@@ -1,0 +1,19 @@
+{
+  "name": "multi-loops-agents",
+  "interface": {
+    "displayName": "Multi-Loops Agents"
+  },
+  "plugins": [
+    {
+      "name": "codex-agent-loop-orchestrator",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

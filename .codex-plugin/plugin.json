@@ -1,0 +1,39 @@
+{
+  "name": "codex-agent-loop-orchestrator",
+  "version": "1.0.0",
+  "description": "A thin, repo-local orchestration layer for durable multi-agent Codex workflows: lane registration, a durable request lifecycle, handoff readiness gates, cross-thread delivery with a file-inbox fallback, checkpoint review/fix loops, and optional Codex Loop Engineering auto-chain.",
+  "author": {
+    "name": "hanco1",
+    "url": "https://github.com/hanco1"
+  },
+  "homepage": "https://github.com/hanco1/multi-loops-agents",
+  "repository": "https://github.com/hanco1/multi-loops-agents",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "agents",
+    "multi-agent",
+    "orchestration",
+    "loop-engineering",
+    "workflow",
+    "skill",
+    "handoff",
+    "code-review"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Agent Loop Orchestrator",
+    "shortDescription": "Durable multi-agent Codex loops with lanes, typed messages, and verification gates.",
+    "longDescription": "Sets up or continues a repo-local multi-agent Codex workflow. Project truth stays in repo files under docs/loop/, agent identities live in a lane registry (agent-lanes.md), and thread tools act only as the message bus with a durable file-based inbox/outbox fallback. Product, Implementation, and Review lanes (plus optional specialist lanes) hand work back and forth across sessions using a fixed message envelope and a durable request lifecycle (requests.md), survive context compaction or an app restart, and resume from files instead of re-planning from chat memory. Includes a deterministic completion gate, atomic crash-safe delivery, advisory file leases with git pre-commit write-scope enforcement, a budget stop gate, heartbeat/orphan recovery, and an append-only run log.",
+    "developerName": "hanco1",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use codex-agent-loop-orchestrator to set up a Product / Implementation / Review loop for this project.",
+      "Use codex-agent-loop-orchestrator to continue the multi-agent loop and hand the open request to the review lane."
+    ]
+  }
+}

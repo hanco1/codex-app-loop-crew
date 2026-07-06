@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Agent Loop Orchestrator"
+  short_description: "多 Agent 会话隔离 + 自动投递 + Codex Loop Engineering 编排"
+  default_prompt: "Use $codex-agent-loop-orchestrator to set up or continue a multi-agent Codex loop."

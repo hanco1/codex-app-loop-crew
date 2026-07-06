@@ -1,0 +1,2312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Loop Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    Read-only view of a repo-local multi-agent Codex loop.
+    Fully self-contained: no external scripts, stylesheets, fonts, or CDNs.
+    It renders offline. Visual language borrows the Editorial / Swiss "Han"
+    palette (paper + ink, serif display, mono labels, hairline rules,
+    restrained accent) as INLINE CSS -- patterns, not parts. All fonts are
+    system fallbacks; no webfont is ever loaded.
+
+    Data comes only from GET /api/state (polled every 2s). The single lane
+    write is the "Add lane" form (POST /api/lanes); the single policy write is
+    the fix-retry stepper (POST /api/policy).
+
+    Bilingual: every user-facing string is rendered through a t(key) lookup
+    against the embedded STRINGS dictionary (the application/json block with
+    id "i18n-strings", below). A top-right EN / 中 toggle re-renders instantly;
+    the choice persists in localStorage. Machine tokens (file names, request
+    ids, "codex login") stay verbatim in both languages.
+  -->
+  <style>
+    /* ---------- Palette (Editorial "ink-classic": paper + ink) ---------- */
+    :root {
+      --paper:      #f3f0e8;
+      --paper-2:    #ebe6da;
+      --paper-3:    #e3ddce;
+      --ink:        #14130f;
+      --ink-rgb:    20, 19, 15;
+      --muted:      #68625a;
+      --line:       rgba(20, 19, 15, .18);
+      --line-soft:  rgba(20, 19, 15, .10);
+      --accent:     #9b5a2e;      /* restrained warm ochre, one accent only */
+      --accent-rgb: 155, 90, 46;
+
+      /* status semantics (kept muted to fit the paper aesthetic) */
+      --ok:      #2e6b4f;
+      --ok-bg:   rgba(46, 107, 79, .12);
+      --warn:    #9b5a2e;
+      --warn-bg: rgba(155, 90, 46, .12);
+      --bad:     #8a2f2f;
+      --bad-bg:  rgba(138, 47, 47, .12);
+      --idle:    #68625a;
+      --idle-bg: rgba(104, 98, 90, .10);
+
+      --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+               Georgia, "Times New Roman", serif;
+      --sans:  -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+               Arial, sans-serif;
+      --mono:  ui-monospace, "SF Mono", "Cascadia Mono", "Consolas",
+               "Liberation Mono", Menlo, monospace;
+    }
+
+    /* ---------- Reset / sheet ---------- */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      /* subtle paper grain, pure CSS (no asset) */
+      background-image: radial-gradient(rgba(0, 0, 0, .028) 1px, transparent 1px);
+      background-size: 3px 3px;
+      line-height: 1.5;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 48px 40px 96px;
+    }
+
+    /* ---------- Masthead ---------- */
+    header.masthead {
+      border-bottom: 2px solid var(--ink);
+      padding-bottom: 20px;
+      margin-bottom: 40px;
+    }
+    h1.title {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 52px;
+      line-height: 1.05;
+      letter-spacing: .01em;
+      margin: 0 0 10px;
+    }
+    .subtitle {
+      font-family: var(--serif);
+      font-style: italic;
+      font-weight: 400;
+      font-size: 20px;
+      color: var(--muted);
+      margin: 0;
+    }
+    /* Compact muted path chip on the title row: shows only the last two path
+       segments; the full loop dir lives in the title attribute (hover). */
+    .loop-dir-chip {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .06em;
+      color: var(--muted);
+      background: var(--paper-2);
+      border: 1px solid var(--line-soft);
+      border-radius: 2px;
+      padding: 2px 8px;
+      margin: 0 0 8px;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .masthead-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+    .masthead-actions {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .pulse {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pulse .live-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--ok);
+      box-shadow: 0 0 0 0 rgba(46, 107, 79, .5);
+      animation: pulse 2s infinite;
+    }
+    .pulse.stale .live-dot { background: var(--bad); animation: none; }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(46, 107, 79, .45); }
+      70%  { box-shadow: 0 0 0 7px rgba(46, 107, 79, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(46, 107, 79, 0); }
+    }
+
+    /* ---------- Buttons ---------- */
+    button {
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      cursor: pointer;
+      border: 1px solid var(--ink);
+      background: var(--ink);
+      color: var(--paper);
+      padding: 10px 18px;
+      border-radius: 2px;
+      transition: opacity .15s ease;
+    }
+    button:hover { opacity: .82; }
+    button.ghost {
+      background: transparent;
+      color: var(--ink);
+    }
+    button.ghost:hover { background: var(--paper-2); opacity: 1; }
+    button:disabled { opacity: .45; cursor: default; }
+
+    /* language toggle (EN / 中) */
+    .lang-toggle {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .10em;
+      padding: 8px 12px;
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      text-transform: none;
+    }
+    .lang-toggle:hover { background: var(--paper-2); opacity: 1; }
+    .lang-toggle .on { color: var(--accent); font-weight: 700; }
+    .lang-toggle .sep { color: var(--muted); margin: 0 3px; }
+    .lang-toggle .off { color: var(--muted); }
+
+    /* ---------- Section headings ---------- */
+    .section { margin-top: 52px; }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 10px;
+      margin-bottom: 10px;
+    }
+    .kicker {
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin: 0;
+    }
+    .section-head h2 {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 26px;
+      margin: 0;
+      letter-spacing: .01em;
+    }
+    .section-head .count {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--muted);
+      margin-left: auto;
+    }
+
+    /* ---------- Collapsible section head (System Checks) ---------- */
+    /* The head becomes a clickable toggle. The verdict badge (.count) stays
+       visible in the head even when collapsed, so the health signal is never
+       hidden; only the body grid folds away. */
+    .section-head.collapsible {
+      cursor: pointer;
+      user-select: none;
+    }
+    .section-head.collapsible .chevron {
+      flex: none;
+      width: 12px;
+      height: 12px;
+      margin-left: 12px;
+      color: var(--muted);
+      transition: transform .18s ease;
+      align-self: center;
+    }
+    .section-head.collapsible .chevron svg { display: block; }
+    /* The .count keeps margin-left:auto so it sits at the right; the chevron
+       follows it. When only the chevron should push right, this still holds
+       because .count comes first in source order. */
+    .section-head.collapsible.is-collapsed .chevron { transform: rotate(-90deg); }
+    .collapsible-body.is-collapsed { display: none; }
+
+    /* ---------- Usage & Limits collapsed-header summary + refresh ---------- */
+    /* A live one-line summary sits in the head and stays visible when the
+       section is folded, so token pressure is never hidden behind the fold.
+       It is pushed to the right (margin-left:auto), the refresh button and
+       chevron follow it. The summary numbers take a danger/warn tint when a
+       window's used% is high. */
+    .usage-summary {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .04em;
+      color: var(--muted);
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      text-align: right;
+    }
+    .usage-summary:empty { display: none; }
+    .usage-summary .us-sep { opacity: .5; }
+    .usage-summary .us-num.warn { color: var(--warn); font-weight: 600; }
+    .usage-summary .us-num.bad  { color: var(--bad);  font-weight: 700; }
+    .usage-summary .us-plan {
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      color: var(--accent);
+    }
+    .usage-summary .us-email { color: rgba(var(--ink-rgb), .7); }
+    /* Refresh button in the collapsible head. Small, ghost-styled; clicking it
+       must NOT toggle the fold (the script calls stopPropagation). */
+    .usage-refresh {
+      flex: none;
+      margin-left: 14px;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      padding: 5px 11px;
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+    }
+    .usage-refresh:hover { background: var(--paper-2); opacity: 1; }
+    .usage-refresh:disabled { opacity: .45; cursor: default; }
+    .usage-refresh.busy { opacity: .55; cursor: default; }
+
+    /* an explanatory subtitle under a section head (localized) */
+    .section-sub {
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 15px;
+      color: var(--muted);
+      margin: 0 0 22px;
+    }
+    .section-sub:empty { display: none; margin: 0; }
+
+    /* ---------- Badge strip (gate + doctor) ---------- */
+    .badges {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .badge {
+      border: 1px solid var(--line);
+      background: var(--paper-2);
+      padding: 18px 20px;
+      border-radius: 3px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .badge .badge-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .badge .badge-value {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-family: var(--serif);
+      font-size: 22px;
+    }
+    .badge .chip {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .10em;
+      text-transform: uppercase;
+      padding: 4px 10px;
+      border-radius: 2px;
+      white-space: nowrap;
+    }
+    .chip.ok   { background: var(--ok-bg);   color: var(--ok); }
+    .chip.warn { background: var(--warn-bg); color: var(--warn); }
+    .chip.bad  { background: var(--bad-bg);  color: var(--bad); }
+    .chip.idle { background: var(--idle-bg); color: var(--idle); }
+    .badge .badge-note {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .badge .badge-sub {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: var(--serif);
+      font-style: italic;
+      line-height: 1.4;
+    }
+    .badge .badge-sub:empty { display: none; }
+
+    /* ---------- Controls strip (usage + policy) ---------- */
+    .controls {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 24px;
+      margin-top: 8px;
+    }
+    @media (max-width: 820px) {
+      .controls { grid-template-columns: 1fr; }
+    }
+    .panel {
+      border: 1px solid var(--line);
+      background: var(--paper-2);
+      border-radius: 3px;
+      padding: 20px 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .panel-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--line-soft);
+      padding-bottom: 10px;
+    }
+    .panel-head h3 {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 20px;
+      margin: 0;
+      letter-spacing: .01em;
+    }
+    .panel-head .panel-tag {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-sub {
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 13px;
+      color: var(--muted);
+      margin: -6px 0 0;
+      line-height: 1.4;
+    }
+    .panel-sub:empty { display: none; margin: 0; }
+
+    /* usage rows */
+    .usage-row { display: flex; flex-direction: column; gap: 6px; }
+    .usage-row-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .usage-row-top .win {
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    /* primary USED number, large */
+    .usage-row-top .pct {
+      font-family: var(--serif);
+      font-size: 26px;
+      color: var(--ink);
+      line-height: 1;
+    }
+    .usage-bar {
+      position: relative;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--paper-3);
+      overflow: hidden;
+      border: 1px solid var(--line-soft);
+    }
+    .usage-bar > span {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      border-radius: 4px;
+      transition: width .4s ease;
+    }
+    .usage-fill-ok   { background: var(--ok); }
+    .usage-fill-warn { background: var(--warn); }
+    .usage-fill-bad  { background: var(--bad); }
+    .usage-row-bottom {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: .03em;
+    }
+    .usage-foot {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: .04em;
+      border-top: 1px solid var(--line-soft);
+      padding-top: 10px;
+    }
+    .usage-foot .plan {
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      color: var(--accent);
+    }
+    /* "Signed in as" identity row (email + name + plan badge + auth mode) */
+    .signed-in {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: .02em;
+      padding-bottom: 4px;
+    }
+    .signed-in .si-label {
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .signed-in .si-email { color: rgba(var(--ink-rgb), .9); word-break: break-all; }
+    .signed-in .si-name { color: var(--muted); font-style: italic; font-family: var(--serif); }
+    .signed-in .si-name:empty { display: none; }
+    .signed-in .si-plan {
+      font-size: 10px;
+      letter-spacing: .10em;
+      text-transform: uppercase;
+      padding: 3px 9px;
+      border-radius: 2px;
+      background: var(--warn-bg);
+      color: var(--warn);
+    }
+    .signed-in .si-plan:empty { display: none; }
+    .signed-in .si-mode { color: var(--muted); }
+    .signed-in .si-mode:empty { display: none; }
+    /* Stale-account hint: quota snapshot predates the current login. */
+    .stale-hint {
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 13px;
+      line-height: 1.4;
+      color: var(--warn);
+      background: var(--warn-bg);
+      border-left: 2px solid var(--warn);
+      border-radius: 2px;
+      padding: 8px 11px;
+    }
+    .stale-hint:empty { display: none; }
+    .usage-unavailable {
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 15px;
+      color: var(--muted);
+      padding: 6px 0;
+    }
+    .usage-unavailable .reason {
+      display: block;
+      font-family: var(--mono);
+      font-style: normal;
+      font-size: 12px;
+      margin-top: 6px;
+      letter-spacing: .02em;
+      color: rgba(var(--ink-rgb), .82);
+    }
+    /* the localized login command, kept verbatim + easy to copy */
+    .usage-unavailable .login-cmd {
+      display: inline-block;
+      font-family: var(--mono);
+      font-style: normal;
+      background: var(--paper-3);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      padding: 1px 7px;
+      color: var(--accent);
+      letter-spacing: 0;
+    }
+
+    /* policy stepper */
+    .policy-desc {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+      margin: 0;
+    }
+    .stepper {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .stepper button {
+      width: 40px;
+      height: 40px;
+      padding: 0;
+      font-size: 20px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .stepper .value {
+      font-family: var(--serif);
+      font-size: 34px;
+      min-width: 48px;
+      text-align: center;
+      color: var(--ink);
+      line-height: 1;
+    }
+    .stepper .value .cur {
+      display: block;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .policy-actions {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .policy-range {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: .04em;
+    }
+    .policy-msg {
+      font-family: var(--mono);
+      font-size: 12px;
+      min-height: 15px;
+      letter-spacing: .02em;
+    }
+    .policy-msg.err { color: var(--bad); }
+    .policy-msg.ok  { color: var(--ok); }
+
+    /* ---------- Lane cards ---------- */
+    .lane-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 24px;
+    }
+    .lane-card {
+      border: 1px solid var(--line);
+      background: var(--paper-2);
+      border-radius: 3px;
+      padding: 24px 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      position: relative;
+      overflow: hidden;
+    }
+    .lane-card::before {
+      content: "";
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--line);
+    }
+    .lane-card.status-registered::before   { background: var(--ok); }
+    .lane-card.status-needs-thread::before { background: var(--warn); }
+    .lane-card.status-stale::before        { background: var(--bad); }
+
+    .lane-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .lane-name {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 24px;
+      letter-spacing: .01em;
+      margin: 0;
+    }
+    .lane-role {
+      font-size: 14px;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.45;
+    }
+    .lane-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .06em;
+      color: var(--muted);
+      border-top: 1px solid var(--line-soft);
+      padding-top: 12px;
+    }
+    .lane-meta .k { text-transform: uppercase; letter-spacing: .12em; opacity: .75; }
+    .hb-fresh { color: var(--ok); }
+    .hb-stale { color: var(--bad); }
+    .hb-none  { color: var(--muted); }
+
+    /* structured current.md summary block */
+    .lane-summary {
+      background: var(--paper-3);
+      border-left: 2px solid var(--line);
+      border-radius: 2px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .lane-sum-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .lane-sum-row .k {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      flex: none;
+    }
+    .lane-sum-row .v { color: rgba(var(--ink-rgb), .9); word-break: break-word; }
+    .lane-sum-row .v.mono { font-family: var(--mono); font-size: 12px; }
+    .lane-sum-row .v.idle { color: var(--muted); font-style: italic; }
+    .lane-sum-blockers {
+      border-left: 2px solid var(--bad);
+      background: var(--bad-bg);
+      border-radius: 2px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .lane-sum-blockers .k {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--bad);
+    }
+    .lane-sum-blockers .b {
+      font-size: 13px;
+      color: var(--bad);
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    /* collapsed raw current.md */
+    details.lane-raw { margin: 0; }
+    details.lane-raw > summary {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .10em;
+      text-transform: uppercase;
+      color: var(--muted);
+      cursor: pointer;
+      list-style: revert;
+      padding: 2px 0;
+    }
+    details.lane-raw > summary:hover { color: var(--accent); }
+    details.lane-raw pre.lane-current {
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      color: rgba(var(--ink-rgb), .82);
+      background: var(--paper-3);
+      border-left: 2px solid var(--line);
+      padding: 12px 14px;
+      border-radius: 2px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 240px;
+      overflow: auto;
+      margin: 8px 0 0;
+    }
+    .lane-artifacts {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .08em;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .lane-artifacts .n {
+      font-family: var(--serif);
+      font-size: 18px;
+      color: var(--ink);
+    }
+
+    /* ---------- Tables (requests, evidence) ---------- */
+    .table-scroll { overflow-x: auto; }
+    table.grid {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      min-width: 640px;
+    }
+    table.grid th {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--ink);
+      white-space: nowrap;
+    }
+    table.grid td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      vertical-align: top;
+    }
+    table.grid tr:hover td { background: var(--paper-2); }
+    table.grid td.mono, table.grid td .mono {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .status-pill {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      padding: 3px 9px;
+      border-radius: 2px;
+      white-space: nowrap;
+      display: inline-block;
+    }
+    .st-accepted  { background: var(--ok-bg);   color: var(--ok); }
+    .st-blocked   { background: var(--bad-bg);  color: var(--bad); }
+    .st-active    { background: var(--warn-bg); color: var(--warn); }
+    .st-neutral   { background: var(--idle-bg); color: var(--idle); }
+    .exit-ok  { color: var(--ok);  font-family: var(--mono); font-weight: 600; }
+    .exit-bad { color: var(--bad); font-family: var(--mono); font-weight: 600; }
+
+    /* ---------- Run-log timeline ---------- */
+    .timeline {
+      border-left: 2px solid var(--line);
+      margin-left: 6px;
+      padding-left: 0;
+      list-style: none;
+    }
+    .timeline li {
+      position: relative;
+      padding: 8px 0 8px 24px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: rgba(var(--ink-rgb), .82);
+      line-height: 1.5;
+      border-bottom: 1px solid var(--line-soft);
+      word-break: break-word;
+    }
+    .timeline li::before {
+      content: "";
+      position: absolute;
+      left: -7px; top: 14px;
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--paper);
+      border: 2px solid var(--accent);
+    }
+    .timeline li:last-child { border-bottom: 0; }
+
+    /* ---------- Empty / muted states ---------- */
+    .empty {
+      font-family: var(--serif);
+      font-style: italic;
+      font-size: 16px;
+      color: var(--muted);
+      padding: 20px 0;
+    }
+    .hint {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: .04em;
+    }
+
+    /* ---------- Add-lane modal ---------- */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 19, 15, .42);
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 80px 20px;
+      z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: 4px;
+      width: 100%;
+      max-width: 460px;
+      padding: 32px 34px 30px;
+      box-shadow: 0 30px 70px -30px rgba(20, 18, 14, .5);
+    }
+    .modal h3 {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 26px;
+      margin: 0 0 6px;
+    }
+    .modal .modal-sub {
+      font-family: var(--serif);
+      font-style: italic;
+      color: var(--muted);
+      font-size: 15px;
+      margin: 0 0 22px;
+    }
+    .field { margin-bottom: 18px; }
+    .field label {
+      display: block;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field input, .field textarea {
+      width: 100%;
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--ink);
+      background: var(--paper-2);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      padding: 10px 12px;
+      resize: vertical;
+    }
+    .field input:focus, .field textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .field .field-hint {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 5px;
+      letter-spacing: .02em;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .form-msg {
+      font-family: var(--mono);
+      font-size: 12px;
+      margin-top: 4px;
+      min-height: 16px;
+      letter-spacing: .02em;
+    }
+    .form-msg.err { color: var(--bad); }
+    .form-msg.ok  { color: var(--ok); }
+
+    /* ---------- Connection banner ---------- */
+    .conn-banner {
+      display: none;
+      background: var(--bad-bg);
+      color: var(--bad);
+      border: 1px solid var(--bad);
+      border-radius: 3px;
+      padding: 12px 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .04em;
+      margin-bottom: 24px;
+    }
+    .conn-banner.show { display: block; }
+
+    footer.foot {
+      margin-top: 72px;
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: .10em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    @media (max-width: 640px) {
+      .wrap { padding: 32px 20px 72px; }
+      h1.title { font-size: 38px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="masthead">
+      <div class="masthead-row">
+        <div>
+          <h1 class="title" data-i18n="page_title">Loop Dashboard</h1>
+          <span class="loop-dir-chip" id="loop-dir" title="docs/loop">docs/loop</span>
+          <p class="subtitle" data-i18n="page_subtitle">A live view of what the agents are working on right now</p>
+        </div>
+        <div class="masthead-actions">
+          <span class="pulse" id="pulse">
+            <span class="live-dot"></span>
+            <span id="pulse-text" data-i18n="pulse_connecting">Connecting…</span>
+          </span>
+          <button id="add-lane-btn" data-i18n="add_lane_button">Add lane</button>
+          <button type="button" class="lang-toggle" id="lang-toggle" data-i18n-aria="lang_toggle_aria" aria-label="Language">
+            <span class="en">EN</span><span class="sep">/</span><span class="zh">中</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div class="conn-banner" id="conn-banner" data-i18n="conn_banner">
+      Can't reach the dashboard's data source. Retrying every 2 seconds…
+    </div>
+
+    <!-- Lane cards: the core "what are the agents doing right now", so this is
+         the FIRST content section on the page. -->
+    <section class="section" id="lanes-section" style="margin-top:40px">
+      <div class="section-head">
+        <p class="kicker" data-i18n="registry_kicker">Lanes</p>
+        <h2 data-i18n="registry_heading">Agent Lanes</h2>
+        <span class="count" id="lanes-count"></span>
+      </div>
+      <p class="section-sub" data-i18n-sub="registry_heading"></p>
+      <div class="lane-grid" id="lanes"></div>
+      <div class="empty" id="lanes-empty" data-i18n="lanes_empty" style="display:none">
+        No lanes yet. This loop hasn't been set up, or hasn't started assigning work.
+      </div>
+    </section>
+
+    <!-- Usage & Limits: the Codex usage panel and the fix-retry limit merged
+         into ONE collapsible section (same fold pattern as System Checks below:
+         clickable head, chevron, its own localStorage key, default COLLAPSED).
+         The collapsed head carries a live one-line summary (5h used% + weekly
+         used% + plan + account email); when either window's used% exceeds 85 the
+         summary numbers render in the danger style (amber for 60-85), so folding
+         never hides token pressure. A Refresh button in the head re-reads
+         auth.json + the newest session (it does NOT toggle the fold). -->
+    <section class="section" id="usage-limits-section">
+      <div class="section-head collapsible" id="usage-head" role="button"
+           tabindex="0" aria-expanded="false" aria-controls="usage-body-wrap"
+           data-i18n-aria="usage_toggle_aria" aria-label="Toggle usage and limits">
+        <p class="kicker" data-i18n="usage_limits_kicker">Budget</p>
+        <h2 data-i18n="usage_limits_heading">Usage &amp; Limits</h2>
+        <span class="usage-summary" id="usage-summary"></span>
+        <button type="button" class="usage-refresh" id="usage-refresh"
+                data-i18n-aria="usage_refresh_aria" aria-label="Refresh usage">
+          <span data-i18n="usage_refresh_button">Refresh</span>
+        </button>
+        <span class="chevron" aria-hidden="true">
+          <svg viewBox="0 0 12 12" width="12" height="12" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+               stroke-linejoin="round"><path d="M2.5 4.5 L6 8 L9.5 4.5"/></svg>
+        </span>
+      </div>
+      <div class="collapsible-body" id="usage-body-wrap">
+        <p class="section-sub" data-i18n-sub="usage_limits_heading"></p>
+        <div class="controls">
+          <!-- Usage: primary number is USED percent -->
+          <div class="panel" id="usage-panel">
+            <div class="panel-head">
+              <h3 data-i18n="usage_panel_title">Usage</h3>
+              <span class="panel-tag" id="usage-source" data-i18n="usage_source_tag">from Codex rate limits</span>
+            </div>
+            <p class="panel-sub" data-i18n-sub="usage_panel_title"></p>
+            <!-- Signed-in-as identity row (email + name + plan + auth_mode) -->
+            <div class="signed-in" id="signed-in" style="display:none">
+              <span class="si-label" data-i18n="usage_signed_in_label">Signed in as</span>
+              <span class="si-email" id="si-email"></span>
+              <span class="si-name" id="si-name"></span>
+              <span class="si-plan chip" id="si-plan"></span>
+              <span class="si-mode" id="si-mode"></span>
+            </div>
+            <!-- Stale-account hint: the quota snapshot predates the current login -->
+            <div class="stale-hint" id="stale-hint" style="display:none"
+                 data-i18n="usage_stale_account_hint"></div>
+            <div id="usage-body"></div>
+            <div class="usage-foot" id="usage-foot" style="display:none">
+              <span class="plan" id="usage-plan">--</span>
+              <span id="usage-asof">--</span>
+            </div>
+          </div>
+
+          <!-- Fix-retry limit: human anti-thrash cap -->
+          <div class="panel" id="policy-panel">
+            <div class="panel-head">
+              <h3 data-i18n="policy_panel_title">Fix-Retry Limit</h3>
+              <span class="panel-tag" data-i18n="policy_panel_tag">loop safety limit</span>
+            </div>
+            <p class="panel-sub" data-i18n-sub="policy_panel_title"></p>
+            <p class="policy-desc" data-i18n="policy_desc_paragraph"></p>
+            <div class="stepper">
+              <button type="button" id="mfc-dec" data-i18n-aria="mfc_dec_aria" aria-label="Decrease limit">-</button>
+              <span class="value">
+                <span id="mfc-value">3</span>
+                <span class="cur" id="mfc-current-sublabel"></span>
+              </span>
+              <button type="button" id="mfc-inc" data-i18n-aria="mfc_inc_aria" aria-label="Increase limit">+</button>
+            </div>
+            <div class="policy-actions">
+              <button type="button" id="mfc-apply" data-i18n="mfc_apply_button">Save</button>
+              <span class="policy-range" data-i18n="mfc_range_label">Allowed range: 1-10 cycles</span>
+            </div>
+            <div class="policy-msg" id="policy-msg"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- System checks (gate + doctor) badges. Collapsed by default: the head
+         stays a clickable toggle and the one-line verdict badge (#doctor-status)
+         lives IN the head so the health signal is always visible; only the grid
+         of check cards folds away. Auto-expands when the doctor finds issues. -->
+    <section class="section" id="badges-section">
+      <div class="section-head collapsible" id="health-head" role="button"
+           tabindex="0" aria-expanded="false" aria-controls="health-body"
+           data-i18n-aria="health_toggle_aria" aria-label="Toggle system checks">
+        <p class="kicker" data-i18n="health_kicker">Health</p>
+        <h2 data-i18n="health_heading">System Checks</h2>
+        <span class="count" id="doctor-status"></span>
+        <span class="chevron" aria-hidden="true">
+          <svg viewBox="0 0 12 12" width="12" height="12" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+               stroke-linejoin="round"><path d="M2.5 4.5 L6 8 L9.5 4.5"/></svg>
+        </span>
+      </div>
+      <div class="collapsible-body" id="health-body">
+        <p class="section-sub" data-i18n-sub="health_heading"></p>
+        <div class="badges" id="badges"></div>
+      </div>
+    </section>
+
+    <!-- Requests table -->
+    <section class="section">
+      <div class="section-head">
+        <p class="kicker" data-i18n="requests_kicker">Task Queue</p>
+        <h2 data-i18n="requests_heading">Requests</h2>
+        <span class="count" id="requests-count"></span>
+      </div>
+      <p class="section-sub" data-i18n-sub="requests_kicker"></p>
+      <div class="table-scroll">
+        <table class="grid" id="requests-table" style="display:none">
+          <thead>
+            <tr>
+              <th data-i18n="requests_th_request">Request</th>
+              <th data-i18n="requests_th_status">Status</th>
+              <th data-i18n="requests_th_owner">Owner Lane</th>
+              <th data-i18n="requests_th_iter">Attempt #</th>
+              <th data-i18n="requests_th_next_action">Next Action</th>
+              <th data-i18n="requests_th_updated">Last Updated</th>
+            </tr>
+          </thead>
+          <tbody id="requests-body"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="requests-empty" data-i18n="requests_empty" style="display:none">
+        No requests yet. New work will show up here automatically.
+      </div>
+    </section>
+
+    <!-- Evidence -->
+    <section class="section">
+      <div class="section-head">
+        <p class="kicker" data-i18n="evidence_kicker">Evidence</p>
+        <h2 data-i18n="evidence_heading">Evidence</h2>
+        <span class="count" id="evidence-count"></span>
+      </div>
+      <p class="section-sub" data-i18n-sub="evidence_kicker"></p>
+      <div class="table-scroll">
+        <table class="grid" id="evidence-table" style="display:none">
+          <thead>
+            <tr>
+              <th data-i18n="evidence_th_request">Request</th>
+              <th data-i18n="evidence_th_checkpoint">Checkpoint</th>
+              <th data-i18n="evidence_th_command">Command Run</th>
+              <th data-i18n="evidence_th_exit">Exit Code</th>
+              <th data-i18n="evidence_th_ran_at">Ran At</th>
+            </tr>
+          </thead>
+          <tbody id="evidence-body"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="evidence-empty" data-i18n="evidence_empty" style="display:none">
+        No evidence recorded yet. This fills in as tasks are checked off.
+      </div>
+      <div class="hint" id="evidence-errors" style="margin-top:12px"></div>
+    </section>
+
+    <!-- Run-log timeline -->
+    <section class="section">
+      <div class="section-head">
+        <p class="kicker" data-i18n="runlog_kicker">Run Log</p>
+        <h2 data-i18n="runlog_heading">Run Log</h2>
+        <span class="count" id="runlog-count"></span>
+      </div>
+      <p class="section-sub" data-i18n-sub="runlog_kicker"></p>
+      <ul class="timeline" id="runlog"></ul>
+      <div class="empty" id="runlog-empty" data-i18n="runlog_empty" style="display:none">
+        No history yet. Status changes will appear here as they happen.
+      </div>
+    </section>
+
+    <footer class="foot">
+      <span id="foot-generated" data-i18n="footer_generated">Last refreshed --</span>
+      <span data-i18n="footer_reassurance">This page is just a viewer -- deleting it won't stop the loop. The only thing it can change is adding a lane.</span>
+    </footer>
+  </div>
+
+  <!-- Add-lane modal -->
+  <div class="modal-backdrop" id="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h3 id="modal-title" data-i18n="modal_title">Add a Lane</h3>
+      <p class="modal-sub" data-i18n="modal_subtitle">Create a new ongoing job for an agent to pick up. It starts out as "Not started" until an agent begins working on it.</p>
+      <form id="add-lane-form">
+        <div class="field">
+          <label for="lane-input" data-i18n="modal_lane_name_label">Lane name</label>
+          <input id="lane-input" name="lane" type="text" autocomplete="off"
+                 placeholder="qa-review" spellcheck="false">
+          <div class="field-hint" data-i18n="modal_lane_name_hint">Lowercase, words separated by hyphens -- e.g. qa-review</div>
+        </div>
+        <div class="field">
+          <label for="role-input" data-i18n="modal_role_label">What this lane does</label>
+          <textarea id="role-input" name="role" rows="3"
+                    placeholder="Review changes against acceptance criteria and request precise fixes."></textarea>
+          <div class="field-hint" data-i18n="modal_role_hint">One line describing what comes in and what this lane is responsible for producing.</div>
+        </div>
+        <div class="form-msg" id="form-msg"></div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" id="cancel-btn" data-i18n="modal_cancel_button">Cancel</button>
+          <button type="submit" id="submit-btn" data-i18n="modal_submit_button">Create Lane</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Embedded bilingual dictionary. Parsed by the script below and by the
+       smoke test; every user-facing string lives here (machine tokens like
+       file names, request ids, and "codex login" stay verbatim in both). -->
+  <script type="application/json" id="i18n-strings">
+{"strings":[{"key":"page_title","en":"Loop Dashboard","zh":"循环仪表盘","subtitle_en":"","subtitle_zh":""},{"key":"page_subtitle","en":"A live view of what the agents are working on right now","zh":"实时查看智能体当前的工作进展","subtitle_en":"","subtitle_zh":""},{"key":"pulse_connecting","en":"Connecting…","zh":"连接中…","subtitle_en":"","subtitle_zh":""},{"key":"pulse_live","en":"Live","zh":"实时","subtitle_en":"","subtitle_zh":""},{"key":"pulse_offline","en":"Offline","zh":"离线","subtitle_en":"","subtitle_zh":""},{"key":"pulse_heartbeat_stale","en":"Data may be outdated","zh":"数据可能已过期","subtitle_en":"One or more agents haven't checked in recently, so this view might lag reality.","subtitle_zh":"部分智能体近期没有发送心跳信号，此视图可能滞后于实际状态。"},{"key":"add_lane_button","en":"Add lane","zh":"新增通道","subtitle_en":"","subtitle_zh":""},{"key":"conn_banner","en":"Can't reach the dashboard's data source. Retrying every 2 seconds…","zh":"无法连接到仪表盘的数据源，正在每 2 秒重试一次…","subtitle_en":"","subtitle_zh":""},{"key":"usage_panel_title","en":"Usage","zh":"用量","subtitle_en":"How much of your Codex quota this workspace has used.","subtitle_zh":"此工作区已使用的 Codex 配额占比。"},{"key":"usage_source_tag","en":"from Codex rate limits","zh":"数据来自 Codex 速率限制","subtitle_en":"","subtitle_zh":""},{"key":"usage_window_5h","en":"5-hour window","zh":"5 小时窗口","subtitle_en":"","subtitle_zh":""},{"key":"usage_window_weekly","en":"Weekly window","zh":"每周窗口","subtitle_en":"","subtitle_zh":""},{"key":"usage_pct_used_primary","en":"NN% used","zh":"已用 NN%","subtitle_en":"Big number now shows how much you've used, not what's left.","subtitle_zh":"大号数字现在显示的是已用量，而不是剩余量。"},{"key":"usage_pct_remaining_secondary","en":"NN% remaining","zh":"剩余 NN%","subtitle_en":"","subtitle_zh":""},{"key":"usage_resets_label","en":"Resets at HH:MM / Resets Mon D","zh":"HH:MM 重置 / Mon D 重置","subtitle_en":"","subtitle_zh":""},{"key":"usage_plan_prefix","en":"Plan: --","zh":"套餐：--","subtitle_en":"","subtitle_zh":""},{"key":"usage_asof_prefix","en":"As of --","zh":"截至 --","subtitle_en":"","subtitle_zh":""},{"key":"usage_unavailable_title","en":"Usage data isn't available right now.","zh":"暂时无法获取用量数据。","subtitle_en":"","subtitle_zh":""},{"key":"usage_unavailable_reason_default","en":"No Codex session data found yet","zh":"尚未找到 Codex 会话数据","subtitle_en":"This usually clears up once an agent has run at least once.","subtitle_zh":"通常在有智能体运行过至少一次之后，这个问题就会自动消失。"},{"key":"policy_panel_title","en":"Fix-Retry Limit","zh":"修复重试上限","subtitle_en":"Caps how many times a task can bounce between \"fix it\" and \"try again\" before it's flagged as stuck -- so it can't loop forever burning tokens.","subtitle_zh":"限制一个任务在\"修复\"与\"重试\"之间反复的次数，超过上限即标记为卡住，避免无限循环消耗 token。"},{"key":"policy_panel_tag","en":"loop safety limit","zh":"循环安全限制","subtitle_en":"","subtitle_zh":""},{"key":"policy_desc_paragraph","en":"Limits how many fix-and-retry rounds one task gets before it's marked BLOCKED and needs a person to look at it. Change the number here -- agents pick it up automatically from loop-policy.md.","zh":"限制一个任务能获得多少轮修复重试机会，超过上限即标记为 BLOCKED，需要人工介入查看。在此处修改数值后，智能体会自动从 loop-policy.md 读取新设置。","subtitle_en":"","subtitle_zh":""},{"key":"mfc_current_sublabel","en":"now: 3","zh":"当前：3","subtitle_en":"","subtitle_zh":""},{"key":"mfc_dec_aria","en":"Decrease limit","zh":"减少上限","subtitle_en":"","subtitle_zh":""},{"key":"mfc_inc_aria","en":"Increase limit","zh":"增加上限","subtitle_en":"","subtitle_zh":""},{"key":"mfc_apply_button","en":"Save","zh":"保存","subtitle_en":"","subtitle_zh":""},{"key":"mfc_range_label","en":"Allowed range: 1-10 cycles","zh":"允许范围：1-10 次修复重试","subtitle_en":"","subtitle_zh":""},{"key":"mfc_msg_already_set","en":"Already set to N -- nothing to save.","zh":"当前已是 N，无需保存。","subtitle_en":"","subtitle_zh":""},{"key":"mfc_msg_applying","en":"Saving…","zh":"保存中…","subtitle_en":"","subtitle_zh":""},{"key":"mfc_msg_success","en":"Fix-retry limit set to N.","zh":"修复重试上限已设为 N。","subtitle_en":"","subtitle_zh":""},{"key":"mfc_msg_server_error","en":"That change wasn't accepted. Please try a different value.","zh":"更改未被接受，请尝试其他数值。","subtitle_en":"","subtitle_zh":""},{"key":"mfc_msg_network_error","en":"Couldn't reach the server to save this. Check your connection and try again.","zh":"无法连接到服务器以保存更改，请检查网络连接后重试。","subtitle_en":"","subtitle_zh":""},{"key":"health_kicker","en":"Health","zh":"健康状态","subtitle_en":"","subtitle_zh":""},{"key":"health_heading","en":"System Checks","zh":"系统检查","subtitle_en":"Automated checks that confirm work is actually done, not just claimed.","subtitle_zh":"自动化检查用于确认任务确实完成，而不仅仅是智能体自称完成。"},{"key":"health_toggle_aria","en":"Toggle system checks","zh":"展开或收起系统检查","subtitle_en":"","subtitle_zh":""},{"key":"doctor_status_clean","en":"All checks passing","zh":"全部检查通过","subtitle_en":"","subtitle_zh":""},{"key":"doctor_status_issues","en":"Some checks flagged issues","zh":"部分检查发现问题","subtitle_en":"","subtitle_zh":""},{"key":"doctor_status_unavailable","en":"Checks unavailable","zh":"检查不可用","subtitle_en":"","subtitle_zh":""},{"key":"badge_doctor_label","en":"System Checks","zh":"系统检查","subtitle_en":"","subtitle_zh":""},{"key":"badge_doctor_value_unavailable","en":"Unavailable","zh":"不可用","subtitle_en":"","subtitle_zh":""},{"key":"badge_doctor_note_default","en":"This loop may not be set up yet","zh":"此循环可能尚未完成初始设置","subtitle_en":"","subtitle_zh":""},{"key":"badge_gate_available_label","en":"Completion checker online","zh":"完成检查器已上线","subtitle_en":"Whether the automated pass/fail checker (the \"completion gate\") is running at all.","subtitle_zh":"用于判断自动化的通过/失败检查器（即\"完成关卡\"）是否正常运行。"},{"key":"badge_gate_available_note_true","en":"The completion checker loaded correctly","zh":"完成检查器已正常加载","subtitle_en":"","subtitle_zh":""},{"key":"badge_gate_available_note_false","en":"The completion checker failed to load","zh":"完成检查器加载失败","subtitle_en":"","subtitle_zh":""},{"key":"badge_completion_gate_label","en":"Machine-Checked Complete","zh":"机器校验完成","subtitle_en":"A task only counts as done when a recorded exit code proves it -- not because an agent says so.","subtitle_zh":"只有当记录的退出码证明任务已完成时才算数，而不是仅凭智能体自称完成。"},{"key":"badge_completion_gate_note_pass","en":"Every checked request passed its real exit-code test","zh":"所有已检查的请求均通过了真实退出码测试","subtitle_en":"","subtitle_zh":""},{"key":"badge_completion_gate_note_fail","en":"N request(s) failed this check","zh":"有 N 个请求未通过此项检查","subtitle_en":"","subtitle_zh":""},{"key":"badge_evidence_recorded_label","en":"Proof on File","zh":"留存凭证","subtitle_en":"Each request has a saved record of the command that was run and its exit code.","subtitle_zh":"每个请求都保存了所执行命令及其退出码的记录。"},{"key":"badge_evidence_recorded_note","en":"Confirms a record exists -- doesn't by itself confirm it passed","zh":"仅确认记录已存在，不代表该请求本身通过了检查","subtitle_en":"","subtitle_zh":""},{"key":"badge_stale_decisions_label","en":"Stale Decisions","zh":"过期决策","subtitle_en":"Decisions logged a while ago that haven't been revisited -- a heads-up, not an error.","subtitle_zh":"较早前记录、此后一直未被重新审视的决策，这只是一个提醒，并非错误。"},{"key":"badge_stale_decisions_note","en":"N total, N still active, N couldn't be read -- informational only","zh":"共 N 条，其中 N 条仍然有效，N 条无法读取——仅供参考","subtitle_en":"","subtitle_zh":""},{"key":"badge_orphan_suspects_label","en":"Possibly Stuck Lanes","zh":"疑似卡住的通道","subtitle_en":"Lanes that haven't checked in recently and may have stalled or crashed.","subtitle_zh":"近期没有发送心跳信号的通道，可能已停滞或崩溃。"},{"key":"badge_orphan_suspects_note_default","en":"All lanes have checked in recently","zh":"所有通道近期均已发送心跳信号","subtitle_en":"","subtitle_zh":""},{"key":"badge_orphan_suspects_note_list","en":"(comma-joined lane names -- keep verbatim)","zh":"（以逗号分隔的通道名称——保持原样）","subtitle_en":"","subtitle_zh":""},{"key":"registry_kicker","en":"Lanes","zh":"通道","subtitle_en":"","subtitle_zh":""},{"key":"registry_heading","en":"Agent Lanes","zh":"智能体通道","subtitle_en":"Each lane is one agent's ongoing job -- what it's assigned to own end-to-end.","subtitle_zh":"每条通道对应一个智能体正在进行的工作，即它被指派全权负责的任务。"},{"key":"lanes_count","en":"N lane(s)","zh":"N 条通道","subtitle_en":"","subtitle_zh":""},{"key":"lanes_empty","en":"No lanes yet. This loop hasn't been set up, or hasn't started assigning work.","zh":"暂无通道。此循环可能尚未完成设置，或尚未开始分配工作。","subtitle_en":"","subtitle_zh":""},{"key":"lane_status_registered","en":"Active","zh":"进行中","subtitle_en":"","subtitle_zh":""},{"key":"lane_status_needs_thread","en":"Not started","zh":"未开始","subtitle_en":"Registered, but no agent conversation has picked it up yet.","subtitle_zh":"通道已注册，但尚未有智能体对话接手。"},{"key":"lane_status_stale","en":"Stalled","zh":"已停滞","subtitle_en":"Hasn't checked in recently -- may need a human look.","subtitle_zh":"近期没有发送心跳信号，可能需要人工查看。"},{"key":"lane_status_unknown","en":"Unknown","zh":"未知","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_heartbeat_label","en":"Last check-in:","zh":"最近心跳：","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_heartbeat_none","en":"never checked in","zh":"从未发送心跳","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_heartbeat_fresh","en":"N min ago","zh":"N 分钟前","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_heartbeat_stale_suffix","en":"(overdue)","zh":"（已超时）","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_thread_label","en":"Conversation:","zh":"对话：","subtitle_en":"","subtitle_zh":""},{"key":"lane_meta_thread_unset","en":"not started","zh":"未开始","subtitle_en":"","subtitle_zh":""},{"key":"lane_blockers_label","en":"Blocked on:","zh":"阻塞于：","subtitle_en":"","subtitle_zh":""},{"key":"lane_artifacts_label","en":"N file(s) saved in this lane's workspace","zh":"该通道工作区中已保存 N 个文件","subtitle_en":"","subtitle_zh":""},{"key":"requests_kicker","en":"Task Queue","zh":"任务队列","subtitle_en":"Every request is saved to disk, one row per task, so nothing is lost if the loop restarts.","subtitle_zh":"每个请求都会写入磁盘保存，一行对应一个任务，即使循环重启也不会丢失。"},{"key":"requests_heading","en":"Requests","zh":"请求","subtitle_en":"","subtitle_zh":""},{"key":"requests_count","en":"N request(s)","zh":"N 个请求","subtitle_en":"","subtitle_zh":""},{"key":"requests_th_request","en":"Request","zh":"请求","subtitle_en":"","subtitle_zh":""},{"key":"requests_th_status","en":"Status","zh":"状态","subtitle_en":"","subtitle_zh":""},{"key":"requests_th_owner","en":"Owner Lane","zh":"负责通道","subtitle_en":"","subtitle_zh":""},{"key":"requests_th_iter","en":"Attempt #","zh":"尝试次数","subtitle_en":"How many fix-and-retry rounds this request has gone through.","subtitle_zh":"该请求已经经历的修复重试轮数。"},{"key":"requests_th_next_action","en":"Next Action","zh":"下一步","subtitle_en":"","subtitle_zh":""},{"key":"requests_th_updated","en":"Last Updated","zh":"最近更新","subtitle_en":"","subtitle_zh":""},{"key":"requests_empty","en":"No requests yet. New work will show up here automatically.","zh":"暂无请求。新任务出现后会自动显示在这里。","subtitle_en":"","subtitle_zh":""},{"key":"evidence_kicker","en":"Evidence","zh":"凭证","subtitle_en":"Proof that a task actually finished: a recorded command and exit code, not just an agent's word.","subtitle_zh":"证明任务确实完成的凭证：记录下的命令与退出码，而非仅凭智能体自称。"},{"key":"evidence_heading","en":"Evidence","zh":"凭证","subtitle_en":"","subtitle_zh":""},{"key":"evidence_count","en":"N record(s)","zh":"N 条记录","subtitle_en":"","subtitle_zh":""},{"key":"evidence_th_request","en":"Request","zh":"请求","subtitle_en":"","subtitle_zh":""},{"key":"evidence_th_checkpoint","en":"Checkpoint","zh":"检查点","subtitle_en":"","subtitle_zh":""},{"key":"evidence_th_command","en":"Command Run","zh":"执行命令","subtitle_en":"","subtitle_zh":""},{"key":"evidence_th_exit","en":"Exit Code","zh":"退出码","subtitle_en":"","subtitle_zh":""},{"key":"evidence_th_ran_at","en":"Ran At","zh":"执行时间","subtitle_en":"","subtitle_zh":""},{"key":"evidence_empty","en":"No evidence recorded yet. This fills in as tasks are checked off.","zh":"暂无凭证记录。任务完成核实后会自动填充到这里。","subtitle_en":"","subtitle_zh":""},{"key":"evidence_errors_note","en":"N evidence file(s) couldn't be read: ...","zh":"有 N 个凭证文件无法读取：...","subtitle_en":"","subtitle_zh":""},{"key":"runlog_kicker","en":"Run Log","zh":"运行日志","subtitle_en":"Every status change is recorded here permanently and never edited -- the full audit trail.","subtitle_zh":"每一次状态变更都会被永久记录在此，且不会被修改——完整的审计轨迹。"},{"key":"runlog_heading","en":"Run Log","zh":"运行日志","subtitle_en":"","subtitle_zh":""},{"key":"runlog_count","en":"N entries","zh":"N 条记录","subtitle_en":"","subtitle_zh":""},{"key":"runlog_empty","en":"No history yet. Status changes will appear here as they happen.","zh":"暂无历史记录。状态变更发生后会实时显示在这里。","subtitle_en":"","subtitle_zh":""},{"key":"footer_generated","en":"Last refreshed --","zh":"最近刷新 --","subtitle_en":"","subtitle_zh":""},{"key":"footer_reassurance","en":"This page is just a viewer -- deleting it won't stop the loop. The only thing it can change is adding a lane.","zh":"本页面仅用于查看，删除它不会影响循环的运行。它唯一能做出的改动是新增通道。","subtitle_en":"","subtitle_zh":""},{"key":"modal_title","en":"Add a Lane","zh":"新增通道","subtitle_en":"","subtitle_zh":""},{"key":"modal_subtitle","en":"Create a new ongoing job for an agent to pick up. It starts out as \"Not started\" until an agent begins working on it.","zh":"创建一项供智能体接手的新任务。在有智能体开始处理之前，状态将显示为\"未开始\"。","subtitle_en":"","subtitle_zh":""},{"key":"modal_lane_name_label","en":"Lane name","zh":"通道名称","subtitle_en":"","subtitle_zh":""},{"key":"modal_lane_name_placeholder","en":"qa-review","zh":"qa-review","subtitle_en":"","subtitle_zh":""},{"key":"modal_lane_name_hint","en":"Lowercase, words separated by hyphens -- e.g. qa-review","zh":"使用小写字母，单词之间用连字符分隔——例如 qa-review","subtitle_en":"","subtitle_zh":""},{"key":"modal_role_label","en":"What this lane does","zh":"通道职责","subtitle_en":"","subtitle_zh":""},{"key":"modal_role_placeholder","en":"Review changes against acceptance criteria and request precise fixes.","zh":"依据验收标准审查改动，并提出精确的修复要求。","subtitle_en":"","subtitle_zh":""},{"key":"modal_role_hint","en":"One line describing what comes in and what this lane is responsible for producing.","zh":"用一句话描述该通道的输入内容，以及它需要产出的结果。","subtitle_en":"","subtitle_zh":""},{"key":"modal_cancel_button","en":"Cancel","zh":"取消","subtitle_en":"","subtitle_zh":""},{"key":"modal_submit_button","en":"Create Lane","zh":"创建通道","subtitle_en":"","subtitle_zh":""},{"key":"modal_form_msg_lane_pattern_error","en":"Lane name must be lowercase letters, numbers, and hyphens only (e.g. qa-review).","zh":"通道名称只能包含小写字母、数字和连字符（例如 qa-review）。","subtitle_en":"","subtitle_zh":""},{"key":"modal_form_msg_creating","en":"Creating…","zh":"创建中…","subtitle_en":"","subtitle_zh":""},{"key":"modal_form_msg_success","en":"Created lane \"X.\" It'll show as Not started until an agent picks it up.","zh":"通道“X”已创建。在有智能体接手之前，状态将显示为“未开始”。","subtitle_en":"","subtitle_zh":""},{"key":"modal_form_msg_server_error","en":"That didn't go through. Please check the name and try again.","zh":"提交未成功，请检查名称后重试。","subtitle_en":"","subtitle_zh":""},{"key":"modal_form_msg_network_error","en":"Couldn't reach the server to create this lane. Check your connection and try again.","zh":"无法连接到服务器以创建该通道，请检查网络连接后重试。","subtitle_en":"","subtitle_zh":""},{"key":"lang_toggle_aria","en":"Language","zh":"语言","subtitle_en":"","subtitle_zh":""},{"key":"badge_bool_ok","en":"ok","zh":"通过","subtitle_en":"","subtitle_zh":""},{"key":"badge_bool_fail","en":"fail","zh":"未通过","subtitle_en":"","subtitle_zh":""},{"key":"badge_bool_na","en":"n/a","zh":"不适用","subtitle_en":"","subtitle_zh":""},{"key":"lane_summary_status_idle","en":"idle","zh":"空闲","subtitle_en":"","subtitle_zh":""},{"key":"lane_view_raw","en":"View raw","zh":"查看原始内容","subtitle_en":"","subtitle_zh":""},{"key":"usage_not_logged_in_hint","en":"Codex is not logged in on this machine. Run:","zh":"Codex 尚未在本机登录。请运行：","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_1","en":"Jan","zh":"1月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_2","en":"Feb","zh":"2月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_3","en":"Mar","zh":"3月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_4","en":"Apr","zh":"4月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_5","en":"May","zh":"5月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_6","en":"Jun","zh":"6月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_7","en":"Jul","zh":"7月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_8","en":"Aug","zh":"8月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_9","en":"Sep","zh":"9月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_10","en":"Oct","zh":"10月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_11","en":"Nov","zh":"11月","subtitle_en":"","subtitle_zh":""},{"key":"usage_month_12","en":"Dec","zh":"12月","subtitle_en":"","subtitle_zh":""},{"key":"usage_limits_kicker","en":"Budget","zh":"预算","subtitle_en":"","subtitle_zh":""},{"key":"usage_limits_heading","en":"Usage & Limits","zh":"用量与限制","subtitle_en":"Your Codex quota, the signed-in account, and the fix-retry safety cap -- collapsed by default.","subtitle_zh":"你的 Codex 配额、已登录账户，以及修复重试安全上限——默认折叠。"},{"key":"usage_toggle_aria","en":"Toggle usage and limits","zh":"展开或收起用量与限制","subtitle_en":"","subtitle_zh":""},{"key":"usage_refresh_button","en":"Refresh","zh":"刷新","subtitle_en":"","subtitle_zh":""},{"key":"usage_refresh_aria","en":"Refresh usage and account now","zh":"立即刷新用量与账户","subtitle_en":"","subtitle_zh":""},{"key":"usage_signed_in_label","en":"Signed in as","zh":"登录账户","subtitle_en":"","subtitle_zh":""},{"key":"usage_auth_mode_prefix","en":"via X","zh":"通过 X","subtitle_en":"","subtitle_zh":""},{"key":"usage_account_unavailable","en":"Account identity unavailable","zh":"无法获取账户身份","subtitle_en":"","subtitle_zh":""},{"key":"usage_stale_account_hint","en":"This quota snapshot predates the current login. Run any codex turn to refresh the quota numbers.","zh":"此配额快照早于当前登录。运行任意 codex 回合即可刷新配额数据。","subtitle_en":"","subtitle_zh":""},{"key":"usage_summary_5h","en":"5h","zh":"5时","subtitle_en":"","subtitle_zh":""},{"key":"usage_summary_weekly","en":"Wk","zh":"周","subtitle_en":"","subtitle_zh":""},{"key":"usage_summary_unavailable","en":"Usage unavailable","zh":"用量不可用","subtitle_en":"","subtitle_zh":""}]}
+  </script>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var POLL_MS = 2000;
+      var pollTimer = null;
+      var lastState = null;   // most recent /api/state, so the toggle re-renders instantly
+
+      // ---- tiny DOM helpers ----
+      function $(id) { return document.getElementById(id); }
+      function el(tag, cls, text) {
+        var node = document.createElement(tag);
+        if (cls) node.className = cls;
+        if (text != null) node.textContent = text;
+        return node;
+      }
+      // Always set user/loop-derived strings via textContent (never innerHTML)
+      // so file contents can never inject markup into the page.
+
+      // =====================================================================
+      // i18n: the STRINGS dictionary + a t()/tsub() lookup. Default English;
+      // the choice persists in localStorage; the toggle re-renders instantly.
+      // Every user-visible string flows through here (machine tokens stay
+      // verbatim in both languages).
+      // =====================================================================
+      var STRINGS = {};
+      (function loadStrings() {
+        try {
+          var raw = $("i18n-strings").textContent;
+          var parsed = JSON.parse(raw);
+          (parsed.strings || []).forEach(function (row) {
+            STRINGS[row.key] = row;
+          });
+        } catch (e) {
+          STRINGS = {};
+        }
+      })();
+
+      var LANG_KEY = "loop_dashboard_lang";
+      var lang = "en";
+      try {
+        var saved = window.localStorage.getItem(LANG_KEY);
+        if (saved === "en" || saved === "zh") lang = saved;
+      } catch (e) { /* localStorage may be unavailable; default en */ }
+
+      // ---- System-checks collapse preference ----
+      // Separate localStorage key from the language choice. The user's stored
+      // choice defaults to collapsed; it is honored ONLY when the doctor reports
+      // everything passing. When issues are present, renderBadges force-expands
+      // regardless (problems are never hidden). ``healthUserExpanded`` tracks
+      // the persisted preference; ``healthForcedOpen`` reflects the current
+      // doctor verdict and is recomputed on every render.
+      var HEALTH_KEY = "loop_dashboard_health_expanded";
+      var healthUserExpanded = false;   // default collapsed
+      try {
+        var savedHealth = window.localStorage.getItem(HEALTH_KEY);
+        if (savedHealth === "1") healthUserExpanded = true;
+        else if (savedHealth === "0") healthUserExpanded = false;
+      } catch (e) { /* localStorage may be unavailable; default collapsed */ }
+      var healthForcedOpen = false;     // set by renderBadges when issues exist
+
+      // Paint the collapse state onto the DOM. The section is EXPANDED when the
+      // user chose to expand it OR the doctor is forcing it open due to issues.
+      // Only the body folds; the head (with the verdict badge) always shows.
+      function paintHealthCollapse() {
+        var head = $("health-head");
+        var body = $("health-body");
+        if (!head || !body) return;
+        var expanded = healthUserExpanded || healthForcedOpen;
+        head.classList.toggle("is-collapsed", !expanded);
+        body.classList.toggle("is-collapsed", !expanded);
+        head.setAttribute("aria-expanded", expanded ? "true" : "false");
+      }
+
+      // User toggled the head. Flip and persist the preference. When the doctor
+      // is forcing the section open (issues present), a click still records the
+      // user's intent but cannot visually collapse it below the forced-open
+      // floor -- problems stay visible until they clear.
+      function toggleHealthCollapse() {
+        healthUserExpanded = !healthUserExpanded;
+        try { window.localStorage.setItem(HEALTH_KEY, healthUserExpanded ? "1" : "0"); }
+        catch (e) { /* ignore */ }
+        paintHealthCollapse();
+      }
+
+      // ---- Usage & Limits collapse preference ----
+      // Its OWN localStorage key (distinct from the language key and the health
+      // key), default COLLAPSED. Unlike System Checks there is no force-open
+      // floor: the fold is purely the user's choice. The collapsed head still
+      // carries a live one-line usage summary, so folding never hides token
+      // pressure. Polling only repaints the summary text; it reads
+      // ``usageUserExpanded`` and never stomps the current fold state.
+      var USAGE_KEY = "loop_dashboard_usage_expanded";
+      var usageUserExpanded = false;   // default collapsed
+      try {
+        var savedUsage = window.localStorage.getItem(USAGE_KEY);
+        if (savedUsage === "1") usageUserExpanded = true;
+        else if (savedUsage === "0") usageUserExpanded = false;
+      } catch (e) { /* localStorage may be unavailable; default collapsed */ }
+
+      // Paint the Usage & Limits fold onto the DOM. Only the body folds; the
+      // head (with the live summary + refresh) always shows.
+      function paintUsageCollapse() {
+        var head = $("usage-head");
+        var body = $("usage-body-wrap");
+        if (!head || !body) return;
+        head.classList.toggle("is-collapsed", !usageUserExpanded);
+        body.classList.toggle("is-collapsed", !usageUserExpanded);
+        head.setAttribute("aria-expanded", usageUserExpanded ? "true" : "false");
+      }
+
+      // User toggled the Usage & Limits head. Flip and persist the preference.
+      function toggleUsageCollapse() {
+        usageUserExpanded = !usageUserExpanded;
+        try { window.localStorage.setItem(USAGE_KEY, usageUserExpanded ? "1" : "0"); }
+        catch (e) { /* ignore */ }
+        paintUsageCollapse();
+      }
+
+      // Look up a localized string by key. Falls back to the key itself if the
+      // dictionary is somehow missing an entry (never renders "undefined").
+      function t(key) {
+        var row = STRINGS[key];
+        if (!row) return key;
+        var v = row[lang];
+        if (v == null || v === "") v = (row.en != null ? row.en : key);
+        return v;
+      }
+      // Look up the localized subtitle for a key (may be empty -> "").
+      function tsub(key) {
+        var row = STRINGS[key];
+        if (!row) return "";
+        var v = row["subtitle_" + lang];
+        return v == null ? "" : v;
+      }
+      // Replace every "N"/"NN" count token in a localized string, in order,
+      // with the given values. Used for "N lane(s)", "N total, N active..."
+      // etc. Longer tokens first so "NN" is not eaten by "N".
+      function tfmt(key, values) {
+        var s = t(key);
+        var i = 0;
+        s = s.replace(/NN|N/g, function () {
+          var val = (i < values.length) ? values[i] : "";
+          i += 1;
+          return String(val);
+        });
+        return s;
+      }
+
+      // Apply every static data-i18n / data-i18n-sub / data-i18n-aria binding.
+      function applyStaticI18n() {
+        document.documentElement.setAttribute("lang", lang === "zh" ? "zh" : "en");
+        var nodes = document.querySelectorAll("[data-i18n]");
+        for (var i = 0; i < nodes.length; i++) {
+          nodes[i].textContent = t(nodes[i].getAttribute("data-i18n"));
+        }
+        var subs = document.querySelectorAll("[data-i18n-sub]");
+        for (var j = 0; j < subs.length; j++) {
+          subs[j].textContent = tsub(subs[j].getAttribute("data-i18n-sub"));
+        }
+        var arias = document.querySelectorAll("[data-i18n-aria]");
+        for (var k = 0; k < arias.length; k++) {
+          arias[k].setAttribute("aria-label", t(arias[k].getAttribute("data-i18n-aria")));
+        }
+        // Localized placeholders for the add-lane inputs.
+        var laneInput = $("lane-input");
+        if (laneInput) laneInput.setAttribute("placeholder", t("modal_lane_name_placeholder"));
+        var roleInput = $("role-input");
+        if (roleInput) roleInput.setAttribute("placeholder", t("modal_role_placeholder"));
+        // The pulse text tracks connection state, not a fixed key; refresh it
+        // from its last-known state key.
+        refreshPulseText();
+        paintLangToggle();
+      }
+
+      function paintLangToggle() {
+        var enS = document.querySelector("#lang-toggle .en");
+        var zhS = document.querySelector("#lang-toggle .zh");
+        if (enS) enS.className = "en " + (lang === "en" ? "on" : "off");
+        if (zhS) zhS.className = "zh " + (lang === "zh" ? "on" : "off");
+      }
+
+      // ---- connection / pulse ----
+      // Remember the current pulse state key so a language flip relabels it.
+      var pulseStateKey = "pulse_connecting";
+      function refreshPulseText() {
+        var node = $("pulse-text");
+        if (node) node.textContent = t(pulseStateKey);
+      }
+      function setConn(connected, stale) {
+        var pulse = $("pulse");
+        var banner = $("conn-banner");
+        if (!connected) {
+          pulse.classList.add("stale");
+          pulseStateKey = "pulse_offline";
+          refreshPulseText();
+          banner.classList.add("show");
+          return;
+        }
+        banner.classList.remove("show");
+        if (stale) {
+          pulse.classList.add("stale");
+          pulseStateKey = "pulse_heartbeat_stale";
+        } else {
+          pulse.classList.remove("stale");
+          pulseStateKey = "pulse_live";
+        }
+        refreshPulseText();
+      }
+
+      // ---- status class mappers ----
+      function requestStatusClass(status) {
+        var s = (status || "").toUpperCase();
+        if (s === "ACCEPTED") return "st-accepted";
+        if (s === "BLOCKED") return "st-blocked";
+        if (s === "" || s === "PLANNED") return "st-neutral";
+        return "st-active";
+      }
+
+      // ---- badge rendering ----
+      function chip(label, kind) {
+        return el("span", "chip " + kind, label);
+      }
+      function boolChip(value) {
+        if (value === true) return chip(t("badge_bool_ok"), "ok");
+        if (value === false) return chip(t("badge_bool_fail"), "bad");
+        return chip(t("badge_bool_na"), "idle");
+      }
+
+      // Append a badge with an optional localized subtitle.
+      function pushBadge(box, labelKey, chipNode, note, subKey) {
+        var b = el("div", "badge");
+        b.appendChild(el("span", "badge-label", t(labelKey)));
+        var v = el("div", "badge-value");
+        v.appendChild(chipNode);
+        b.appendChild(v);
+        if (note != null && note !== "") b.appendChild(el("span", "badge-note", note));
+        if (subKey) {
+          var sub = tsub(subKey);
+          if (sub) b.appendChild(el("span", "badge-sub", sub));
+        }
+        box.appendChild(b);
+      }
+
+      function renderBadges(doc) {
+        var box = $("badges");
+        box.textContent = "";
+        var statusNote = $("doctor-status");
+
+        // Auto-expand override: force the section open whenever the doctor
+        // reports issues (not all checks passing), so problems are never hidden
+        // behind the fold. When everything passes (or the doctor is merely
+        // unavailable, which is not an "issue"), the user's stored preference
+        // is honored. Recomputed on every render, then painted -- so a poll
+        // can flip the forced-open floor without stomping the user's choice.
+        healthForcedOpen = !!(doc && doc.available !== false && doc.ok === false);
+        paintHealthCollapse();
+
+        if (!doc || doc.available === false) {
+          statusNote.textContent = t("doctor_status_unavailable");
+          pushBadge(box, "badge_doctor_label",
+            chip(t("badge_doctor_value_unavailable"), "idle"),
+            t("badge_doctor_note_default"), "badge_doctor_label");
+          return;
+        }
+        statusNote.textContent = doc.ok === false
+          ? t("doctor_status_issues") : t("doctor_status_clean");
+
+        // Gate available
+        pushBadge(box, "badge_gate_available_label", boolChip(doc.gate_available),
+          doc.gate_available ? t("badge_gate_available_note_true")
+                             : t("badge_gate_available_note_false"),
+          "badge_gate_available_label");
+
+        // Completion gate (machine-checked complete)
+        var failN = (doc.gate_failed_requests && doc.gate_failed_requests.length) || 0;
+        pushBadge(box, "badge_completion_gate_label", boolChip(doc.completion_gate_ok),
+          failN ? tfmt("badge_completion_gate_note_fail", [failN])
+                : t("badge_completion_gate_note_pass"),
+          "badge_completion_gate_label");
+
+        // Evidence recorded (proof on file)
+        pushBadge(box, "badge_evidence_recorded_label", boolChip(doc.evidence_recorded_ok),
+          t("badge_evidence_recorded_note"), "badge_evidence_recorded_label");
+
+        // Stale decisions
+        var d = doc.decisions || {};
+        var staleN = d.stale || 0;
+        pushBadge(box, "badge_stale_decisions_label",
+          chip(String(staleN), staleN > 0 ? "warn" : "ok"),
+          tfmt("badge_stale_decisions_note", [d.total || 0, d.active || 0, d.malformed || 0]),
+          "badge_stale_decisions_label");
+
+        // Orphan-suspect lanes (possibly stuck)
+        var orphans = doc.orphan_suspects || [];
+        pushBadge(box, "badge_orphan_suspects_label",
+          chip(String(orphans.length), orphans.length > 0 ? "warn" : "ok"),
+          orphans.length ? orphans.join(", ") : t("badge_orphan_suspects_note_default"),
+          "badge_orphan_suspects_label");
+      }
+
+      // ---- lane cards ----
+      // Localize a lane status bucket ("registered"/"needs-thread"/"stale").
+      function laneStatusLabel(status) {
+        if (status === "registered") return t("lane_status_registered");
+        if (status === "needs-thread") return t("lane_status_needs_thread");
+        if (status === "stale") return t("lane_status_stale");
+        return t("lane_status_unknown");
+      }
+
+      // Add a labeled summary row (key + value). ``idle`` styles a placeholder
+      // value; ``mono`` renders the value in monospace (for request ids).
+      function summaryRow(parent, labelKey, valueText, opts) {
+        opts = opts || {};
+        var row = el("div", "lane-sum-row");
+        row.appendChild(el("span", "k", t(labelKey)));
+        var vcls = "v" + (opts.mono ? " mono" : "") + (opts.idle ? " idle" : "");
+        row.appendChild(el("span", vcls, valueText));
+        parent.appendChild(row);
+      }
+
+      function renderLaneSummary(card, lane) {
+        var sum = lane.summary || {};
+        var box = el("div", "lane-summary");
+
+        // Status chip from the parsed current.md status (idle-aware).
+        var statusVal = (sum.status || "").trim();
+        var statusRow = el("div", "lane-sum-row");
+        statusRow.appendChild(el("span", "k", t("requests_th_status")));
+        if (statusVal) {
+          var kind = /idle|wait/i.test(statusVal) ? "idle"
+            : /block/i.test(statusVal) ? "bad"
+            : /done|accept|complete|ok/i.test(statusVal) ? "ok" : "warn";
+          statusRow.appendChild(chip(statusVal, kind));
+        } else {
+          statusRow.appendChild(el("span", "v idle", t("lane_summary_status_idle")));
+        }
+        box.appendChild(statusRow);
+
+        // Request id, or a localized "idle" placeholder when none.
+        var rid = (sum.current_request_id || "").trim();
+        summaryRow(box, "requests_th_request", rid || t("lane_status_needs_thread"),
+          { mono: !!rid, idle: !rid });
+
+        // Next action (first parsed item), if present.
+        var next = (sum.next_action && sum.next_action.length) ? sum.next_action[0] : "";
+        if (next) summaryRow(box, "requests_th_next_action", next, {});
+
+        // Blockers: highlighted only when non-trivial (parser already dropped
+        // "None." placeholders, so any entry here is real).
+        var blockers = sum.blockers || [];
+        if (blockers.length) {
+          var bl = el("div", "lane-sum-blockers");
+          bl.appendChild(el("span", "k", t("lane_blockers_label")));
+          blockers.forEach(function (b) { bl.appendChild(el("span", "b", b)); });
+          box.appendChild(bl);
+        }
+
+        card.appendChild(box);
+      }
+
+      function renderLanes(lanes) {
+        var grid = $("lanes");
+        grid.textContent = "";
+        $("lanes-count").textContent = tfmt("lanes_count", [lanes.length]);
+        $("lanes-empty").style.display = lanes.length ? "none" : "block";
+
+        lanes.forEach(function (lane) {
+          var card = el("div", "lane-card status-" + (lane.status || "neutral"));
+
+          var top = el("div", "lane-top");
+          top.appendChild(el("h3", "lane-name", lane.lane));
+          var statusKind = lane.status === "registered" ? "ok"
+            : lane.status === "stale" ? "bad" : "warn";
+          top.appendChild(chip(laneStatusLabel(lane.status), statusKind));
+          card.appendChild(top);
+
+          if (lane.role) card.appendChild(el("p", "lane-role", lane.role));
+
+          // meta: heartbeat + conversation (thread)
+          var meta = el("div", "lane-meta");
+          var hb = lane.heartbeat || {};
+          var hbCls = hb.state === "fresh" ? "hb-fresh"
+            : hb.state === "stale" ? "hb-stale" : "hb-none";
+          var hbText;
+          if (hb.state === "none" || hb.age_mins == null) {
+            hbText = t("lane_meta_heartbeat_none");
+          } else {
+            hbText = tfmt("lane_meta_heartbeat_fresh", [hb.age_mins]);
+            if (hb.state === "stale") hbText += " " + t("lane_meta_heartbeat_stale_suffix");
+          }
+          var hbSpan = el("span");
+          hbSpan.appendChild(el("span", "k", t("lane_meta_heartbeat_label") + " "));
+          hbSpan.appendChild(el("span", hbCls, hbText));
+          meta.appendChild(hbSpan);
+
+          var thSpan = el("span");
+          thSpan.appendChild(el("span", "k", t("lane_meta_thread_label") + " "));
+          thSpan.appendChild(document.createTextNode(
+            lane.thread_id && lane.thread_id !== "UNVERIFIED"
+              ? lane.thread_id : t("lane_meta_thread_unset")));
+          meta.appendChild(thSpan);
+          card.appendChild(meta);
+
+          // structured current.md summary
+          renderLaneSummary(card, lane);
+
+          // raw current.md, collapsed. "View raw" flows through the dictionary
+          // (key lane_view_raw) so it flips with the toggle like every other
+          // user-visible string.
+          if (lane.current && lane.current.trim()) {
+            var det = el("details", "lane-raw");
+            det.appendChild(el("summary", null, t("lane_view_raw")));
+            det.appendChild(el("pre", "lane-current", lane.current.trim()));
+            card.appendChild(det);
+          }
+
+          // workspace artifacts: full localized sentence with the count
+          // substituted in place (the "N" token sits mid-string in ZH, so we
+          // render the whole sentence rather than splitting the number out).
+          var art = el("div", "lane-artifacts");
+          art.appendChild(document.createTextNode(
+            tfmt("lane_artifacts_label", [lane.workspace_count || 0])));
+          card.appendChild(art);
+
+          grid.appendChild(card);
+        });
+      }
+
+      // ---- requests table ----
+      function cellFor(row, keys) {
+        for (var i = 0; i < keys.length; i++) {
+          if (row[keys[i]] != null && String(row[keys[i]]).trim() !== "") {
+            return String(row[keys[i]]);
+          }
+        }
+        return "";
+      }
+
+      function renderRequests(requests) {
+        var table = $("requests-table");
+        var body = $("requests-body");
+        body.textContent = "";
+        $("requests-count").textContent = tfmt("requests_count", [requests.length]);
+        if (!requests.length) {
+          table.style.display = "none";
+          $("requests-empty").style.display = "block";
+          return;
+        }
+        $("requests-empty").style.display = "none";
+        table.style.display = "";
+
+        requests.forEach(function (row) {
+          var tr = el("tr");
+          var rid = cellFor(row, ["request_id"]);
+          var status = cellFor(row, ["status"]);
+          var owner = cellFor(row, ["owner_lane", "owner"]);
+          var iter = cellFor(row, ["iteration", "iter"]);
+          var next = cellFor(row, ["next_action"]);
+          var updated = cellFor(row, ["updated_at", "updated"]);
+
+          var tdR = el("td", "mono"); tdR.textContent = rid || "--"; tr.appendChild(tdR);
+
+          var tdS = el("td");
+          tdS.appendChild(el("span", "status-pill " + requestStatusClass(status),
+            status || "--"));
+          tr.appendChild(tdS);
+
+          tr.appendChild(el("td", null, owner || "--"));
+          var tdI = el("td", "mono"); tdI.textContent = iter || "0"; tr.appendChild(tdI);
+          tr.appendChild(el("td", null, next || "--"));
+          var tdU = el("td", "mono"); tdU.textContent = updated || "--"; tr.appendChild(tdU);
+
+          body.appendChild(tr);
+        });
+      }
+
+      // ---- evidence table ----
+      function renderEvidence(evidence) {
+        var records = (evidence && evidence.records) || [];
+        var errors = (evidence && evidence.load_errors) || [];
+        var table = $("evidence-table");
+        var body = $("evidence-body");
+        body.textContent = "";
+        $("evidence-count").textContent = tfmt("evidence_count", [records.length]);
+
+        if (!records.length) {
+          table.style.display = "none";
+          $("evidence-empty").style.display = "block";
+        } else {
+          $("evidence-empty").style.display = "none";
+          table.style.display = "";
+          records.forEach(function (rec) {
+            var tr = el("tr");
+            var tdR = el("td", "mono"); tdR.textContent = rec.request_id || "--";
+            tr.appendChild(tdR);
+            tr.appendChild(el("td", null, rec.checkpoint || "--"));
+            var tdC = el("td", "mono"); tdC.textContent = rec.command || "--";
+            tr.appendChild(tdC);
+            var tdE = el("td");
+            var code = rec.exit_code;
+            tdE.appendChild(el("span", code === 0 ? "exit-ok" : "exit-bad",
+              (code === null || code === undefined) ? "?" : String(code)));
+            tr.appendChild(tdE);
+            var tdT = el("td", "mono"); tdT.textContent = rec.ran_at || "--";
+            tr.appendChild(tdT);
+            body.appendChild(tr);
+          });
+        }
+
+        var errBox = $("evidence-errors");
+        errBox.textContent = "";
+        if (errors.length) {
+          var sources = errors.map(function (e) { return e.source; }).join(", ");
+          // Replace the trailing "..." placeholder with the real source list.
+          errBox.textContent = tfmt("evidence_errors_note", [errors.length])
+            .replace(/\.\.\.$/, sources);
+        }
+      }
+
+      // ---- run-log timeline ----
+      function renderRunLog(lines) {
+        var ul = $("runlog");
+        ul.textContent = "";
+        $("runlog-count").textContent = tfmt("runlog_count", [lines.length]);
+        if (!lines.length) {
+          $("runlog-empty").style.display = "block";
+          return;
+        }
+        $("runlog-empty").style.display = "none";
+        lines.forEach(function (line) {
+          var trimmed = line.trim();
+          if (/^\|?\s*-{2,}/.test(trimmed) && /-\s*\|/.test(trimmed)) return;
+          if (/^\|\s*timestamp\s*\|/i.test(trimmed)) return;
+          if (/^#\s/.test(trimmed)) return;
+          var li = el("li");
+          if (trimmed.indexOf("|") !== -1) {
+            var cells = trimmed.replace(/^\|/, "").replace(/\|$/, "").split("|")
+              .map(function (c) { return c.trim(); })
+              .filter(function (c) { return c.length; });
+            li.textContent = cells.join("  ·  ");
+          } else {
+            li.textContent = trimmed;
+          }
+          ul.appendChild(li);
+        });
+        if (!ul.children.length) $("runlog-empty").style.display = "block";
+      }
+
+      // ---- usage panel (USED-forward) ----
+      function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+      // resets_at is a unix epoch (seconds). Render in LOCAL time.
+      // mode "time" -> HH:MM (5h window); mode "date" -> "Mon D" (weekly).
+      function localReset(epochSeconds, mode) {
+        if (epochSeconds == null || isNaN(epochSeconds)) return "--";
+        var d = new Date(epochSeconds * 1000);
+        if (isNaN(d.getTime())) return "--";
+        if (mode === "date") {
+          // Month abbreviation flows through the dictionary (usage_month_1..12)
+          // so the weekly reset date localizes with the toggle instead of
+          // always rendering an English month.
+          var month = t("usage_month_" + (d.getMonth() + 1));
+          return month + " " + d.getDate();
+        }
+        return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+      }
+
+      function localFromIso(iso) {
+        if (!iso) return "--";
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return String(iso);
+        return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+               " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+      }
+
+      // Bar fill class by USED percent: <60 normal(ok), 60-85 amber(warn),
+      // >85 red(bad). This is the flipped semantics (was keyed on remaining).
+      function usedClass(used) {
+        if (used == null || isNaN(used)) return "usage-fill-warn";
+        if (used > 85) return "usage-fill-bad";
+        if (used >= 60) return "usage-fill-warn";
+        return "usage-fill-ok";
+      }
+
+      function fmtPct(v) {
+        if (v == null || isNaN(v)) return "--";
+        var r = Math.round(v * 10) / 10;
+        return (r % 1 === 0) ? String(r) : r.toFixed(1);
+      }
+
+      // A single usage window row: primary large number is USED%, the bar fills
+      // to USED%, and remaining is the small secondary line. Reset time stays.
+      function usageRow(labelKey, win, mode) {
+        var row = el("div", "usage-row");
+        var used = win ? win.used_percent : null;
+        var remaining = win ? win.remaining_percent : null;
+
+        var top = el("div", "usage-row-top");
+        top.appendChild(el("span", "win", t(labelKey)));
+        // Primary: "NN% used" with NN replaced by the used percent.
+        var pct = el("span", "pct",
+          tfmt("usage_pct_used_primary", [fmtPct(used)]));
+        top.appendChild(pct);
+        row.appendChild(top);
+
+        var bar = el("div", "usage-bar");
+        var fill = el("span", usedClass(used));
+        var w = (used == null || isNaN(used)) ? 0 : Math.max(0, Math.min(100, used));
+        fill.style.width = w + "%";
+        bar.appendChild(fill);
+        row.appendChild(bar);
+
+        var bottom = el("div", "usage-row-bottom");
+        // Secondary: "NN% remaining".
+        bottom.appendChild(el("span", null,
+          (remaining != null) ? tfmt("usage_pct_remaining_secondary", [fmtPct(remaining)]) : ""));
+        // Reset time (label stays; uses the window's resets_at).
+        bottom.appendChild(el("span", null,
+          win ? localReset(win.resets_at, mode) : ""));
+        row.appendChild(bottom);
+        return row;
+      }
+
+      // Tint class for a summary/identity USED number: >85 danger(bad),
+      // 60-85 amber(warn), else none. Mirrors usedClass' thresholds so the
+      // folded summary and the expanded bars agree on when to alarm.
+      function usedTint(used) {
+        if (used == null || isNaN(used)) return "";
+        if (used > 85) return "bad";
+        if (used >= 60) return "warn";
+        return "";
+      }
+
+      // Render the "Signed in as" identity row + the stale-account hint from the
+      // scoped ``usage.account`` object (email/name/plan/auth_mode only -- the
+      // server never sends token material). Both rows hide when there is no
+      // account. Called from renderUsage so identity shows even when the quota
+      // numbers themselves are unavailable (logged in, no session data yet).
+      function renderAccount(account) {
+        var row = $("signed-in");
+        var hint = $("stale-hint");
+        if (!row || !hint) return;
+        var emailEl = $("si-email");
+        var nameEl = $("si-name");
+        var planEl = $("si-plan");
+        var modeEl = $("si-mode");
+
+        if (!account || account.available !== true) {
+          // Not available: hide the identity row. (The usage-unavailable note
+          // below already explains the logged-out / no-data case.) If we at
+          // least know the auth_mode, surface a minimal note so an apikey login
+          // still shows something rather than a blank.
+          if (account && account.auth_mode) {
+            row.style.display = "flex";
+            emailEl.textContent = t("usage_account_unavailable");
+            nameEl.textContent = "";
+            planEl.textContent = "";
+            modeEl.textContent = t("usage_auth_mode_prefix")
+              .replace("X", account.auth_mode);
+          } else {
+            row.style.display = "none";
+          }
+          hint.style.display = "none";
+          return;
+        }
+
+        row.style.display = "flex";
+        emailEl.textContent = account.email || t("usage_account_unavailable");
+        // Show the name only when it differs from the email (avoid echoing).
+        nameEl.textContent =
+          (account.name && account.name !== account.email) ? account.name : "";
+        // Plan badge (data value; rendered verbatim). Empty -> the :empty CSS
+        // rule hides the badge.
+        planEl.textContent = account.plan_type ? account.plan_type : "";
+        // auth_mode via the localized "via X" template (X is a machine token).
+        modeEl.textContent = account.auth_mode
+          ? t("usage_auth_mode_prefix").replace("X", account.auth_mode) : "";
+
+        // Stale-account hint: shown when the server flagged the quota snapshot
+        // as predating the current login (plan changed, or auth.json newer than
+        // the snapshot). The full sentence is localized; "codex" stays verbatim.
+        if (account.snapshot_stale === true) {
+          hint.style.display = "block";
+          hint.textContent = t("usage_stale_account_hint");
+        } else {
+          hint.style.display = "none";
+        }
+      }
+
+      // Render the live one-line summary in the (possibly folded) Usage & Limits
+      // head: "5h NN% . Wk NN% . <plan> . <email>". Numbers take the amber/red
+      // tint when a window is under pressure, so folding never hides it. When
+      // usage is unavailable, a short localized note stands in.
+      function renderUsageSummary(usage) {
+        var box = $("usage-summary");
+        if (!box) return;
+        box.textContent = "";
+        var account = (usage && usage.account) || null;
+
+        if (!usage || usage.available !== true) {
+          // No quota numbers. If we at least know who is signed in, show the
+          // email so the folded head still identifies the account; otherwise a
+          // short "unavailable" note.
+          if (account && account.available === true && account.email) {
+            box.appendChild(el("span", "us-email", account.email));
+          } else {
+            box.appendChild(el("span", null, t("usage_summary_unavailable")));
+          }
+          return;
+        }
+
+        var primary = usage.primary || {};
+        var secondary = usage.secondary || {};
+        var p = primary.used_percent;
+        var s = secondary.used_percent;
+
+        function addWindow(labelKey, used) {
+          var seg = el("span");
+          seg.appendChild(document.createTextNode(t(labelKey) + " "));
+          var num = el("span", "us-num" + (usedTint(used) ? " " + usedTint(used) : ""));
+          num.textContent = (used == null || isNaN(used)) ? "--%" : (fmtPct(used) + "%");
+          seg.appendChild(num);
+          return seg;
+        }
+        function sep() { return el("span", "us-sep", "·"); }
+
+        box.appendChild(addWindow("usage_summary_5h", p));
+        box.appendChild(sep());
+        box.appendChild(addWindow("usage_summary_weekly", s));
+
+        var plan = (account && account.plan_type) || usage.plan_type;
+        if (plan) {
+          box.appendChild(sep());
+          box.appendChild(el("span", "us-plan", plan));
+        }
+        if (account && account.available === true && account.email) {
+          box.appendChild(sep());
+          box.appendChild(el("span", "us-email", account.email));
+        }
+      }
+
+      function renderUsage(usage) {
+        var body = $("usage-body");
+        var foot = $("usage-foot");
+        body.textContent = "";
+        // Identity row + stale hint render from usage.account regardless of
+        // whether the quota numbers are available.
+        renderAccount(usage && usage.account);
+        if (!usage || usage.available !== true) {
+          foot.style.display = "none";
+          var note = el("div", "usage-unavailable", t("usage_unavailable_title"));
+          var reason = el("span", "reason");
+          var code = usage && (usage.reason_code || usage.reason);
+          if (code === "codex_not_logged_in") {
+            // Not logged in: the hint prose is localized through the dictionary
+            // (usage_not_logged_in_hint); the "codex login" command stays
+            // verbatim in both languages, rendered as its own span.
+            reason.appendChild(document.createTextNode(
+              t("usage_not_logged_in_hint") + " "));
+            reason.appendChild(el("span", "login-cmd", "codex login"));
+          } else {
+            // Logged in but no data yet (or unknown): show the default hint.
+            reason.textContent = t("usage_unavailable_reason_default");
+          }
+          note.appendChild(reason);
+          body.appendChild(note);
+          return;
+        }
+        body.appendChild(usageRow("usage_window_5h", usage.primary, "time"));
+        body.appendChild(usageRow("usage_window_weekly", usage.secondary, "date"));
+        foot.style.display = "flex";
+        // Plan + "as of" prefixes reuse the bilingual usage_plan_prefix /
+        // usage_asof_prefix keys, substituting their "--" placeholder with the
+        // real value (same pattern as the footer) so neither language is
+        // hardcoded inline.
+        $("usage-plan").textContent = usage.plan_type
+          ? t("usage_plan_prefix").replace(/--\s*$/, usage.plan_type)
+          : t("usage_plan_prefix");
+        $("usage-asof").textContent =
+          t("usage_asof_prefix").replace(/--\s*$/, localFromIso(usage.as_of));
+      }
+
+      // ---- policy stepper ----
+      var MFC_MIN = 1, MFC_MAX = 10;
+      var mfcValue = 3;       // the value shown in the stepper
+      var mfcCurrent = 3;     // the last server-confirmed value
+      var mfcDirty = false;   // true once the user edits, until Save succeeds
+
+      function clampMfc(n) {
+        n = parseInt(n, 10);
+        if (isNaN(n)) return mfcCurrent;
+        if (n < MFC_MIN) return MFC_MIN;
+        if (n > MFC_MAX) return MFC_MAX;
+        return n;
+      }
+      function paintMfc() {
+        $("mfc-value").textContent = String(mfcValue);
+        // "now: N" sublabel, localized.
+        $("mfc-current-sublabel").textContent =
+          t("mfc_current_sublabel").replace(/3/, String(mfcCurrent));
+        $("mfc-dec").disabled = (mfcValue <= MFC_MIN);
+        $("mfc-inc").disabled = (mfcValue >= MFC_MAX);
+      }
+      function renderPolicy(policy) {
+        var cur = (policy && typeof policy.max_fix_cycles === "number")
+          ? policy.max_fix_cycles : 3;
+        mfcCurrent = cur;
+        if (!mfcDirty) mfcValue = cur;
+        paintMfc();
+      }
+
+      // ---- main render ----
+      // Compact a loop-dir path to its last two segments for the header chip.
+      // Handles both "/" and "\\" separators; drops empty/trailing segments.
+      function shortenLoopDir(full) {
+        var segs = String(full || "").split(/[\/\\]+/).filter(function (s) {
+          return s.length > 0;
+        });
+        if (segs.length <= 2) return segs.join("/") || String(full || "");
+        return segs.slice(-2).join("/");
+      }
+
+      function render(state) {
+        lastState = state;
+        var loopDirFull = state.loop_dir || "docs/loop";
+        var loopDirEl = $("loop-dir");
+        loopDirEl.textContent = shortenLoopDir(loopDirFull);
+        loopDirEl.title = loopDirFull;
+        var doc = state.doctor || {};
+        var anyStale = (state.lanes || []).some(function (l) {
+          return l.heartbeat && l.heartbeat.state === "stale";
+        });
+        setConn(true, anyStale);
+        renderUsage(state.usage || {});
+        renderUsageSummary(state.usage || {});
+        renderPolicy(state.policy || {});
+        renderBadges(doc);
+        renderLanes(state.lanes || []);
+        renderRequests(state.requests || []);
+        renderEvidence(state.evidence || {});
+        renderRunLog(state.run_log_tail || []);
+        $("foot-generated").textContent =
+          t("footer_generated").replace(/--\s*$/, (state.generated_at || "--"));
+      }
+
+      // ---- polling ----
+      function poll() {
+        fetch("/api/state", { cache: "no-store" })
+          .then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
+          .then(function (state) { render(state); })
+          .catch(function () { setConn(false, false); })
+          .then(function () {
+            pollTimer = setTimeout(poll, POLL_MS);
+          });
+      }
+
+      // ---- language toggle ----
+      function setLang(next) {
+        lang = (next === "zh") ? "zh" : "en";
+        try { window.localStorage.setItem(LANG_KEY, lang); } catch (e) { /* ignore */ }
+        applyStaticI18n();
+        // Re-render dynamic content from the last snapshot (no reload/refetch).
+        if (lastState) render(lastState);
+      }
+      $("lang-toggle").addEventListener("click", function () {
+        setLang(lang === "en" ? "zh" : "en");
+      });
+
+      // ---- system-checks collapse wiring ----
+      // The head acts as a button: click, Enter, or Space toggles the fold.
+      (function wireHealthToggle() {
+        var head = $("health-head");
+        if (!head) return;
+        head.addEventListener("click", toggleHealthCollapse);
+        head.addEventListener("keydown", function (e) {
+          if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+            e.preventDefault();
+            toggleHealthCollapse();
+          }
+        });
+      })();
+
+      // ---- usage & limits collapse + refresh wiring ----
+      // The head toggles the fold on click / Enter / Space, EXCEPT when the
+      // interaction originates from the Refresh button (which does its own
+      // thing and must not fold the section). The button calls
+      // stopPropagation so its click/keys never reach the head toggle.
+      (function wireUsageToggle() {
+        var head = $("usage-head");
+        if (!head) return;
+        head.addEventListener("click", function (e) {
+          var rb = $("usage-refresh");
+          if (rb && (e.target === rb || rb.contains(e.target))) return;
+          toggleUsageCollapse();
+        });
+        head.addEventListener("keydown", function (e) {
+          var rb = $("usage-refresh");
+          if (rb && (e.target === rb || rb.contains(e.target))) return;
+          if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+            e.preventDefault();
+            toggleUsageCollapse();
+          }
+        });
+      })();
+
+      // Refresh button: re-read auth.json + the newest session by hitting the
+      // read-only ``/api/state?refresh=1`` variant ONCE, then re-render. It does
+      // not toggle the fold (stopPropagation), and normal 2s polling keeps using
+      // the cached path. Guarded so a failed refresh just restores the button.
+      var usageRefreshing = false;
+      function refreshUsage() {
+        if (usageRefreshing) return;
+        usageRefreshing = true;
+        var btn = $("usage-refresh");
+        if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+        fetch("/api/state?refresh=1", { cache: "no-store" })
+          .then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
+          .then(function (state) { render(state); })
+          .catch(function () { /* leave the last good render in place */ })
+          .then(function () {
+            usageRefreshing = false;
+            if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+          });
+      }
+      (function wireUsageRefresh() {
+        var btn = $("usage-refresh");
+        if (!btn) return;
+        btn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          refreshUsage();
+        });
+        btn.addEventListener("keydown", function (e) {
+          // Keep Enter/Space on the button from bubbling to the head toggle.
+          if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+            e.stopPropagation();
+          }
+        });
+      })();
+
+      // ---- add-lane modal wiring ----
+      var backdrop = $("modal-backdrop");
+      function openModal() {
+        $("form-msg").textContent = "";
+        $("form-msg").className = "form-msg";
+        $("lane-input").value = "";
+        $("role-input").value = "";
+        backdrop.classList.add("open");
+        $("lane-input").focus();
+      }
+      function closeModal() { backdrop.classList.remove("open"); }
+
+      $("add-lane-btn").addEventListener("click", openModal);
+      $("cancel-btn").addEventListener("click", closeModal);
+      backdrop.addEventListener("click", function (e) {
+        if (e.target === backdrop) closeModal();
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && backdrop.classList.contains("open")) closeModal();
+      });
+
+      $("add-lane-form").addEventListener("submit", function (e) {
+        e.preventDefault();
+        var lane = $("lane-input").value.trim();
+        var role = $("role-input").value.trim();
+        var msg = $("form-msg");
+        var submit = $("submit-btn");
+
+        // Client-side pre-check mirrors the server regex for a fast error.
+        if (!/^[a-z][a-z0-9-]{1,30}$/.test(lane)) {
+          msg.className = "form-msg err";
+          msg.textContent = t("modal_form_msg_lane_pattern_error");
+          return;
+        }
+
+        submit.disabled = true;
+        msg.className = "form-msg";
+        msg.textContent = t("modal_form_msg_creating");
+
+        fetch("/api/lanes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lane: lane, role: role })
+        })
+          .then(function (r) {
+            return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+          })
+          .then(function (res) {
+            if (res.body && res.body.ok) {
+              msg.className = "form-msg ok";
+              // "Created lane \"X.\" ..." with X replaced by the lane name.
+              msg.textContent = t("modal_form_msg_success")
+                .replace("X", res.body.lane);
+              if (pollTimer) clearTimeout(pollTimer);
+              poll();
+              setTimeout(closeModal, 700);
+            } else {
+              msg.className = "form-msg err";
+              msg.textContent = t("modal_form_msg_server_error");
+            }
+          })
+          .catch(function () {
+            msg.className = "form-msg err";
+            msg.textContent = t("modal_form_msg_network_error");
+          })
+          .then(function () { submit.disabled = false; });
+      });
+
+      // ---- policy stepper wiring ----
+      $("mfc-dec").addEventListener("click", function () {
+        mfcValue = clampMfc(mfcValue - 1);
+        mfcDirty = (mfcValue !== mfcCurrent);
+        $("policy-msg").textContent = "";
+        $("policy-msg").className = "policy-msg";
+        paintMfc();
+      });
+      $("mfc-inc").addEventListener("click", function () {
+        mfcValue = clampMfc(mfcValue + 1);
+        mfcDirty = (mfcValue !== mfcCurrent);
+        $("policy-msg").textContent = "";
+        $("policy-msg").className = "policy-msg";
+        paintMfc();
+      });
+      $("mfc-apply").addEventListener("click", function () {
+        var msg = $("policy-msg");
+        var apply = $("mfc-apply");
+        var target = clampMfc(mfcValue);
+        if (target === mfcCurrent) {
+          msg.className = "policy-msg";
+          msg.textContent = t("mfc_msg_already_set").replace(/N/, String(target));
+          mfcDirty = false;
+          return;
+        }
+        apply.disabled = true;
+        msg.className = "policy-msg";
+        msg.textContent = t("mfc_msg_applying");
+        fetch("/api/policy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ max_fix_cycles: target })
+        })
+          .then(function (r) {
+            return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+          })
+          .then(function (res) {
+            if (res.body && res.body.ok) {
+              msg.className = "policy-msg ok";
+              mfcCurrent = res.body.max_fix_cycles;
+              mfcValue = res.body.max_fix_cycles;
+              mfcDirty = false;
+              msg.textContent = t("mfc_msg_success").replace(/N/, String(mfcCurrent));
+              paintMfc();
+              if (pollTimer) clearTimeout(pollTimer);
+              poll();
+            } else {
+              msg.className = "policy-msg err";
+              msg.textContent = t("mfc_msg_server_error");
+            }
+          })
+          .catch(function () {
+            msg.className = "policy-msg err";
+            msg.textContent = t("mfc_msg_network_error");
+          })
+          .then(function () { apply.disabled = false; });
+      });
+
+      // ---- go ----
+      applyStaticI18n();
+      paintHealthCollapse();   // collapsed by default before the first poll
+      paintUsageCollapse();    // Usage & Limits also collapsed by default
+      poll();
+    })();
+  </script>
+</body>
+</html>

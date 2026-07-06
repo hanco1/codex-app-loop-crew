@@ -1,0 +1,1233 @@
+#!/usr/bin/env python3
+"""Read-only local dashboard for a repo-local multi-agent Codex loop.
+
+A tiny stdlib-only web server that renders the loop's durable files as a live
+page. It is a VIEW over ``docs/loop`` and nothing more: agents never read it,
+deleting it does not affect the loop, and it holds no state of its own.
+
+Endpoints (only four, everything else is 404/405):
+
+- ``GET  /``           serves ``dashboard.html`` (the file next to this script);
+- ``GET  /api/state``  returns a JSON snapshot assembled by READING files only:
+  the ``agent-lanes.md`` registry (with computed heartbeat freshness), the
+  ``requests.md`` queue, each lane's ``current.md`` text + a ``worklog.md`` tail
+  + a workspace file listing, the ``loop-run-log.md`` tail, every
+  ``evidence/*.json`` record, the doctor result via an IN-PROCESS import of
+  ``multi_agent_loop_doctor`` (guarded; degrades gracefully), a decisions
+  summary when available, the current ``max_fix_cycles`` policy value, and a
+  Codex rate-limit ``usage`` snapshot read from the newest session JSONL. The
+  ``usage`` object also carries a scoped ``account`` identity parsed from
+  ``auth.json`` (email/name/plan/auth_mode/short-id only -- never tokens). An
+  optional ``?refresh=1`` query drops the in-memory usage/account caches and
+  rescans before responding; it is still read-only (no writes) and NOT a new
+  endpoint -- normal 2s polling omits it and rides the caches;
+- ``POST /api/lanes``  a write. Body ``{"lane": ..., "role": ...}``.
+  Validates the lane name (lowercase kebab, not already registered, not a
+  reserved name), appends a registry row with ``status=needs-thread`` and a
+  default write_scope, and creates the lane directory + files by REUSING
+  ``bootstrap_agent_loop`` in-process. The registry write is atomic (temp file
+  then ``os.replace``). Returns ``{"ok": true, ...}`` or an error object;
+- ``POST /api/policy`` a write. Body ``{"max_fix_cycles": <int 1..10>}``.
+  Validates the integer, updates the ``max_fix_cycles`` line in
+  ``loop-policy.md`` atomically (preserving the rest of the file), and returns
+  ``{"ok": true, "max_fix_cycles": ...}`` or a 400 with a reason. This is a
+  HUMAN control that bounds fix-cycle token burn; agents read the policy file,
+  never this API.
+
+The server binds ``127.0.0.1`` only. No other endpoint writes anything.
+
+Codex host coupling lives in ONE place: the ``usage`` and ``account`` sections
+are the only ones that read the Codex host's UNDOCUMENTED data surfaces (session
+JSONL rate-limits, ``auth.json`` identity). That entire coupling has been
+extracted into the standalone ``codex_host_probe`` module; this dashboard is
+host-agnostic apart from a guarded import of it. If the probe module is missing,
+``/api/state`` serves usage/account as ``available: false`` (reason
+``probe_module_missing``) and never crashes -- the same graceful-degradation
+pattern the doctor uses for its imports.
+
+Usage panel privacy: the probe's ``usage`` provider reads the user's Codex
+session JSONL files (PRIVATE conversation content) but extracts ONLY the
+``rate_limits`` numbers, ``total_token_usage`` numbers, ``plan_type``, and the
+event timestamp by walking the exact known JSON paths of a ``token_count``
+event -- never a recursive scan -- so no message text, prompt, or conversation
+file path can leak through ``/api/state``. Only the newest file's tail
+(<= 256 KB) is read, and the parsed result is cached by (path, mtime, size).
+
+Account identity privacy (SECURITY RED LINE): ``auth.json`` holds OAuth tokens
+(id_token, access_token, refresh_token). The probe's account provider parses it
+server-side and the ONLY fields permitted to leave the parser are ``email``,
+``name``, ``plan_type``, ``auth_mode``, a TRUNCATED ``account_id_short`` (first
+8 chars), and the auth.json mtime as ISO. No token string, no full JWT, no
+id_token, no access/refresh token, and no full account_id may EVER appear in
+``/api/state`` or in any log line. The JWT ``id_token`` payload is decoded with
+base64url read-only (no signature verification, raw segments never returned) --
+see ``codex_host_probe`` for the full implementation and red-line notes. The
+parsed result is cached by (auth.json path, mtime, size).
+
+Design constraints honored here:
+
+- stdlib only (``http.server``, ``json``, ``argparse``, ``pathlib``, ``re``,
+  ``datetime``, ``os``, ``socketserver``); the Codex host reads (session JSONL,
+  auth.json) that once needed ``glob`` + ``threading`` here now live entirely in
+  the ``codex_host_probe`` module, imported optionally;
+- no subprocess: the doctor and bootstrap are imported in-process, matching the
+  rest of this toolkit (this box's sandbox cannot shell out);
+- every file read is guarded so a not-yet-bootstrapped loop renders a
+  meaningful empty state instead of crashing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socketserver
+import sys
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from typing import Any, Optional
+
+# Import the loop's own helpers in-process (never a subprocess). They live in
+# scripts/ beside this file. Guard every import so a missing/partial toolkit
+# degrades the dashboard gracefully instead of failing to start.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+try:
+    import multi_agent_loop_doctor as doctor  # type: ignore
+
+    DOCTOR_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive; doctor import should succeed
+    doctor = None  # type: ignore
+    DOCTOR_AVAILABLE = False
+
+try:
+    import bootstrap_agent_loop  # type: ignore
+
+    BOOTSTRAP_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive; bootstrap import should succeed
+    bootstrap_agent_loop = None  # type: ignore
+    BOOTSTRAP_AVAILABLE = False
+
+# The Codex host probe (usage/account) is the ONLY module that touches the
+# Codex host's undocumented data surfaces (session JSONL rate-limits, auth.json
+# identity). It is an OPTIONAL dependency: if it is missing, the dashboard stays
+# a pure loop tool and serves usage/account as unavailable rather than crashing.
+# Guard the import exactly like the doctor/bootstrap ones above.
+try:
+    import codex_host_probe  # type: ignore
+
+    PROBE_AVAILABLE = True
+except ImportError:
+    codex_host_probe = None  # type: ignore
+    PROBE_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Lane names are validated against this exactly (mirrors the bootstrap/doctor
+# convention): a lowercase letter, then 1..30 more of lowercase / digit / dash.
+LANE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+
+# Names that must never be registered as lanes: they collide with loop control
+# files / directories, or are otherwise structural and would confuse recovery
+# tooling. Kept lowercase for a case-insensitive check.
+RESERVED_LANE_NAMES = frozenset(
+    {
+        "lanes",
+        "messages",
+        "evidence",
+        "memory",
+        "workspace",
+        "goal",
+        "tracker",
+        "constraints",
+        "handoff",
+        "requests",
+        "loop-policy",
+        "loop-budget",
+        "loop-run-log",
+        "leases",
+        "agent-lanes",
+    }
+)
+
+# How many trailing worklog rows and run-log rows to surface. Small on purpose:
+# the dashboard is a glance, not an archive.
+WORKLOG_TAIL = 15
+RUNLOG_TAIL = 20
+CURRENT_MAX_CHARS = 4000
+
+# Registry columns, in the order bootstrap writes them.
+REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat"]
+
+# A heartbeat older than this many minutes is flagged "stale" in the freshness
+# label. This is display-only; the doctor keeps its own orphan-suspect logic.
+STALE_HEARTBEAT_MINS = 30
+
+_DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
+
+# Default max_fix_cycles when loop-policy.md is absent or has no line (mirrors
+# the bootstrap template default and protocol.md's documented default).
+DEFAULT_MAX_FIX_CYCLES = 3
+# Valid inclusive range for the human-set fix-cycle cap.
+MAX_FIX_CYCLES_MIN = 1
+MAX_FIX_CYCLES_MAX = 10
+# Matches the "max_fix_cycles: <int>" line in loop-policy.md. Tolerant of
+# surrounding whitespace and an optional leading list marker, case-insensitive
+# on the key; captures the integer so it can be read or rewritten in place.
+_MAX_FIX_CYCLES_RE = re.compile(
+    r"^(?P<prefix>\s*(?:[-*]\s*)?)(?P<key>max_fix_cycles)\s*:\s*(?P<value>\d+)\s*$",
+    re.IGNORECASE,
+)
+
+# Test seam only: ``main`` stashes the bound server here so an in-process smoke
+# can shut down a main() started in a background thread. The app never reads it.
+_LAST_SERVER_FOR_TEST: Optional["_ThreadingHTTPServer"] = None
+
+
+# ---------------------------------------------------------------------------
+# File readers (all guarded: missing files -> empty, never an exception)
+# ---------------------------------------------------------------------------
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _split_md_row(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _parse_md_table(path: Path) -> list[dict[str, str]]:
+    """Parse the first Markdown table in ``path`` into a list of row dicts.
+
+    Header cells become keys. A delimiter row (all dashes/colons) is skipped.
+    Missing trailing cells are padded with ''. Returns [] if the file is
+    absent or has no table.
+    """
+    text = _read_text(path)
+    if not text:
+        return []
+    headers: Optional[list[str]] = None
+    rows: list[dict[str, str]] = []
+    for line in text.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = _split_md_row(line)
+        if not cells:
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+        if headers is None:
+            headers = [cell.strip() for cell in cells]
+            continue
+        if len(cells) < len(headers):
+            cells = cells + [""] * (len(headers) - len(cells))
+        rows.append(dict(zip(headers, cells[: len(headers)])))
+    return rows
+
+
+def _parse_timestamp(value: str) -> Optional[datetime]:
+    """Parse an ISO-8601-ish timestamp into an aware UTC datetime, or None.
+
+    Handles a trailing ``Z`` and a space date/time separator, and assumes UTC
+    for naive values. Returns None for blank or unparseable input.
+    """
+    text = (value or "").strip()
+    if not text or text.upper() in {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}:
+        return None
+    candidate = text
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    if " " in candidate and "T" not in candidate:
+        candidate = candidate.replace(" ", "T", 1)
+    parsed: Optional[datetime] = None
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _heartbeat_freshness(raw: str, now: datetime) -> dict[str, Any]:
+    """Compute a display-only freshness label for a heartbeat cell."""
+    parsed = _parse_timestamp(raw)
+    if parsed is None:
+        return {"raw": raw.strip(), "age_mins": None, "state": "none"}
+    age_mins = (now - parsed).total_seconds() / 60.0
+    state = "stale" if age_mins > STALE_HEARTBEAT_MINS else "fresh"
+    return {"raw": raw.strip(), "age_mins": round(age_mins, 1), "state": state}
+
+
+def _tail(text: str, n: int) -> list[str]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-n:] if n > 0 else lines
+
+
+def _lane_status_label(row: dict[str, str]) -> str:
+    """Normalize a registry row's status into one of a few display buckets."""
+    thread_id = (row.get("thread_id", "") or "").strip().upper()
+    status = (row.get("status", "") or "").strip().lower()
+    if status == "stale" or "stale" in status:
+        return "stale"
+    if thread_id in {"", "UNVERIFIED", "TBD", "NONE", "NULL", "-"} or status in {
+        "needs-thread",
+        "unverified",
+    }:
+        return "needs-thread"
+    return "registered"
+
+
+def _lane_workspace_files(lanes_dir: Path, lane: str) -> list[str]:
+    """List files under a lane's workspace/, README excluded from the count."""
+    workspace = lanes_dir / lane / "workspace"
+    if not workspace.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        for entry in sorted(workspace.iterdir()):
+            if entry.is_file():
+                names.append(entry.name)
+    except OSError:
+        return []
+    return names
+
+
+# current.md key/value header fields, mapped from their file key to the output
+# key. These sit above the first "##" heading in the bootstrap CURRENT_TEMPLATE.
+_CURRENT_HEADER_KEYS = {
+    "current_request_id": "current_request_id",
+    "status": "status",
+    "iteration": "iteration",
+    "last_updated": "last_updated",
+    "heartbeat": "heartbeat",
+}
+# Known "## <heading>" sections of current.md, mapped to the output list key.
+# Matching is case-insensitive and tolerant of extra words in the heading.
+_CURRENT_SECTION_KEYS = {
+    "current checkpoint": "checkpoint_items",
+    "next action": "next_action",
+    "blockers": "blockers",
+}
+# A list item that means "nothing here"; filtered so an empty section reads as
+# [] rather than ["None."]. Matches "none", "none.", "n/a", "-", "tbd".
+_CURRENT_EMPTY_ITEM_RE = re.compile(r"^(none\.?|n/?a|-+|tbd)$", re.IGNORECASE)
+
+
+def _parse_current_md(text: str) -> dict[str, Any]:
+    """Parse a lane's current.md into structured fields (tolerantly).
+
+    Returns a dict with string header fields (``current_request_id``,
+    ``status``, ``iteration``, ``last_updated``, ``heartbeat``) and list
+    fields (``checkpoint_items``, ``next_action``, ``blockers``). Missing or
+    unrecognized input degrades to empty strings / empty lists; this never
+    raises. Header key/value lines are read only until the first ``##`` heading,
+    so a request-id-looking token buried in prose cannot be mistaken for one.
+    """
+    header: dict[str, str] = {out: "" for out in _CURRENT_HEADER_KEYS.values()}
+    sections: dict[str, list[str]] = {out: [] for out in _CURRENT_SECTION_KEYS.values()}
+
+    current_section: Optional[str] = None
+    seen_heading = False
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            # Count the heading level. The single-``#`` document title ("# X
+            # Current State") must NOT close the header key/value block -- only
+            # a ``##``+ section heading does. This lets the key/value lines that
+            # sit between the title and the first section be read as header.
+            level = len(stripped) - len(stripped.lstrip("#"))
+            heading = stripped.lstrip("#").strip().lower()
+            current_section = None
+            if level >= 2:
+                seen_heading = True
+                # Normalize "## Current Checkpoint" -> "current checkpoint".
+                for known, out_key in _CURRENT_SECTION_KEYS.items():
+                    if heading == known or heading.startswith(known):
+                        current_section = out_key
+                        break
+            continue
+        if current_section is not None:
+            # Collect list items (or any non-blank line) under a known section.
+            item = re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", line).strip()
+            if item and not _CURRENT_EMPTY_ITEM_RE.match(item):
+                sections[current_section].append(item)
+            continue
+        if not seen_heading and ":" in stripped:
+            key, _, value = stripped.partition(":")
+            out_key = _CURRENT_HEADER_KEYS.get(key.strip().lower())
+            if out_key is not None and not header[out_key]:
+                header[out_key] = value.strip()
+
+    result: dict[str, Any] = {}
+    result.update(header)
+    result.update(sections)
+    return result
+
+
+def _current_summary(lanes_dir: Path, lane: str) -> dict[str, Any]:
+    """Return the lane's parsed current.md summary, raw text, and worklog tail.
+
+    ``current`` keeps the raw (capped) current.md for the "View raw" details
+    block; ``summary`` carries the structured fields parsed from it so the card
+    can render a clean block without re-parsing on the client.
+    """
+    lane_dir = lanes_dir / lane
+    raw_current = _read_text(lane_dir / "current.md")
+    summary = _parse_current_md(raw_current)
+    current_text = raw_current
+    if len(current_text) > CURRENT_MAX_CHARS:
+        current_text = current_text[:CURRENT_MAX_CHARS] + "\n... (truncated)"
+    worklog_tail = _tail(_read_text(lane_dir / "worklog.md"), WORKLOG_TAIL)
+    workspace_files = _lane_workspace_files(lanes_dir, lane)
+    return {
+        "current": current_text,
+        "summary": summary,
+        "worklog_tail": worklog_tail,
+        "workspace_files": workspace_files,
+        "workspace_count": len(workspace_files),
+    }
+
+
+def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
+    """Parse every ``evidence/*.json`` (non-recursive) into simple records.
+
+    Reuses ``completion_gate.load_evidence`` when the gate is importable so the
+    dashboard reads evidence exactly as the gate does; falls back to a direct
+    glob otherwise. Malformed files are surfaced as ``load_errors`` rather than
+    crashing.
+    """
+    records: list[dict[str, Any]] = []
+    load_errors: list[dict[str, str]] = []
+    if not evidence_dir.is_dir():
+        return {"records": records, "load_errors": load_errors}
+
+    gate = None
+    if DOCTOR_AVAILABLE and getattr(doctor, "completion_gate", None) is not None:
+        gate = doctor.completion_gate  # reuse the gate the doctor imported
+    if gate is not None:
+        try:
+            gate_records, gate_errors = gate.load_evidence(evidence_dir)
+            for rec in gate_records:
+                records.append(
+                    {
+                        "request_id": str(rec.get("request_id", "")).strip(),
+                        "checkpoint": str(rec.get("checkpoint", "")).strip(),
+                        "command": str(rec.get("command", "")).strip(),
+                        "exit_code": rec.get("exit_code"),
+                        "ran_at": str(rec.get("ran_at", "")).strip(),
+                        "source": str(rec.get("_source", "")).strip(),
+                    }
+                )
+            load_errors = [
+                {"source": e.get("source", ""), "reason": e.get("reason", "")}
+                for e in gate_errors
+            ]
+            return {"records": records, "load_errors": load_errors}
+        except Exception:
+            # Fall through to the direct reader on any gate hiccup.
+            records = []
+            load_errors = []
+
+    for path in sorted(evidence_dir.glob("*.json")):
+        source = str(path).replace("\\", "/")
+        raw = _read_text(path)
+        if not raw:
+            load_errors.append({"source": source, "reason": "unreadable or empty"})
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            load_errors.append({"source": source, "reason": "invalid JSON: {0}".format(exc)})
+            continue
+        if not isinstance(data, dict):
+            load_errors.append({"source": source, "reason": "not a JSON object"})
+            continue
+        records.append(
+            {
+                "request_id": str(data.get("request_id", "")).strip(),
+                "checkpoint": str(data.get("checkpoint", "")).strip(),
+                "command": str(data.get("command", "")).strip(),
+                "exit_code": data.get("exit_code"),
+                "ran_at": str(data.get("ran_at", "")).strip(),
+                "source": source,
+            }
+        )
+    return {"records": records, "load_errors": load_errors}
+
+
+def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
+    """Run the in-process doctor and pull out the badge-relevant fields.
+
+    Guarded end to end: if the doctor is not importable, or raises while
+    summarizing (for example the loop is not bootstrapped), return a small
+    ``available: false`` object so the page can still render.
+    """
+    if not DOCTOR_AVAILABLE or doctor is None:
+        return {"available": False, "reason": "multi_agent_loop_doctor is not importable"}
+    try:
+        result = doctor.summarize(
+            loop_dir, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS
+        )
+    except Exception as exc:  # loop not bootstrapped, unreadable files, etc.
+        return {"available": False, "reason": "doctor error: {0}".format(exc)}
+
+    decisions = result.get("decisions") or {}
+    return {
+        "available": True,
+        "ok": result.get("ok"),
+        "handoff_ready": result.get("handoff_ready"),
+        "gate_available": result.get("gate_available"),
+        "completion_gate_ok": result.get("completion_gate_ok"),
+        "evidence_recorded_ok": result.get("evidence_recorded_ok"),
+        "gate_failed_requests": result.get("gate_failed_requests", []),
+        "orphan_suspects": result.get("orphan_suspects", []),
+        "decisions": {
+            "total": decisions.get("total", 0),
+            "active": decisions.get("active", 0),
+            "stale": decisions.get("stale", 0),
+            "malformed": decisions.get("malformed", 0),
+        },
+        "issues": result.get("issues", []),
+        "warnings": result.get("warnings", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Policy reader: current max_fix_cycles from loop-policy.md (read-only here)
+# ---------------------------------------------------------------------------
+
+
+def read_max_fix_cycles(loop_dir: Path) -> dict[str, Any]:
+    """Read the ``max_fix_cycles`` value from ``loop-policy.md``.
+
+    Returns ``{"max_fix_cycles": int, "source_present": bool}``. When the file
+    is missing or has no recognizable line, falls back to
+    ``DEFAULT_MAX_FIX_CYCLES`` and reports ``source_present`` honestly. Never
+    raises; a malformed value degrades to the default.
+    """
+    policy_path = loop_dir / "loop-policy.md"
+    text = _read_text(policy_path)
+    present = bool(text)
+    value = DEFAULT_MAX_FIX_CYCLES
+    for line in text.splitlines():
+        m = _MAX_FIX_CYCLES_RE.match(line)
+        if m:
+            try:
+                value = int(m.group("value"))
+            except ValueError:
+                value = DEFAULT_MAX_FIX_CYCLES
+            break
+    return {"max_fix_cycles": value, "source_present": present}
+
+
+# ---------------------------------------------------------------------------
+# Usage + account providers: delegated to the Codex host probe
+# ---------------------------------------------------------------------------
+#
+# Everything that reads the Codex host's UNDOCUMENTED data surfaces (session
+# JSONL rate-limits, auth.json JWT identity) lives in ``codex_host_probe`` -- the
+# ONLY module in this skill that touches that data plane. The dashboard imports
+# ``build_usage`` / ``build_account`` from it (guarded above) and treats it as an
+# OPTIONAL dependency: if the probe is missing, ``build_state`` serves usage and
+# account as ``available: false`` with reason ``probe_module_missing`` and never
+# crashes. The refresh path calls the probe's ``drop_caches`` (guarded) to force a
+# rescan. The privacy/red-line notes for both providers live in that module.
+
+# Reason surfaced when the probe module could not be imported at all, so a
+# consumer can tell "host probe absent" apart from "logged out / no data yet".
+PROBE_MISSING_REASON = "probe_module_missing"
+
+
+def _compute_account_stale(account: dict[str, Any], usage: dict[str, Any]) -> None:
+    """Annotate ``account`` in place with whether the quota snapshot is stale.
+
+    The quota snapshot "predates the current login" when either:
+
+    - the JWT-derived ``plan_type`` differs from the usage snapshot's
+      ``plan_type`` (the plan changed since the snapshot was written), or
+    - auth.json's mtime is NEWER than the usage snapshot's ``as_of`` (the login
+      was refreshed after the last rate-limit event landed).
+
+    Sets ``account['snapshot_stale']`` (bool) and ``account['stale_reason']``
+    (a stable machine code the UI localizes: ``plan_mismatch`` or
+    ``auth_newer_than_snapshot``, else empty). Purely comparative; surfaces no
+    new sensitive data. No-op when the account is unavailable.
+    """
+    account["snapshot_stale"] = False
+    account["stale_reason"] = ""
+    if not account.get("available"):
+        return
+    if not isinstance(usage, dict) or usage.get("available") is not True:
+        return
+
+    # Plan mismatch: both sides must actually carry a plan to compare.
+    acct_plan = account.get("plan_type")
+    snap_plan = usage.get("plan_type")
+    if isinstance(acct_plan, str) and acct_plan and isinstance(snap_plan, str) and snap_plan:
+        if acct_plan != snap_plan:
+            account["snapshot_stale"] = True
+            account["stale_reason"] = "plan_mismatch"
+            return
+
+    # auth.json newer than the snapshot's as_of (login refreshed after the last
+    # rate-limit event). Both timestamps are local-time ISO strings written by
+    # ``_iso_local``; parse them tolerantly and compare.
+    auth_dt = _parse_timestamp(account.get("auth_mtime_iso") or "")
+    asof_dt = _parse_timestamp(usage.get("as_of") or "")
+    if auth_dt is not None and asof_dt is not None and auth_dt > asof_dt:
+        account["snapshot_stale"] = True
+        account["stale_reason"] = "auth_newer_than_snapshot"
+
+
+def build_state(
+    loop_dir: Path, now: Optional[datetime] = None, refresh: bool = False
+) -> dict[str, Any]:
+    """Assemble the full ``/api/state`` snapshot by reading files only.
+
+    Never writes. Every section degrades to an empty/false value when the
+    underlying file is missing, so a brand-new (un-bootstrapped) loop renders a
+    meaningful empty state.
+
+    When ``refresh`` is True, the in-memory usage + account caches are dropped
+    first so the usage/account sections are recomputed from a fresh auth.json
+    re-read and a newest-session re-scan. This is still a read-only operation:
+    it forces a rescan, it never writes to disk. Normal polling passes
+    ``refresh=False`` and rides the caches.
+    """
+    if refresh and PROBE_AVAILABLE and codex_host_probe is not None:
+        # Drop the probe's usage/account caches so the next read rescans. Guarded
+        # so a missing probe (or a probe without the function) never crashes the
+        # read; still read-only -- it forces a rescan, it writes nothing.
+        try:
+            codex_host_probe.drop_caches()
+        except Exception:  # pragma: no cover - defensive; drop must never raise
+            pass
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    lanes_dir = loop_dir / "lanes"
+    registry_path = loop_dir / "agent-lanes.md"
+    requests_path = loop_dir / "requests.md"
+    run_log_path = loop_dir / "loop-run-log.md"
+    evidence_dir = loop_dir / "evidence"
+
+    bootstrapped = registry_path.exists()
+
+    # Registry rows + per-lane detail.
+    lane_rows = _parse_md_table(registry_path)
+    lanes: list[dict[str, Any]] = []
+    for row in lane_rows:
+        lane = (row.get("lane", "") or "").strip()
+        if not lane:
+            continue
+        detail = _current_summary(lanes_dir, lane)
+        lanes.append(
+            {
+                "lane": lane,
+                "thread_id": (row.get("thread_id", "") or "").strip(),
+                "role": (row.get("role", "") or "").strip(),
+                "write_scope": (row.get("write_scope", "") or "").strip(),
+                "status": _lane_status_label(row),
+                "status_raw": (row.get("status", "") or "").strip(),
+                "heartbeat": _heartbeat_freshness(
+                    row.get("heartbeat", "") or row.get("last_heartbeat", ""), now
+                ),
+                "current": detail["current"],
+                "summary": detail["summary"],
+                "worklog_tail": detail["worklog_tail"],
+                "workspace_files": detail["workspace_files"],
+                "workspace_count": detail["workspace_count"],
+            }
+        )
+
+    # Requests queue.
+    requests = _parse_md_table(requests_path)
+
+    # Evidence records.
+    evidence = _load_evidence_records(evidence_dir)
+
+    # Run-log tail.
+    run_log_tail = _tail(_read_text(run_log_path), RUNLOG_TAIL)
+
+    # Doctor snapshot (in-process).
+    doctor_snapshot = _doctor_snapshot(loop_dir)
+
+    # Current anti-thrash cap (read-only view of loop-policy.md).
+    policy = read_max_fix_cycles(loop_dir)
+
+    # Codex usage snapshot, delegated to the host probe. Guarded end to end so a
+    # missing probe module or a parser hiccup never blocks the rest of the state;
+    # degrades to available:false. When the probe module itself is absent, the
+    # reason is ``probe_module_missing`` so a consumer can tell that apart from a
+    # logged-out / no-data-yet state.
+    if PROBE_AVAILABLE and codex_host_probe is not None:
+        try:
+            usage = codex_host_probe.build_usage()
+        except Exception as exc:  # pragma: no cover - defensive belt-and-suspenders
+            usage = {"available": False, "reason": "usage provider error: {0}".format(exc)}
+    else:
+        usage = {"available": False, "reason": PROBE_MISSING_REASON}
+
+    # Scoped account identity from auth.json (email/name/plan/auth_mode/short id
+    # only -- never tokens), also from the host probe. Attached UNDER usage as
+    # ``usage.account`` so the Usage & Limits panel has both quota and identity in
+    # one object. Guarded so a missing probe or parser hiccup degrades to
+    # available:false rather than blocking state.
+    if PROBE_AVAILABLE and codex_host_probe is not None:
+        try:
+            account = codex_host_probe.build_account()
+        except Exception as exc:  # pragma: no cover - defensive belt-and-suspenders
+            account = {"available": False, "detail": "account provider error: {0}".format(exc)}
+    else:
+        account = {"available": False, "detail": PROBE_MISSING_REASON}
+    # Flag when the quota snapshot predates the current login (plan changed, or
+    # auth.json refreshed after the last rate-limit event). Comparative only.
+    _compute_account_stale(account, usage)
+    if isinstance(usage, dict):
+        usage["account"] = account
+
+    return {
+        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "loop_dir": str(loop_dir).replace("\\", "/"),
+        "bootstrapped": bootstrapped,
+        "stale_heartbeat_mins": STALE_HEARTBEAT_MINS,
+        "reserved_lane_names": sorted(RESERVED_LANE_NAMES),
+        "lanes": lanes,
+        "requests": requests,
+        "evidence": evidence,
+        "run_log_tail": run_log_tail,
+        "doctor": doctor_snapshot,
+        "policy": policy,
+        "usage": usage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The single write path: add a lane
+# ---------------------------------------------------------------------------
+
+
+def _existing_lane_names(registry_path: Path) -> set[str]:
+    names: set[str] = set()
+    for row in _parse_md_table(registry_path):
+        lane = (row.get("lane", "") or "").strip()
+        if lane:
+            names.add(lane.lower())
+    return names
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (temp file then os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp-{0}".format(os.getpid()))
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
+    """Validate and append one lane. The ONLY mutation this module performs.
+
+    Steps:
+    1. validate the lane name (kebab, length, not reserved);
+    2. reject a name already present in the registry;
+    3. build the new row (status=needs-thread, default write_scope);
+    4. reuse ``bootstrap_agent_loop`` to create the lane directory + files;
+    5. rewrite ``agent-lanes.md`` atomically (temp file then os.replace).
+
+    Returns ``{"ok": True, "lane": ...}`` on success, or
+    ``{"ok": False, "error": ...}`` on any validation/parse failure. Never
+    raises for a bad request; only genuinely unexpected IO errors propagate.
+    """
+    lane = (lane or "").strip()
+    role = (role or "").strip()
+
+    if not lane:
+        return {"ok": False, "error": "lane name is required"}
+    if not LANE_NAME_RE.match(lane):
+        return {
+            "ok": False,
+            "error": (
+                "invalid lane name {0!r}: must match ^[a-z][a-z0-9-]{{1,30}}$ "
+                "(lowercase kebab-case)".format(lane)
+            ),
+        }
+    if lane.lower() in RESERVED_LANE_NAMES:
+        return {"ok": False, "error": "lane name {0!r} is reserved".format(lane)}
+
+    registry_path = loop_dir / "agent-lanes.md"
+    if not registry_path.exists():
+        return {
+            "ok": False,
+            "error": "loop is not bootstrapped (no agent-lanes.md); run bootstrap first",
+        }
+
+    existing = _existing_lane_names(registry_path)
+    if lane.lower() in existing:
+        return {"ok": False, "error": "lane {0!r} is already registered".format(lane)}
+
+    if not role:
+        role = "Handle scoped {0} work and report evidence.".format(lane)
+    write_scope = "docs/loop/lanes/{0}/**".format(lane)
+
+    # Parse the current registry into a lane->row mapping using bootstrap's own
+    # reader so column handling matches exactly. Fall back to a local parse if
+    # bootstrap is somehow unavailable.
+    if BOOTSTRAP_AVAILABLE and bootstrap_agent_loop is not None:
+        rows = bootstrap_agent_loop.existing_rows(registry_path)
+    else:
+        rows = {}
+        for row in _parse_md_table(registry_path):
+            name = (row.get("lane", "") or "").strip()
+            if not name:
+                continue
+            rows[name] = {
+                "thread_id": (row.get("thread_id", "") or "").strip(),
+                "role": (row.get("role", "") or "").strip(),
+                "write_scope": (row.get("write_scope", "") or "").strip(),
+                "worklog": (row.get("worklog", "") or "").strip(),
+                "status": (row.get("status", "") or "").strip(),
+                "heartbeat": (row.get("heartbeat", "") or "-").strip() or "-",
+            }
+
+    worklog = "{0}/lanes/{1}/worklog.md".format(str(loop_dir).replace("\\", "/"), lane)
+    rows[lane] = {
+        "thread_id": "UNVERIFIED",
+        "role": role,
+        "write_scope": write_scope,
+        "worklog": worklog,
+        "status": "needs-thread",
+        "heartbeat": "-",
+    }
+
+    # Create the lane directory + per-lane files by REUSING bootstrap's
+    # write-if-missing templates. This mirrors exactly what bootstrap would
+    # create for a lane, without touching any other lane's files.
+    created_files: list[str] = []
+    if BOOTSTRAP_AVAILABLE and bootstrap_agent_loop is not None:
+        lane_dir = loop_dir / "lanes" / lane
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        title = bootstrap_agent_loop.title_for(lane)
+        lane_templates = {
+            "worklog.md": bootstrap_agent_loop.WORKLOG_TEMPLATE,
+            "inbox.md": bootstrap_agent_loop.INBOX_TEMPLATE,
+            "outbox.md": bootstrap_agent_loop.OUTBOX_TEMPLATE,
+            "current.md": bootstrap_agent_loop.CURRENT_TEMPLATE,
+        }
+        for filename, template in lane_templates.items():
+            path = lane_dir / filename
+            if bootstrap_agent_loop.write_if_missing(path, template.format(title=title)):
+                created_files.append(str(path).replace("\\", "/"))
+        workspace_dir = lane_dir / "workspace"
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        workspace_readme = workspace_dir / "README.md"
+        if bootstrap_agent_loop.write_if_missing(
+            workspace_readme,
+            bootstrap_agent_loop.LANE_WORKSPACE_README_TEMPLATE.format(title=title),
+        ):
+            created_files.append(str(workspace_readme).replace("\\", "/"))
+        columns = bootstrap_agent_loop.REGISTRY_COLUMNS
+    else:
+        return {
+            "ok": False,
+            "error": "bootstrap_agent_loop is not importable; cannot create lane files",
+        }
+
+    # Rebuild the registry table from the full row set and write it atomically.
+    lines = [
+        "# Agent Lanes",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for name in sorted(rows):
+        row = rows[name]
+        lines.append(
+            "| {lane} | {thread_id} | {role} | {write_scope} | {worklog} | {status} | {heartbeat} |".format(
+                lane=name,
+                thread_id=row.get("thread_id", "UNVERIFIED"),
+                role=row.get("role", ""),
+                write_scope=row.get("write_scope", ""),
+                worklog=row.get("worklog", ""),
+                status=row.get("status", "needs-thread"),
+                heartbeat=row.get("heartbeat", "-") or "-",
+            )
+        )
+    _atomic_write(registry_path, "\n".join(lines) + "\n")
+
+    return {
+        "ok": True,
+        "lane": lane,
+        "role": role,
+        "write_scope": write_scope,
+        "status": "needs-thread",
+        "created_files": created_files,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The second write path: set max_fix_cycles in loop-policy.md
+# ---------------------------------------------------------------------------
+
+
+def set_max_fix_cycles(loop_dir: Path, value: Any) -> dict[str, Any]:
+    """Validate and write ``max_fix_cycles`` into ``loop-policy.md`` atomically.
+
+    Steps:
+    1. coerce ``value`` to an int and require ``MAX_FIX_CYCLES_MIN..MAX``;
+    2. read the existing ``loop-policy.md`` (must exist -- it is a bootstrap
+       output; refusing when absent avoids creating a half-populated policy);
+    3. rewrite ONLY the ``max_fix_cycles`` line, preserving every other byte;
+       if no such line exists, insert one under the ``## Request Policy``
+       heading (or append a minimal section if that heading is absent);
+    4. write via temp file + ``os.replace`` (atomic).
+
+    Returns ``{"ok": True, "max_fix_cycles": int}`` or
+    ``{"ok": False, "error": ...}``. Never raises for a bad request.
+    """
+    # (1) validate the integer. Reject bools and non-integers explicitly.
+    if isinstance(value, bool):
+        return {"ok": False, "error": "max_fix_cycles must be an integer, not a boolean"}
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, float) and value.is_integer():
+        n = int(value)
+    elif isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+        n = int(value.strip())
+    else:
+        return {
+            "ok": False,
+            "error": "max_fix_cycles must be an integer in {0}..{1}".format(
+                MAX_FIX_CYCLES_MIN, MAX_FIX_CYCLES_MAX
+            ),
+        }
+    if n < MAX_FIX_CYCLES_MIN or n > MAX_FIX_CYCLES_MAX:
+        return {
+            "ok": False,
+            "error": "max_fix_cycles must be in {0}..{1}, got {2}".format(
+                MAX_FIX_CYCLES_MIN, MAX_FIX_CYCLES_MAX, n
+            ),
+        }
+
+    policy_path = loop_dir / "loop-policy.md"
+    if not policy_path.exists():
+        return {
+            "ok": False,
+            "error": "loop-policy.md not found; run bootstrap first",
+        }
+
+    text = _read_text(policy_path)
+    if not text:
+        return {"ok": False, "error": "loop-policy.md is empty or unreadable"}
+
+    # (3) rewrite the existing line in place, preserving its prefix marker.
+    # ``_read_text`` uses universal-newline reads, so ``lines`` never carries a
+    # trailing ``\r``; we re-join with ``\n`` and let the atomic writer apply
+    # the platform newline (matching how bootstrap writes this file).
+    lines = text.splitlines()
+    replaced = False
+    for i, line in enumerate(lines):
+        m = _MAX_FIX_CYCLES_RE.match(line)
+        if m:
+            lines[i] = "{0}max_fix_cycles: {1}".format(m.group("prefix"), n)
+            replaced = True
+            break
+
+    if not replaced:
+        # Insert under "## Request Policy" if present, else append a section.
+        insert_at = None
+        for i, line in enumerate(lines):
+            if line.strip().lower() == "## request policy":
+                insert_at = i + 1
+                break
+        policy_line = "max_fix_cycles: {0}".format(n)
+        if insert_at is not None:
+            # Skip a single blank line after the heading for tidy placement.
+            if insert_at < len(lines) and lines[insert_at].strip() == "":
+                insert_at += 1
+            lines.insert(insert_at, policy_line)
+        else:
+            if lines and lines[-1].strip() != "":
+                lines.append("")
+            lines.append("## Request Policy")
+            lines.append("")
+            lines.append(policy_line)
+
+    # Preserve a trailing newline if the original had one.
+    content = "\n".join(lines)
+    if text.endswith("\n"):
+        content += "\n"
+
+    _atomic_write(policy_path, content)
+    return {"ok": True, "max_fix_cycles": n}
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Serve the dashboard page, the state JSON, and the two write endpoints.
+
+    ``loop_dir`` is injected onto the server object by ``make_server`` and read
+    here via ``self.server.loop_dir``. The handler itself is stateless. The only
+    writes are ``POST /api/lanes`` (add one lane) and ``POST /api/policy`` (set
+    ``max_fix_cycles``); every other path/verb is refused.
+    """
+
+    server_version = "LoopDashboard/1.0"
+    # Silence the default per-request stderr logging so the smoke test output
+    # stays clean; real operators can watch the process if they want.
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+    # -- helpers ------------------------------------------------------------
+
+    @property
+    def loop_dir(self) -> Path:
+        return self.server.loop_dir  # type: ignore[attr-defined]
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_plain(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _path_only(self) -> str:
+        # Strip any query string; we route on the path alone.
+        return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+    def _wants_refresh(self) -> bool:
+        """True when the request carries a ``refresh=1`` query flag.
+
+        Read-only: the flag only tells ``build_state`` to drop its in-memory
+        usage/account caches and rescan; it opens no new endpoint and writes
+        nothing. Parsed by hand (no extra import) as a simple ``key=value`` scan.
+        """
+        parts = self.path.split("?", 1)
+        if len(parts) < 2 or not parts[1]:
+            return False
+        for pair in parts[1].split("&"):
+            key, _, value = pair.partition("=")
+            if key == "refresh" and value in ("1", "true", "yes"):
+                return True
+        return False
+
+    # -- verbs --------------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        route = self._path_only()
+        if route == "/":
+            html = _read_text(_DASHBOARD_HTML)
+            if not html:
+                self._send_plain(
+                    500,
+                    "dashboard.html not found next to loop_dashboard.py",
+                )
+                return
+            self._send_html(200, html)
+            return
+        if route == "/api/state":
+            # ``?refresh=1`` drops the usage/account caches and rescans before
+            # responding (read-only; still not a new endpoint, still no writes).
+            refresh = self._wants_refresh()
+            try:
+                state = build_state(self.loop_dir, refresh=refresh)
+            except Exception as exc:  # never let a read crash the server
+                self._send_json(500, {"error": "failed to build state: {0}".format(exc)})
+                return
+            self._send_json(200, state)
+            return
+        # Unknown GET path.
+        self._send_json(404, {"error": "not found", "path": route})
+
+    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Read and JSON-parse the request body. Returns (payload, error).
+
+        On success ``payload`` is a dict and ``error`` is None. On failure
+        ``payload`` is None and ``error`` is a human-readable reason.
+        """
+        length = self.headers.get("Content-Length")
+        try:
+            n = int(length) if length is not None else 0
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            return None, "body must be valid JSON"
+        if not isinstance(payload, dict):
+            return None, "body must be a JSON object"
+        return payload, None
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        route = self._path_only()
+        if route not in ("/api/lanes", "/api/policy"):
+            # Every other POST path is refused. /api/state is GET-only.
+            self._send_json(404, {"error": "not found", "path": route})
+            return
+
+        payload, error = self._read_json_body()
+        if error is not None:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+
+        if route == "/api/lanes":
+            lane = str(payload.get("lane", ""))
+            role = str(payload.get("role", ""))
+            result = add_lane(self.loop_dir, lane, role)
+        else:  # /api/policy
+            result = set_max_fix_cycles(self.loop_dir, payload.get("max_fix_cycles"))
+        self._send_json(200 if result.get("ok") else 400, result)
+
+    # Explicitly reject other verbs with 405 (no writes anywhere else).
+    def _reject_405(self) -> None:
+        self.send_response(405)
+        self.send_header("Allow", "GET, POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._reject_405()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._reject_405()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._reject_405()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._reject_405()
+
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """A threading TCP server that binds fast and carries ``loop_dir``.
+
+    ``allow_reuse_address`` avoids TIME_WAIT bind failures on restart;
+    ``daemon_threads`` lets the process exit without joining request threads.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+    loop_dir: Path
+
+
+def make_server(loop_dir: Path, port: int) -> _ThreadingHTTPServer:
+    """Create a server bound to 127.0.0.1 on ``port`` (0 = ephemeral).
+
+    Binds the loopback interface ONLY; the dashboard is never exposed off-host.
+    Raises ``OSError`` if the port cannot be bound.
+    """
+    server = _ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
+    server.loop_dir = loop_dir
+    return server
+
+
+def make_server_with_fallback(
+    loop_dir: Path, port: int
+) -> tuple[_ThreadingHTTPServer, bool]:
+    """Bind ``port`` if free, otherwise fall back to an ephemeral port (0).
+
+    Returns ``(server, fell_back)``. A busy requested port must never crash the
+    dashboard: on any bind ``OSError`` (address in use, permission, etc.) with a
+    non-zero requested port, retry once on port 0 so the OS assigns a free port.
+    A failure to bind port 0 itself is genuinely fatal and propagates.
+    """
+    try:
+        return make_server(loop_dir, port), False
+    except OSError:
+        if port == 0:
+            raise
+        return make_server(loop_dir, 0), True
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Read-only local dashboard for a repo-local multi-agent loop."
+    )
+    parser.add_argument("--loop-dir", default="docs/loop", help="Loop directory to view.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to bind on 127.0.0.1 (default 8765; 0 picks an ephemeral port).",
+    )
+    args = parser.parse_args(argv)
+
+    loop_dir = Path(args.loop_dir)
+    server, fell_back = make_server_with_fallback(loop_dir, args.port)
+    # Test seam: expose the bound server so an in-process smoke can shut down a
+    # main() started in a background thread. Never read by the running app.
+    global _LAST_SERVER_FOR_TEST
+    _LAST_SERVER_FOR_TEST = server
+    host, port = server.server_address[0], server.server_address[1]
+    # One machine-greppable line, printed AFTER binding, so an orchestrating
+    # agent can capture the real URL (never a guessed one). If the requested
+    # port was busy the OS chose an ephemeral one; this reports the actual bind.
+    print("DASHBOARD_URL=http://{0}:{1}/".format(host, port))
+    sys.stdout.flush()
+    if fell_back:
+        print(
+            "requested port {0} was busy; bound ephemeral port {1} instead".format(
+                args.port, port
+            )
+        )
+    print("Loop dashboard on http://{0}:{1}/  (loop-dir: {2})".format(host, port, loop_dir))
+    print(
+        "Read-only view. Writes: POST /api/lanes (add lane), "
+        "POST /api/policy (max_fix_cycles). Ctrl-C to stop."
+    )
+    sys.stdout.flush()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping...")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
