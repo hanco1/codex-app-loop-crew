@@ -30,6 +30,8 @@ Before starting a loop, size the task. If the work plausibly fits **one session*
 
 When `goal.md`/`Done When` still hold bootstrap placeholders, there is **no objective yet, which is the ABSENCE of a request** - not a blocked request. Run an intake conversation with the human (objective + Done-When; build-the-software vs be-the-operations-team; discipline-cut vs feature-cut) and create the first request **only after** the human answers. Never mint a `PLANNED -> BLOCKED` "no goal yet" placeholder request: a red BLOCKED row before first contact misreports absence as failure.
 
+**Intake is a grilling interview, not a questionnaire.** Ask ONE question at a time and wait for the answer before the next (a bulk list loses the dependency order between answers); attach the coordinator's OWN recommended answer to every question so the human edits a proposal instead of authoring cold; look up any fact the repo or host can answer (stack, test runner, existing UI surface, whether a tool is installed) rather than asking - reserve questions for genuine decisions. **Stop rule:** when the objective is checkable (a concrete Done-When is in hand), stop asking and write `goal.md` - do not over-interview. For a **user-facing goal**, one question is MANDATORY: *"walk me through how you'll actually operate this - input method, file selection, what you look at first"* (the file-picker-vs-path-textbox gap dies here). This preserves the F3/F5 intake semantics (no placeholder BLOCKED, the task-size gate, and the two forks) and only sharpens HOW the questions are asked.
+
 ## Checkpoint Close Gate
 
 A checkpoint is closed enough to hand off only when:
@@ -45,14 +47,13 @@ If any item is missing, continue in the current session until the checkpoint can
 
 ### In-Turn Report-Back (mandatory before the turn ends)
 
-Codex threads run one turn and stop, so the handoff must finish inside the same turn as the work. **Your turn is not finished until you have, in this turn:**
-
-1. sent the reply message (`send_message_to_thread` / `codex_app.*`, or the `deliver_message.py` file-inbox fallback);
-2. updated `requests.md` (advance status + owner);
-3. appended the `loop-run-log.md` row for that transition;
-4. refreshed your heartbeat (the `heartbeat` column in `agent-lanes.md` and the `last_updated`/`heartbeat` mirror in lane `current.md`).
-
-Do not end the turn after the work (even after `SHIP_CHECK_OK`) with the reply, ledger, run-log, or heartbeat left undone: there is no guaranteed next turn, and the requester will wait forever. The doctor reports a done-but-unadvanced request as `stalled_handoff`.
+Codex threads run one turn and stop, so the handoff must finish inside the same
+turn as the work: **close the turn**. The full step list is defined once in
+`references/protocol.md` ("Close the turn") - read it there and do not restate
+it here. Do not end the turn after the work (even after `SHIP_CHECK_OK`) with
+the reply, ledger, run-log, or heartbeat left undone: there is no guaranteed
+next turn, and the requester will wait forever. The doctor reports a
+done-but-unadvanced request as `stalled_handoff`.
 
 ## Handoff Readiness Gate
 
@@ -185,8 +186,23 @@ Before editing files that another lane could touch:
 Send `IMPLEMENTATION_REQUEST` only after product has:
 
 - named source docs;
-- defined scope and non-goals;
-- copied acceptance criteria;
+- defined scope and **non-empty non-goals** - a request whose `non_goals` is
+  empty is NOT ready to send. An empty Out-of-Scope gives review no written
+  boundary to enforce and invites gold-plating; name at least one thing the
+  slice will deliberately not do;
+- copied acceptance criteria, **each naming its red-capable verify command**
+  (see `references/protocol.md` "Red-capable acceptance criteria"): a criterion
+  whose named command cannot FAIL on that criterion's violation is a vibe -
+  sharpen it or drop it before sending;
+- **when `goal.md` names human-provided real data** (a real statement, export,
+  or invoice), included at least one criterion asserting **field-level
+  correctness** against it or a human-approved redacted derivative - row count
+  > 0, valid ISO calendar dates, merchant/payee non-empty and non-numeric, and
+  the document's sign convention. "Parses without error" alone is never
+  sufficient real-data evidence. The check runs against the redacted sample the
+  human approved once at intake, and evidence records only counts/booleans (see
+  `references/protocol.md` "Real-input correctness" and its redacted-sample
+  ritual);
 - confirmed the implementation write scope does not conflict with another active lane;
 - created or updated the request row in `requests.md`.
 
@@ -210,6 +226,100 @@ Send `FIX_REQUEST` only when review can state:
 - the same `request_id` with incremented `iteration`.
 
 Do not rewrite product scope during review. Send `BLOCKED` to product if criteria are ambiguous.
+
+### Review checklist (three named categories)
+
+Every review evaluates the slice against three named categories, not just
+per-criterion pass/fail:
+
+1. **Unmet or partial criteria** - any acceptance criterion whose red-capable
+   command did not pass, or passed only in part.
+2. **Scope creep** - changed files or behavior OUTSIDE the request's declared
+   `scope`/`non_goals`, flagged **even if it works**. The mechanical yardstick
+   is the request's `scope` globs: compare the `changed_files` against them, and
+   any changed file that no `scope` glob covers (or that a `non_goals` line
+   forbids) is scope creep. Run 2's out-of-scope pie chart and direct-ask
+   restyle were both this category, and review never named it.
+3. **Looks-done-but-wrong** - criteria that appear satisfied but produce a
+   wrong result (the tautological-evidence class: green command, garbage output).
+
+### Ease-of-misuse question (standing, mandatory)
+
+Beyond per-criterion pass/fail, every review answers one standing question and
+records the answer in `REVIEW_DONE`:
+
+> **Ease-of-misuse:** can a caller or input reach a wrong-but-accepted outcome
+> the criteria did not forbid? Name the path, or state "none found."
+
+This is the UNC-path class: run 2's localhost guard blocked `://` but not UNC
+network-share paths, and only a diligent reviewer caught it. Making the question
+mandatory turns that lucky catch into a required lens.
+
+### Finding severity (blocker | should-fix | nit)
+
+Each `FIX_REQUEST` finding carries a `severity`: `blocker`, `should-fix`, or
+`nit`.
+
+- **Only a `blocker` forces a fix cycle.** A blocker means a criterion is unmet,
+  scope creep shipped, or a misuse path is reachable - the slice cannot be
+  accepted as-is. Send `FIX_REQUEST`, keep the same `request_id`, and increment
+  `iteration`.
+- **`should-fix` and `nit` do NOT force a fix cycle.** They may be
+  accepted-with-notes (recorded in `REVIEW_DONE`'s `remaining_risks`, carried
+  into a follow-up request) or batched. **`iteration` increments only for
+  blockers** - a review that finds nothing but nits does not bounce the request
+  back and does not increment `iteration`. This cools the fix-cycle rate without
+  weakening review: a nitpick and a privacy hole no longer carry equal blocking
+  weight.
+
+When review finds only `should-fix`/`nit` items (no blocker), it may send
+`REVIEW_DONE` with the notes attached rather than `FIX_REQUEST`.
+
+### Tautological-evidence guard (reject evidence that cannot go red)
+
+A green exit code only counts when the command that produced it is
+**red-capable** - able to FAIL on the criterion's violation. Review must reject
+evidence whose command cannot distinguish a correct result from garbage output,
+even though it exited `0`. Ask of every evidence record: *if the code were
+wrong in the way the criterion forbids, would this exact command go red?* If the
+answer is no, the evidence is tautological - it proves the code ran, not that it
+is correct - and review sends `FIX_REQUEST` demanding a red-capable command, not
+`REVIEW_DONE`.
+
+The canonical case is run 2's `REQ-20260707-073729-data-eng`: its
+`td-pdf-smoke` evidence recorded `exit_code: 0` while the app produced
+`merchant="9"`, `date="2026-06-00"`, and 0 imported rows. The smoke exercised
+the plumbing without asserting a single field value, so it passed on garbage.
+Field-level assertions (row count > 0, valid ISO calendar dates, merchant
+non-empty and non-numeric, amount sign) are what make such a command go red -
+see G2 real-input correctness below.
+
+## Human-QA Gate (user-facing slices)
+
+A request whose deliverable is **human-operated** (a UI slice, a dashboard, an
+interactive CLI - anything marked `user_facing: true` on the request envelope or
+its goal/tracker checkpoint) does NOT reach `ACCEPTED` on machine evidence alone.
+The machine gate is unchanged and still runs FIRST; the human sign-off is
+additive and applies only to user-facing slices.
+
+Flow (all within existing status tokens and schema - no new column, no new
+status):
+
+- After `REVIEW_DONE`, product asks the human to **operate the feature** in one
+  message naming the URL/launch command + a 30-second try.
+- The request HOLDS: status stays `REVIEWING`, `next_action` reads
+  `awaiting human sign-off: <try>`, and a run-log row records
+  `human_qa_requested: <try>`. The tracker checkpoint stays `[~]`, never `[x]`.
+- On the human's confirmation, product records a run-log row
+  `human_qa: confirmed <who/when>` BEFORE moving the request to `ACCEPTED` and
+  marking the checkpoint `[x]`.
+
+A request holding for human QA is **normal waiting, not a stall**. The doctor
+recognizes it by the `human_qa_requested` run-log row with no matching
+`human_qa: confirmed` row for that `request_id`, and suppresses `stalled_handoff`
+for it - the held request is the HUMAN's turn (the dashboard's
+result-awaiting-confirmation state), not a lane to nudge. See
+`references/protocol.md` "Human-QA gate for user-facing slices".
 
 ## Auto-Chain Gate
 

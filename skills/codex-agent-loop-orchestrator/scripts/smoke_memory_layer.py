@@ -37,6 +37,20 @@ Team-shape check (second temp loop):
     lane, never product/implementation/review, and every lane has a workspace/
     directory.
 
+G1/G2/G3 criteria-and-gate checks (doc wording + a synthetic doctor loop):
+
+  - G1: protocol.md teaches red-capable acceptance criteria (each names the
+    exact command that proves it; a criterion with no red-capable command is a
+    vibe), carries the good/bad exemplar pair and the run-2 canonical
+    counterexample, and loop-state.md carries the tautological-evidence guard;
+  - G2: protocol.md defines field-level real-input correctness + the
+    redacted-sample ritual (human approves a sanitized excerpt/field-shape spec
+    ONCE at intake; evidence records only counts/booleans);
+  - G3: a request held awaiting human QA (a user-facing slice at REVIEWING with
+    a ``human_qa_requested`` run-log row and no confirmation) is NORMAL WAITING,
+    so the doctor suppresses ``stalled_handoff`` for it; the same request with
+    no marker (or after ``human_qa: confirmed``) still stalls.
+
 F8/F11 registry checks (tier loop):
 
   - the agent-lanes.md registry ends with an advisory ``tier`` column whose
@@ -53,6 +67,7 @@ Prints ``SMOKE_OK`` and exits 0 only if every assertion passes.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -71,9 +86,21 @@ import record_decision  # noqa: E402
 PASSING_REQUEST = "REQ-20260704-000001-implementation"
 FAILING_REQUEST = "REQ-20260704-000002-implementation"
 
+# The skill root (one level above scripts/) holds SKILL.md and references/.
+_SKILL_DIR = Path(__file__).resolve().parent.parent
+_SKILL_MD = _SKILL_DIR / "SKILL.md"
+_PROTOCOL_MD = _SKILL_DIR / "references" / "protocol.md"
+_LOOP_STATE_MD = _SKILL_DIR / "references" / "loop-state.md"
+
 
 def _fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def _read_doc(path: Path) -> str:
+    if not path.exists():
+        _fail("expected skill doc missing: {0}".format(path))
+    return path.read_text(encoding="utf-8")
 
 
 def _bootstrap(loop_dir: Path, extra_argv=None) -> None:
@@ -231,6 +258,475 @@ def _blank_heartbeat(registry: Path, lane: str) -> None:
         else:
             out.append(line)
     registry.write_text("".join(out), encoding="utf-8")
+
+
+def _make_terminal_request(requests_path: Path, request_id: str, owner_lane: str) -> None:
+    """Append a request row already in a terminal (ACCEPTED) state."""
+    _append_request_row(requests_path, request_id, owner_lane, "accepted")
+    _set_request_status(requests_path, request_id, "ACCEPTED")
+
+
+def _check_g7_doctor(tmp_path: Path) -> None:
+    """G7: the three WARNING-only doctor lineage/hygiene checks.
+
+    Positive AND negative cases for orphan_evidence, evidence_naming, and
+    uncommitted_work. orphan_evidence/evidence_naming are pure filesystem
+    checks; uncommitted_work needs a real tiny git repo, built in %TEMP% here.
+    """
+    import subprocess
+
+    # ---- (a) orphan_evidence / (b) evidence_naming (filesystem-only) --------
+    loop_g7 = tmp_path / "loop_g7"
+    _bootstrap(loop_g7)
+    evidence_dir = loop_g7 / "evidence"
+    requests_path = loop_g7 / "requests.md"
+    real_request = "REQ-20260707-090000-implementation"
+    _make_terminal_request(requests_path, real_request, "implementation")
+
+    # A well-named evidence file for a REGISTERED request: no warning.
+    _write_evidence(evidence_dir, real_request, 1, "pytest", 0)
+    # A well-named evidence file whose request_id is NOT registered: orphan.
+    orphan_request = "REQ-20260707-091111-frontend"
+    _write_evidence(evidence_dir, orphan_request, 1, "pytest", 0)
+    # A SETUP-* record: legitimate, never flagged.
+    (evidence_dir / "SETUP-20260707-first-move-doctor.json").write_text(
+        '{"note": "setup record"}', encoding="utf-8"
+    )
+    # A malformed name (the canonical stray from run 2): evidence_naming.
+    stray_name = "frontend-ui-ux-pro-max-20260707-verification.json"
+    (evidence_dir / stray_name).write_text('{"note": "stray"}', encoding="utf-8")
+
+    probe = doctor.summarize(loop_g7, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+
+    # orphan_evidence fires for the unregistered request, names file + id.
+    orphans = [w for w in probe["warnings"] if w["code"] == "orphan_evidence"]
+    if not orphans:
+        _fail("doctor should warn orphan_evidence for an evidence file naming an unregistered request")
+    if not any(orphan_request in w["message"] for w in orphans):
+        _fail("orphan_evidence should name the unregistered request_id")
+    # It must NOT flag the registered request's evidence or the SETUP record.
+    if any(real_request in w["message"] for w in orphans):
+        _fail("orphan_evidence must not fire for a registered request's evidence")
+    if any("SETUP-" in w["message"] for w in orphans):
+        _fail("orphan_evidence must not flag a SETUP-* record")
+    # Machine-readable list mirrors it.
+    if not any(o["request_id"] == orphan_request for o in probe.get("orphan_evidence", [])):
+        _fail("doctor result should expose orphan_evidence with the request_id")
+
+    # evidence_naming fires for the malformed name, and only that.
+    naming = [w for w in probe["warnings"] if w["code"] == "evidence_naming"]
+    if not any(stray_name in w["message"] for w in naming):
+        _fail("evidence_naming should flag the malformed stray filename")
+    if any(real_request in w["message"] or orphan_request in w["message"] for w in naming):
+        _fail("evidence_naming must not flag a well-named REQ-* evidence file")
+    if not any(n["file"] == stray_name for n in probe.get("evidence_naming", [])):
+        _fail("doctor result should expose evidence_naming with the file name")
+    # All three G7 codes are WARNING-only, never issues.
+    for code in ("orphan_evidence", "evidence_naming", "uncommitted_work"):
+        if any(i["code"] == code for i in probe["issues"]):
+            _fail("{0} must be a warning, never an issue".format(code))
+
+    # ---- (c) uncommitted_work: real tiny git repo ---------------------------
+    # Negative first: with NO git repo above the loop, the check is skipped
+    # silently even though a request is terminal and files are "dirty".
+    if probe.get("git_present") is not False:
+        _fail("loop_g7 must have no git ancestor for the git-absent negative case")
+    if probe.get("uncommitted_work"):
+        _fail("uncommitted_work must NOT fire when git is absent")
+
+    # Positive: build a real repo with the loop under it, an in-scope tracked
+    # file left dirty, all requests terminal. Guard on git being runnable so the
+    # smoke stays green where subprocess/git is unavailable.
+    def _git(repo: Path, *args: str) -> bool:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return out.returncode == 0
+
+    repo = tmp_path / "g7_repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    git_usable = _git(repo, "init")
+    if git_usable:
+        _git(repo, "config", "user.email", "smoke@example.com")
+        _git(repo, "config", "user.name", "smoke")
+        loop_c = repo / "docs" / "loop"
+        # A single custom lane owning src/** (no default lanes) so attribution
+        # is unambiguous: the default 'implementation' lane also owns src/**,
+        # which would win first-match and make the owner assertion flaky.
+        _bootstrap(loop_c, ["--no-default-lanes", "--extra-lane", "data-eng|Own core|src/**"])
+        c_requests = loop_c / "requests.md"
+        _make_terminal_request(c_requests, "REQ-20260707-092222-data-eng", "data-eng")
+        # An in-scope source file, committed, then modified so it is dirty.
+        src_dir = repo / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        src_file = src_dir / "core.py"
+        src_file.write_text("x = 1\n", encoding="utf-8")
+        # A data/DB artifact that must stay EXEMPT even when dirty.
+        data_dir = repo / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "expenses.sqlite3").write_text("db\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "seed")
+        # Now dirty the in-scope tracked source file.
+        src_file.write_text("x = 2\n", encoding="utf-8")
+        # And dirty the exempt data artifact.
+        (data_dir / "expenses.sqlite3").write_text("db2\n", encoding="utf-8")
+
+        c_probe = doctor.summarize(loop_c, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+        if c_probe.get("git_present") is not True:
+            _fail("loop_c must have a git ancestor for the uncommitted_work positive case")
+        uw = [w for w in c_probe["warnings"] if w["code"] == "uncommitted_work"]
+        if not uw:
+            _fail("uncommitted_work should fire for a dirty in-scope file at a paused/idle loop")
+        if not any("src/core.py" in w["message"] for w in uw):
+            _fail("uncommitted_work should name the dirty in-scope path src/core.py")
+        if not any("data-eng" in w["message"] for w in uw):
+            _fail("uncommitted_work should name the owning lane (data-eng)")
+        # The exempt data artifact must NOT be flagged.
+        if any("expenses.sqlite3" in w["message"] for w in uw):
+            _fail("uncommitted_work must exempt data/DB artifacts (*.sqlite3)")
+        if not any("src/core.py" in item["path"] for item in c_probe.get("uncommitted_work", [])):
+            _fail("doctor result should expose uncommitted_work with the in-scope path")
+
+        # Negative: while a request is still NON-terminal (mid-flight), the same
+        # dirty file must NOT warn -- work in progress is normal.
+        _set_request_status(c_requests, "REQ-20260707-092222-data-eng", "IMPLEMENTING")
+        mid_probe = doctor.summarize(loop_c, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+        if any(w["code"] == "uncommitted_work" for w in mid_probe["warnings"]):
+            _fail("uncommitted_work must NOT fire while a request is still non-terminal (mid-flight)")
+
+
+def _append_run_log_row(loop_dir: Path, request_id: str, from_status: str, to_status: str, lane: str, note: str) -> None:
+    """Append one row to loop-run-log.md (the append-only transition log).
+
+    Columns: timestamp, request_id, iteration, from_status, to_status, lane, note.
+    """
+    row = "| 2026-07-07T10:00:00Z | {rid} | 1 | {frm} | {to} | {lane} | {note} |\n".format(
+        rid=request_id, frm=from_status, to=to_status, lane=lane, note=note
+    )
+    with (loop_dir / "loop-run-log.md").open("a", encoding="utf-8") as handle:
+        handle.write(row)
+
+
+def _check_g14(tmp_path: Path) -> None:
+    """G14: tier observability (model_observed line + tier_mismatch doctor).
+
+    (a) ``bootstrap --observed-model 'lane=<observed>'`` stamps the lane's
+    current.md ``model_observed:`` line verbatim, and a fresh current.md carries
+    the (blank) model_observed field.
+
+    (b) The doctor emits a WARNING-only ``tier_mismatch`` for a lane whose
+    OBSERVED tier tag differs from the registry ``tier`` column, names both
+    tiers, and does NOT flag a lane whose observed tier MATCHES nor one whose
+    model_observed line is blank (not-yet-observed is not a mismatch). Never an
+    issue; the concrete model id is DATA (allowed in the observed value).
+    """
+    loop = tmp_path / "g14_loop"
+    # (a) adoption-time stamping: implementation MATCHES (highest), product
+    # MISMATCHES (registry second-highest, observed highest), review left blank.
+    _bootstrap(loop, extra_argv=[
+        "--observed-model", "implementation=gpt-5.5 xhigh (highest)",
+        "--observed-model", "product=gpt-5.5 xhigh (highest)",
+    ])
+    # The template carries a (blank) model_observed field for every lane.
+    review_cur = (loop / "lanes" / "review" / "current.md").read_text(encoding="utf-8")
+    if "model_observed:" not in review_cur:
+        _fail("G14(a): current.md template must carry a model_observed field")
+    impl_cur = (loop / "lanes" / "implementation" / "current.md").read_text(encoding="utf-8")
+    if "model_observed: gpt-5.5 xhigh (highest)" not in impl_cur:
+        _fail("G14(a): --observed-model must stamp the current.md model_observed line verbatim")
+
+    # The doctor's tag extractor pulls the abstract tag from the observed value.
+    if doctor.observed_tier_tag(impl_cur) != "highest":
+        _fail("G14(b): observed_tier_tag must extract 'highest' from the model_observed line")
+    if doctor.observed_tier_tag("current_request_id:\nmodel_observed:\n") != "":
+        _fail("G14(b): a blank model_observed line must yield no observed tier tag")
+
+    res = _doctor(loop)
+    tms = [w for w in res["warnings"] if w["code"] == "tier_mismatch"]
+    if not tms:
+        _fail("G14(b): the doctor must warn tier_mismatch for product (observed highest vs recommended second-highest)")
+    if not any("product" in w["message"] for w in tms):
+        _fail("G14(b): tier_mismatch must name the mismatched lane 'product'")
+    if not any("highest" in w["message"] and "second-highest" in w["message"] for w in tms):
+        _fail("G14(b): tier_mismatch must name both the observed and recommended tiers")
+    # The MATCHING lane (implementation) must NOT be flagged.
+    if any("lane implementation" in w["message"] for w in tms):
+        _fail("G14(b): a lane whose observed tier matches must not be flagged")
+    # A not-yet-observed lane (review, blank model_observed) must NOT be flagged.
+    if any("lane review" in w["message"] for w in tms):
+        _fail("G14(b): a blank (not-yet-observed) lane must not be a tier_mismatch")
+    if any(i["code"] == "tier_mismatch" for i in res["issues"]):
+        _fail("G14(b): tier_mismatch must be a warning, never an issue")
+    # Machine-readable passthrough.
+    tm_list = res.get("tier_mismatches") or []
+    if not any(t["lane"] == "product" and t["observed"] == "highest"
+               and t["recommended"] == "second-highest" for t in tm_list):
+        _fail("G14(b): doctor result must expose the tier_mismatches list with both tiers")
+    # A tier_mismatch must NOT block handoff (WARNING-only contract).
+    if res.get("handoff_ready") is not True:
+        _fail("G14(b): a tier_mismatch warning must not flip handoff_ready to False")
+
+    # NEGATIVE: fix the registry (human raises product to highest) -> no mismatch.
+    reg = loop / "agent-lanes.md"
+    idx = _registry_col_index(reg, "tier")
+    lines = reg.read_text(encoding="utf-8").splitlines(keepends=True)
+    out = []
+    for line in lines:
+        if line.strip().startswith("|") and "| product |" in line:
+            suffix = "\n" if line.endswith("\n") else ""
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if idx < len(cells):
+                cells[idx] = "highest"
+            out.append("| " + " | ".join(cells) + " |" + suffix)
+        else:
+            out.append(line)
+    reg.write_text("".join(out), encoding="utf-8")
+    res2 = _doctor(loop)
+    if any(w["code"] == "tier_mismatch" and "product" in w["message"]
+           for w in res2["warnings"]):
+        _fail("G14(e): raising the registry tier to match the observed tier must clear the mismatch")
+
+
+def _check_g12(tmp_path: Path) -> None:
+    """G12: handoff/auto-chain seed sensitive-content scan (WARNING-only).
+
+    NEGATIVE: a clean handoff that references sensitive material by name (and
+    carries only ordinary short numbers -- ports, dates, iterations) produces NO
+    ``handoff_sensitive_content`` warning.
+
+    POSITIVE: a handoff that quotes an account-number-like digit run and a full
+    path into a constraint-marked sensitive directory produces the warning for
+    each, as a WARNING (never an issue), and the doctor's own message MASKS the
+    account number (last 4 only) so it never re-leaks the material. A
+    project-specific sensitive dir named on a constraints.md sensitive line is
+    detected too.
+    """
+    loop = tmp_path / "g12_loop"
+    _bootstrap(loop)
+    (loop / "constraints.md").write_text(
+        "# Constraints\n\n"
+        "- The user's TD statement is highly sensitive; never upload or commit it.\n"
+        "- Keep `data/`, `uploads/`, `private_samples/`, and `client_files/` "
+        "untracked (private).\n",
+        encoding="utf-8",
+    )
+
+    # NEGATIVE.
+    (loop / "handoff.md").write_text(
+        "# Handoff\n\n"
+        "Continue R4: import the TD statement (referenced by name only).\n"
+        "Server on port 8011; last touched 2026-07-07; iteration 2.\n"
+        "Context: docs/loop/goal.md and src/core/parse.py.\n",
+        encoding="utf-8",
+    )
+    clean = doctor.check_handoff_sensitive_content(loop)
+    if clean:
+        _fail("G12: a clean handoff (references only, short numbers) must not flag; got {0}".format(clean))
+    res_clean = _doctor(loop)
+    if any(w["code"] == "handoff_sensitive_content" for w in res_clean["warnings"]):
+        _fail("G12: no handoff_sensitive_content warning may fire on a clean handoff")
+
+    # POSITIVE.
+    (loop / "handoff.md").write_text(
+        "# Handoff\n\n"
+        "Continue R4. The account is 4123 5678 9012 3456 on the TD statement.\n"
+        "Redacted sample at private_samples/td_2026_06.pdf; also "
+        "client_files/customer_list.csv.\n"
+        "Server on port 8011.\n",
+        encoding="utf-8",
+    )
+    leaky = doctor.check_handoff_sensitive_content(loop)
+    kinds = {f["kind"] for f in leaky}
+    if "account_number" not in kinds:
+        _fail("G12: an account-number-like digit run in handoff.md must be flagged")
+    if "sensitive_path" not in kinds:
+        _fail("G12: a path into a sensitive directory in handoff.md must be flagged")
+    # The account sample must be MASKED (no full run), and a project-specific
+    # sensitive dir named in constraints must be caught.
+    acct = [f for f in leaky if f["kind"] == "account_number"][0]
+    if "4123" in acct["sample"] or "5678" in acct["sample"]:
+        _fail("G12: the account-number finding must be masked, not carry the leading digits")
+    if not acct["sample"].endswith("3456"):
+        _fail("G12: the masked account finding should keep the last 4 digits")
+    paths = {f["sample"] for f in leaky if f["kind"] == "sensitive_path"}
+    if not any(p.startswith("private_samples/") for p in paths):
+        _fail("G12: the private_samples path must be flagged")
+    if not any(p.startswith("client_files/") for p in paths):
+        _fail("G12: a project-specific sensitive dir named on a constraints sensitive line must be flagged")
+
+    res = _doctor(loop)
+    warns = [w for w in res["warnings"] if w["code"] == "handoff_sensitive_content"]
+    if not warns:
+        _fail("G12: the doctor must emit handoff_sensitive_content warnings for a leaky handoff")
+    if any(i["code"] == "handoff_sensitive_content" for i in res["issues"]):
+        _fail("G12: handoff_sensitive_content must be a warning, never an issue")
+    # The raw account run must NEVER appear in the doctor's own output.
+    for w in warns:
+        if "4123 5678 9012 3456" in w["message"] or "4123567890123456" in w["message"]:
+            _fail("G12: the doctor re-leaked the raw account number in its own warning")
+    # A leaky handoff must NOT block handoff/auto-chain (WARNING-only contract).
+    if res.get("handoff_ready") is not True:
+        _fail("G12: a sensitive-content warning must not flip handoff_ready to False")
+    # Machine-readable passthrough present.
+    if not isinstance(res.get("handoff_sensitive_content"), list) or not res["handoff_sensitive_content"]:
+        _fail("G12: doctor result should expose a non-empty handoff_sensitive_content list")
+
+
+def _check_g11(tmp_path: Path) -> None:
+    """G11: no pre-minted message dirs + timestamp-sorted reconstruction.
+
+    (a) ``deliver_message.archive_message`` creates the durable
+    ``messages/<request_id>/`` dir ONLY alongside a real write: called with no
+    request_id it creates nothing (the run-2 empty-stray-dir failure mode), and
+    called with a final id it leaves a message file, never an empty dir.
+
+    (b) The doctor's run-log reconstruction is timestamp-ordered: feeding the
+    SAME rows in chronological order and in a SHUFFLED order (late-append
+    recovery rows out of file order -- which run 2 legally produced) yields
+    identical fix-cycle counts and human-QA-hold conclusions, and
+    ``parse_run_log_sorted`` returns rows in chronological order.
+    """
+    loop = tmp_path / "g11_loop"
+    _bootstrap(loop)
+
+    # ---- (a) archive_message never leaves an empty messages/<rid>/ dir -------
+    msgs = loop / "messages"
+    # No id -> no request-scoped store, and crucially no empty directory.
+    if deliver_message.archive_message(loop, "", "IMPLEMENTATION_DONE", "1", "x\n") is not None:
+        _fail("G11: archive_message with no request_id should return None (no dir)")
+    empties = [p for p in msgs.iterdir() if p.is_dir() and not any(p.iterdir())]
+    if empties:
+        _fail("G11: archive_message with no id created an empty dir: {0}".format(
+            [p.name for p in empties]))
+    # Final id -> dir minted WITH a message file inside it.
+    final_rid = "REQ-20260707-120000-implementation"
+    archived = deliver_message.archive_message(
+        loop, final_rid, "IMPLEMENTATION_DONE", "1", "# IMPLEMENTATION_DONE\n\ndone\n")
+    if not archived:
+        _fail("G11: archive_message with a final id must return the archived path")
+    final_dir = msgs / final_rid
+    if not any(final_dir.glob("*.md")):
+        _fail("G11: archive_message must write a message file into messages/<rid>/")
+    still_empty = [p for p in msgs.iterdir() if p.is_dir() and not any(p.iterdir())]
+    if still_empty:
+        _fail("G11: no empty messages/<rid>/ dir may remain; got {0}".format(
+            [p.name for p in still_empty]))
+
+    # ---- (b) shuffled-log invariance ----------------------------------------
+    runlog = loop / "loop-run-log.md"
+    header = (
+        "# Loop Run Log\n\n"
+        "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+    )
+    rid = "REQ-20260707-073729-data-eng"
+    rows = [
+        ("2026-07-07T07:37:29Z", rid, "1", "REQUESTED", "IMPLEMENTING", "data-eng", "start"),
+        ("2026-07-07T07:45:00Z", rid, "1", "IMPLEMENTING", "REVIEWING", "review", "impl done"),
+        ("2026-07-07T07:50:00Z", rid, "1", "REVIEWING", "FIX_REQUESTED", "review", "reject"),
+        ("2026-07-07T07:55:00Z", rid, "2", "FIX_REQUESTED", "IMPLEMENTING", "data-eng", "fix"),
+        ("2026-07-07T08:00:00Z", rid, "2", "IMPLEMENTING", "REVIEWING", "review", "impl done 2"),
+        # A human_qa hold on a second (user-facing) request; its confirmation is
+        # a LATER row placed out of order in the shuffle below.
+        ("2026-07-07T08:05:00Z", "REQ-20260707-080500-frontend", "1", "IMPLEMENTATION_DONE",
+         "REVIEWING", "frontend", "human_qa_requested: try the UI"),
+    ]
+
+    def _render(order):
+        return header + "".join("| " + " | ".join(r) + " |\n" for r in order)
+
+    runlog.write_text(_render(rows), encoding="utf-8")
+    fix_inorder = doctor.count_fix_cycles_from_log(loop)
+    held_inorder = doctor.requests_held_for_human_qa(loop)
+
+    # Shuffle: put recovery rows out of chronological order (legal append-only).
+    shuffled = [rows[2], rows[5], rows[0], rows[4], rows[1], rows[3]]
+    runlog.write_text(_render(shuffled), encoding="utf-8")
+    fix_shuffled = doctor.count_fix_cycles_from_log(loop)
+    held_shuffled = doctor.requests_held_for_human_qa(loop)
+
+    if fix_inorder != fix_shuffled:
+        _fail("G11: fix-cycle counts must be identical on a shuffled log; "
+              "{0} vs {1}".format(fix_inorder, fix_shuffled))
+    if fix_inorder.get(rid) != 3:
+        _fail("G11: the data-eng request should count 3 thrash transitions; got {0}".format(
+            fix_inorder.get(rid)))
+    if held_inorder != held_shuffled:
+        _fail("G11: human-QA hold conclusions must be identical on a shuffled log; "
+              "{0} vs {1}".format(held_inorder, held_shuffled))
+    if "REQ-20260707-080500-frontend" not in held_shuffled:
+        _fail("G11: the held user-facing request must be detected on the shuffled log")
+
+    # parse_run_log_sorted yields chronological order even on the shuffled log.
+    srt = doctor.parse_run_log_sorted(loop)
+    ts = [r.get("timestamp", "") for r in srt]
+    if ts != sorted(ts):
+        _fail("G11: parse_run_log_sorted must return rows in chronological order; got {0}".format(ts))
+
+
+def _check_g3_doctor(tmp_path: Path) -> None:
+    """G3: a request held awaiting human QA is NORMAL WAITING, not stalled_handoff.
+
+    Positive (exclusion works): a user-facing request at REVIEWING with an
+    archived REVIEW_DONE (work done) AND a human_qa_requested run-log row but NO
+    confirmation must NOT emit stalled_handoff -- the doctor recognizes the hold.
+
+    Negative (exclusion is specific): the SAME request, with the human_qa marker
+    removed but still REVIEWING with an archived REVIEW_DONE, MUST still emit
+    stalled_handoff. And once a human_qa: confirmed row is appended, the hold is
+    released (so if the request were still parked it would stall again) -- proving
+    the confirmation, not merely any human_qa mention, releases the exclusion.
+    """
+    loop_g3 = tmp_path / "loop_g3"
+    _bootstrap(loop_g3)
+    requests_path = loop_g3 / "requests.md"
+    uf_request = "REQ-20260707-100000-frontend"
+    # A user-facing request parked at REVIEWING (work done, awaiting the human).
+    _append_request_row(requests_path, uf_request, "product", "awaiting human sign-off: try import")
+    _set_request_status(requests_path, uf_request, "REVIEWING")
+    # Archive a REVIEW_DONE so the stall detector's done-by-review signal fires.
+    rd_dir = loop_g3 / "messages" / uf_request
+    rd_dir.mkdir(parents=True, exist_ok=True)
+    (rd_dir / "REVIEW_DONE-iter-1.md").write_text("# REVIEW_DONE\n\npass\n", encoding="utf-8")
+
+    # --- Negative baseline: no human_qa marker yet -> the hold is absent, so a
+    # done-but-unadvanced REVIEWING request DOES stall (the exclusion is not a
+    # blanket suppression of REVIEWING requests).
+    base = doctor.summarize(loop_g3, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+    base_stalls = [w for w in base["warnings"] if w["code"] == "stalled_handoff" and uf_request in w["message"]]
+    if not base_stalls:
+        _fail("without a human_qa_requested row, a done REVIEWING request must still emit stalled_handoff")
+    if uf_request in base.get("held_for_human_qa", []):
+        _fail("a request with no human_qa_requested row must NOT be reported as held_for_human_qa")
+
+    # --- Positive: append human_qa_requested (no confirmation) -> HELD, no stall.
+    _append_run_log_row(loop_g3, uf_request, "REVIEWING", "REVIEWING", "product", "human_qa_requested: import your statement")
+    held = doctor.summarize(loop_g3, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+    held_stalls = [w for w in held["warnings"] if w["code"] == "stalled_handoff" and uf_request in w["message"]]
+    if held_stalls:
+        _fail("a request held awaiting human QA must NOT emit stalled_handoff (normal waiting)")
+    if uf_request not in held.get("held_for_human_qa", []):
+        _fail("doctor must expose the held request in held_for_human_qa")
+
+    # --- Confirmation released the hold: append human_qa: confirmed. The request
+    # is no longer held, so if it is STILL parked at REVIEWING (product has not
+    # yet moved it to ACCEPTED) the stall fires again -- confirmation, not any
+    # mention, ends the exclusion.
+    _append_run_log_row(loop_g3, uf_request, "REVIEWING", "REVIEWING", "product", "human_qa: confirmed operator 2026-07-07")
+    confirmed = doctor.summarize(loop_g3, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+    if uf_request in confirmed.get("held_for_human_qa", []):
+        _fail("a confirmed request must NOT remain in held_for_human_qa")
+    conf_stalls = [w for w in confirmed["warnings"] if w["code"] == "stalled_handoff" and uf_request in w["message"]]
+    if not conf_stalls:
+        _fail("after human_qa: confirmed, a still-parked REVIEWING request must stall again (hold released)")
 
 
 def main() -> int:
@@ -885,6 +1381,456 @@ def main() -> int:
                 _fail("default lane dir {0} was created despite --no-default-lanes".format(lane))
         if not (loop_b / "lanes" / "research" / "workspace" / "README.md").exists():
             _fail("research lane is missing its workspace/ directory")
+
+        # ---- G5: single-source "close the turn" ritual ----------------------
+        # The in-turn report-back ritual must be defined in FULL exactly once
+        # (protocol.md), coined with the leading token "close the turn"; SKILL.md
+        # and loop-state.md carry the token + a pointer to protocol.md but NOT
+        # the full step list. Three drifting copies were the failure this fixes.
+        skill_md = _read_doc(_SKILL_MD)
+        protocol_md = _read_doc(_PROTOCOL_MD)
+        loop_state_md = _read_doc(_LOOP_STATE_MD)
+
+        # The leading token appears in all three files (case-insensitive).
+        for name, text in (
+            ("SKILL.md", skill_md),
+            ("protocol.md", protocol_md),
+            ("loop-state.md", loop_state_md),
+        ):
+            if "close the turn" not in text.lower():
+                _fail("{0} must reference the ritual by the token 'close the turn'".format(name))
+
+        # The FULL step list is a numbered "1. ... send the reply" beat. It must
+        # appear in exactly one file (protocol.md). Signature: the numbered
+        # "1." step naming the reply message, present once.
+        def _has_full_step_list(text: str) -> bool:
+            lower = text.lower()
+            return (
+                "1." in text
+                and "2." in text
+                and "3." in text
+                and "4." in text
+                and "send the reply message" in lower
+                and "append the `loop-run-log.md` row" in lower
+                and "refresh your heartbeat" in lower
+            )
+
+        full_sources = [
+            name
+            for name, text in (
+                ("SKILL.md", skill_md),
+                ("protocol.md", protocol_md),
+                ("loop-state.md", loop_state_md),
+            )
+            if _has_full_step_list(text)
+        ]
+        if full_sources != ["protocol.md"]:
+            _fail(
+                "the full close-the-turn step list must live in exactly protocol.md; "
+                "found it in {0}".format(full_sources or "(nowhere)")
+            )
+
+        # The two pointer files must name protocol.md as the single source.
+        if "protocol.md" not in skill_md:
+            _fail("SKILL.md must point to references/protocol.md for the ritual")
+        if "protocol.md" not in loop_state_md:
+            _fail("loop-state.md must point to references/protocol.md for the ritual")
+
+        # ---- G4: commit-as-lane is the 5th close-the-turn step --------------
+        # The single source (protocol.md) must carry a 5th mandatory step:
+        # commit your slice as your lane, with the WHY (uncommitted slice leaves
+        # the scope guard inert + next lane builds on uncommitted state).
+        protocol_lower = protocol_md.lower()
+        if "5." not in protocol_md or "codex_lane=" not in protocol_lower:
+            _fail("protocol.md close-the-turn ritual is missing the 5th commit-as-lane step")
+        if "git commit" not in protocol_lower:
+            _fail("the commit-as-lane step must name `git commit`")
+        if "scope guard" not in protocol_lower or "inert" not in protocol_lower:
+            _fail("the commit-as-lane step must state the WHY (uncommitted slice = inert scope guard)")
+        # Product's accept/pause path: a paused loop is a fully committed loop.
+        if "git status --porcelain" not in protocol_lower:
+            _fail("protocol.md must require `git status --porcelain` before pausing")
+        if "paused loop is a fully committed loop" not in protocol_lower:
+            _fail("protocol.md must state 'a paused loop is a fully committed loop'")
+        # UI addendum: restart a serving process and re-smoke the LIVE instance.
+        if "re-smoke" not in protocol_lower and "re-run the smoke" not in protocol_lower:
+            _fail("protocol.md UI addendum must require re-smoking a restarted serving process")
+        if "live instance" not in protocol_lower:
+            _fail("protocol.md UI addendum must name the LIVE instance")
+        # The full step list (now 5 steps) still lives ONLY in protocol.md: the
+        # single-source check above already guards SKILL.md/loop-state.md against
+        # restating it.
+
+        # ---- G6: Human Direct-Ask Ritual (hard gate) ------------------------
+        # SKILL.md must carry a positively-framed direct-ask ritual: a lane
+        # receiving a direct work ask records the preference and ROUTES it
+        # (ask product to mint the request, or self-mint cc product); the change
+        # ships only through the normal lifecycle.
+        skill_lower = skill_md.lower()
+        if "human direct-ask ritual" not in skill_lower:
+            _fail("SKILL.md must add a 'Human Direct-Ask Ritual (hard gate)' subsection")
+        if "record the preference" not in skill_lower and "records the preference" not in skill_lower:
+            _fail("the direct-ask ritual must say a lane records the preference")
+        if "route" not in skill_lower:
+            _fail("the direct-ask ritual must ROUTE the ask into the normal lifecycle")
+        if "ask product to create the request" not in skill_lower:
+            _fail("the direct-ask ritual must offer the exit 'ask product to create the request'")
+        # Paired product rule: product dispatches, does not implement.
+        if "product dispatches" not in skill_lower or "does not implement" not in skill_lower:
+            _fail("SKILL.md must carry the paired rule 'product dispatches; it does not implement'")
+        if "implementation_request" not in skill_lower:
+            _fail("the product-dispatches rule must route even a one-line ask into an IMPLEMENTATION_REQUEST")
+        # One crisp cardinal statement -- stated EXACTLY once (single-source,
+        # same principle as G5): other mentions back-reference it, never restate.
+        cardinal_count = skill_lower.count("no code ships without a request_id")
+        if cardinal_count != 1:
+            _fail(
+                "SKILL.md must state the cardinal rule 'no code ships without a "
+                "request_id and independent review' exactly once; found {0}".format(cardinal_count)
+            )
+        if "no code ships without a request_id and independent review" not in skill_lower:
+            _fail("the single cardinal statement must carry the full rule text")
+        # New Stop Condition: asked to change code with no backing request row.
+        if "no backing request row" not in skill_lower:
+            _fail("SKILL.md Stop Conditions must include 'asked to change code with no backing request row'")
+
+        # ---- G1: red-capable acceptance criteria ----------------------------
+        # protocol.md IMPLEMENTATION_REQUEST template must teach red-capable
+        # criteria: each criterion names the exact command that proves it, the
+        # command must be able to go RED on that criterion's violation, and the
+        # good/bad exemplar pair + the run-2 canonical counterexample are cited.
+        protocol_g1 = protocol_lower
+        if "red-capable" not in protocol_g1:
+            _fail("protocol.md must teach 'red-capable' acceptance criteria")
+        if "a criterion with no command that can go red is a vibe" not in protocol_g1:
+            _fail("protocol.md must carry the 'a criterion ... is a vibe: sharpen it or drop it' rule")
+        # The exemplar pair: bad 'parsing works' vs a good field-level unittest.
+        if "parsing works" not in protocol_g1:
+            _fail("protocol.md must show the BAD exemplar ('parsing works')")
+        if "test_parse_fields" not in protocol_g1:
+            _fail("protocol.md must show the GOOD exemplar (a field-level unittest that fails on garbage)")
+        if "merchant is non-numeric" not in protocol_g1:
+            _fail("the good exemplar must assert merchant is non-numeric text")
+        # The canonical run-2 counterexample must be cited with its real defect.
+        for needle in ("req-20260707-073729-data-eng", "td-pdf-smoke", 'merchant="9"', "2026-06-00"):
+            if needle not in protocol_g1:
+                _fail("protocol.md must cite the run-2 counterexample detail: {0}".format(needle))
+        # The IMPLEMENTATION_REQUEST template itself carries a per-criterion
+        # VERIFY command so an author copies red-capable criteria, not vibes.
+        if "verify `python -m unittest" not in protocol_g1:
+            _fail("the IMPLEMENTATION_REQUEST template must show a per-criterion VERIFY command")
+
+        # loop-state.md: the product->implementation gate demands a red-capable
+        # command per criterion, and the review gate carries the
+        # tautological-evidence guard citing the same counterexample.
+        loop_state_lower = loop_state_md.lower()
+        if "red-capable verify command" not in loop_state_lower:
+            _fail("loop-state.md product->implementation gate must require a red-capable verify command per criterion")
+        if "tautological-evidence guard" not in loop_state_lower:
+            _fail("loop-state.md review gate must carry the tautological-evidence guard")
+        if "cannot distinguish" not in loop_state_lower:
+            _fail("the tautological-evidence guard must reject evidence that cannot distinguish success from garbage")
+        if "req-20260707-073729-data-eng" not in loop_state_lower:
+            _fail("loop-state.md tautological-evidence guard must cite the run-2 counterexample")
+
+        # SKILL.md mirrors the red-capable rule in one sentence.
+        if "red-capable" not in skill_lower:
+            _fail("SKILL.md must mirror the red-capable verify-command rule")
+
+        # ---- G2: real-input correctness + redacted-sample ritual ------------
+        # protocol.md must define field-level real-data correctness (row count,
+        # valid calendar dates, non-numeric merchant, sign convention) and the
+        # redacted-sample ritual (human approves a sanitized excerpt/field-shape
+        # spec ONCE at intake; evidence records only counts/booleans).
+        if "real-input correctness" not in protocol_g1:
+            _fail("protocol.md must define a 'Real-input correctness' verification surface")
+        if "field-level correctness" not in protocol_g1:
+            _fail("protocol.md real-input section must require field-level correctness")
+        if "parses without error" not in protocol_g1:
+            _fail("protocol.md must state 'parses without error' alone is never sufficient real-data evidence")
+        if "redacted-sample ritual" not in protocol_g1:
+            _fail("protocol.md must define the redacted-sample ritual")
+        # The four field-level assertions must all be named.
+        for needle in ("row count", "valid", "calendar", "non-numeric", "sign"):
+            if needle not in protocol_g1:
+                _fail("protocol.md real-input section must name the field assertion: {0}".format(needle))
+        # Evidence records only counts/booleans, never raw rows.
+        if "only counts" not in protocol_g1 and "counts and booleans" not in protocol_g1:
+            _fail("the redacted-sample ritual must record only counts/booleans as evidence")
+        if "once at intake" not in protocol_g1:
+            _fail("the redacted-sample must be approved ONCE at intake")
+
+        # loop-state.md product->implementation gate must require the field-level
+        # criterion when the goal names real data.
+        if "field-level" not in loop_state_lower:
+            _fail("loop-state.md gate must require a field-level criterion for real data")
+        if "human-provided real data" not in loop_state_lower:
+            _fail("loop-state.md gate must key the field-level rule off human-provided real data")
+
+        # SKILL.md intake must carry the redacted-sample ritual.
+        if "redacted-sample ritual" not in skill_lower:
+            _fail("SKILL.md intake must define the redacted-sample ritual")
+        if "field-shape spec" not in skill_lower:
+            _fail("SKILL.md redacted-sample ritual must offer a field-shape spec as the derivative")
+
+        # ---- G3: human-QA gate for user-facing slices (doc wording) ---------
+        # protocol.md defines the gate: user_facing marker, hold within existing
+        # tokens (REVIEWING + next_action + human_qa_requested run-log row),
+        # sign-off via human_qa: confirmed BEFORE ACCEPTED, machine gate first.
+        if "human-qa gate for user-facing slices" not in protocol_g1:
+            _fail("protocol.md must define the 'Human-QA gate for user-facing slices'")
+        if "user_facing: true" not in protocol_md:
+            _fail("protocol.md must mark user-facing requests with 'user_facing: true'")
+        if "human_qa_requested" not in protocol_g1:
+            _fail("protocol.md human-QA gate must record a human_qa_requested run-log row")
+        if "human_qa: confirmed" not in protocol_g1:
+            _fail("protocol.md human-QA gate must record human_qa: confirmed before ACCEPTED")
+        if "machine evidence alone" not in protocol_g1:
+            _fail("protocol.md must state a user-facing slice does not reach ACCEPTED on machine evidence alone")
+        # It must NOT introduce a new status token; the hold stays at REVIEWING.
+        if "do not invent a new status" not in protocol_g1 and "do not\n   invent a new status" not in protocol_g1:
+            _fail("protocol.md human-QA gate must keep the hold at REVIEWING (no new status token)")
+        # The IMPLEMENTATION_REQUEST envelope carries the user_facing field.
+        if "user_facing: false" not in protocol_md:
+            _fail("the IMPLEMENTATION_REQUEST template must carry a user_facing envelope field")
+
+        # loop-state.md carries the Human-QA Gate section + the stall exclusion.
+        if "human-qa gate" not in loop_state_lower:
+            _fail("loop-state.md must carry a 'Human-QA Gate' section")
+        if "normal waiting, not a stall" not in loop_state_lower:
+            _fail("loop-state.md must state a held request is normal waiting, not a stall")
+
+        # SKILL.md mirrors the human-QA gate.
+        if "human-qa sign-off" not in skill_lower:
+            _fail("SKILL.md must mirror the human-QA sign-off before ACCEPTED for user-facing slices")
+
+        # ---- G8: review upgrades --------------------------------------------
+        # (a) Three named review categories incl. SCOPE CREEP with the
+        # changed-files-vs-scope-globs yardstick.
+        if "scope creep" not in loop_state_lower:
+            _fail("loop-state.md review checklist must name a SCOPE CREEP category")
+        if "changed_files" not in loop_state_lower and "changed files" not in loop_state_lower:
+            _fail("the scope-creep check must use changed files vs scope globs as the yardstick")
+        if "even if it works" not in loop_state_lower:
+            _fail("scope creep must be flagged even if it works")
+        if "looks-done-but-wrong" not in loop_state_lower:
+            _fail("loop-state.md review checklist must name the looks-done-but-wrong category")
+        # (b) Empty non_goals gate: not ready to send.
+        if "non-empty non-goals" not in loop_state_lower and "non-empty non_goals" not in loop_state_lower:
+            _fail("loop-state.md product->implementation gate must require non-empty non_goals")
+        if "not ready to send" not in loop_state_lower:
+            _fail("an empty non_goals must make the request 'not ready to send'")
+        # (c) Standing ease-of-misuse question in the review gate + REVIEW_DONE.
+        if "ease-of-misuse" not in loop_state_lower:
+            _fail("loop-state.md review gate must carry the standing ease-of-misuse question")
+        if "wrong-but-accepted" not in loop_state_lower:
+            _fail("the ease-of-misuse question must ask about a wrong-but-accepted outcome the criteria did not forbid")
+        if "ease_of_misuse" not in protocol_md:
+            _fail("the REVIEW_DONE template must carry an ease_of_misuse field")
+        # (d) FIX_REQUEST severity tiers; only blockers force a fix cycle.
+        if "severity: blocker" not in protocol_md:
+            _fail("the FIX_REQUEST envelope must carry a severity field (blocker|should-fix|nit)")
+        for tier in ("blocker", "should-fix", "nit"):
+            if tier not in loop_state_lower:
+                _fail("loop-state.md must define the severity tier: {0}".format(tier))
+        if "only a `blocker` forces a fix cycle" not in loop_state_lower:
+            _fail("loop-state.md must state only a blocker forces a fix cycle")
+        # iteration increments only for blockers (tolerate line-wrap between the
+        # two words by collapsing whitespace before matching).
+        loop_state_collapsed = " ".join(loop_state_lower.split())
+        if "increments only for blockers" not in loop_state_collapsed:
+            _fail("loop-state.md must state iteration increments only for blockers")
+        # SKILL.md review-lane wording mirrors the three categories + severity.
+        if "scope creep" not in skill_lower:
+            _fail("SKILL.md review-lane wording must name scope creep")
+        if "ease-of-misuse" not in skill_lower:
+            _fail("SKILL.md review-lane wording must carry the ease-of-misuse question")
+        if "only a blocker forces a fix cycle" not in skill_lower:
+            _fail("SKILL.md must state only a blocker forces a fix cycle and increments iteration")
+
+        # ---- G9: grilling intake --------------------------------------------
+        # SKILL.md Intake becomes an interview: one question at a time with a
+        # recommended answer attached, facts looked up not asked, a stop rule,
+        # and the MANDATORY operate-it question for user-facing goals. F3/F5
+        # semantics (no placeholder BLOCKED, task-size gate, two forks) preserved.
+        if "one question at a time" not in skill_lower:
+            _fail("SKILL.md intake must ask ONE question at a time")
+        if "recommended answer" not in skill_lower:
+            _fail("SKILL.md intake must attach a recommended answer to every question")
+        if "look up any fact" not in skill_lower and "looked up" not in skill_lower:
+            _fail("SKILL.md intake must look up facts the repo/host can answer, never ask them")
+        if "stop rule" not in skill_lower:
+            _fail("SKILL.md intake must carry a stop rule (checkable objective -> stop asking)")
+        if "over-interview" not in skill_lower:
+            _fail("SKILL.md intake stop rule must say 'do not over-interview'")
+        if "walk me through how you'll actually operate this" not in skill_lower:
+            _fail("SKILL.md must carry the MANDATORY operate-it question for user-facing goals")
+        if "input method" not in skill_lower or "file selection" not in skill_lower:
+            _fail("the operate-it question must ask about input method and file selection")
+        # F3/F5 intake semantics preserved in SKILL.md.
+        if "absence of a request" not in skill_lower:
+            _fail("SKILL.md must preserve the F3 no-placeholder-BLOCKED intake semantic")
+        if "which fork" not in skill_lower or "which cut" not in skill_lower:
+            _fail("SKILL.md must preserve the two forks (build-vs-operations, discipline-vs-feature)")
+
+        # loop-state.md intake section carries the grilling rules + operate-it Q.
+        if "one question at a time" not in loop_state_lower:
+            _fail("loop-state.md intake section must ask ONE question at a time")
+        if "recommended answer" not in loop_state_lower:
+            _fail("loop-state.md intake section must attach a recommended answer")
+        if "stop rule" not in loop_state_lower:
+            _fail("loop-state.md intake section must carry the stop rule")
+        if "walk me through how you'll actually operate this" not in loop_state_lower:
+            _fail("loop-state.md intake section must carry the mandatory operate-it question")
+        if "placeholder blocked" not in loop_state_lower and "no goal yet" not in loop_state_lower:
+            _fail("loop-state.md intake section must preserve the F3 no-placeholder-BLOCKED semantic")
+
+        # ---- G12: handoff redaction wording ---------------------------------
+        # SKILL.md and protocol.md must both instruct: reference sensitive
+        # material, never quote it into a handoff/auto-chain seed; and name the
+        # doctor's handoff_sensitive_content warning.
+        if "reference sensitive material" not in skill_lower:
+            _fail("SKILL.md must instruct: reference sensitive material, never quote it into a handoff")
+        if "handoff_sensitive_content" not in skill_md:
+            _fail("SKILL.md must name the handoff_sensitive_content doctor warning")
+        if "reference sensitive material" not in protocol_md.lower():
+            _fail("protocol.md must instruct: reference sensitive material, never quote it")
+        if "handoff_sensitive_content" not in protocol_md:
+            _fail("protocol.md must name the handoff_sensitive_content doctor warning")
+
+        # ---- G13: BLOCKED envelopes carry recommended_answer ----------------
+        # The BLOCKED template must carry a recommended_answer field, and the
+        # prose must generalize F16's install command into "the lane proposes
+        # the resolution; the human edits a proposal, not a blank page".
+        if "recommended_answer:" not in protocol_md:
+            _fail("protocol.md BLOCKED envelope must carry a recommended_answer field")
+        if "recommended_answer" not in protocol_md.lower():
+            _fail("protocol.md must document the recommended_answer field")
+        if "edits a proposal" not in protocol_md.lower():
+            _fail("protocol.md must state the human edits a proposal instead of authoring cold")
+
+        # ---- G14 (d/e): tier policy wording in SKILL.md ---------------------
+        # (a) SKILL.md instructs recording the OBSERVED model at creation/adoption
+        # into current.md's model_observed line (as data, with the abstract tag).
+        if "model_observed" not in skill_md:
+            _fail("SKILL.md must instruct recording the observed model in current.md model_observed")
+        if "observed data" not in skill_lower:
+            _fail("SKILL.md must frame model_observed as observed DATA, not policy")
+        # (d) SKILL.md resolves the create_thread "no model unless asked" conflict:
+        # the recorded tier policy IS the user's explicit request; pass model+thinking.
+        if "recorded tier policy is the user's explicit request" not in skill_lower:
+            _fail("SKILL.md (G14d) must state the recorded tier policy IS the user's explicit request")
+        if "create_thread" not in skill_md:
+            _fail("SKILL.md (G14d) must reference create_thread's 'no model unless asked' guidance")
+        # (e) The human may set ANY lane's tier up OR down; never silently deviates.
+        if "up or down" not in skill_lower:
+            _fail("SKILL.md (G14e) must state the human may set any lane's tier up OR down")
+        if "never silently deviate" not in skill_lower and "never silently deviates" not in skill_lower:
+            _fail("SKILL.md (G14e) must state the skill never silently deviates from the recorded tier")
+
+        # (G14 boundary) No concrete model-name literal may appear anywhere in
+        # SKILL.md or protocol.md: policy docs may only speak in the abstract
+        # tier words; a concrete model id belongs solely in runtime observed
+        # data (e.g. a lane's current.md model_observed line), never in doc
+        # prose or examples. Scan both doc files for the two known concrete
+        # patterns (a case-insensitive regex, so this is not just a substring
+        # check).
+        _CONCRETE_MODEL_RE = re.compile(r"gpt-[0-9]|codex-spark", re.IGNORECASE)
+        for doc_name, doc_text in (("SKILL.md", skill_md), ("protocol.md", protocol_md)):
+            hit = _CONCRETE_MODEL_RE.search(doc_text)
+            if hit:
+                _fail(
+                    "G14 boundary violation: {0} contains a concrete model-name "
+                    "literal {1!r}; policy docs may only use abstract tier words "
+                    "(a concrete model id is runtime observed data, never doc "
+                    "policy text)".format(doc_name, hit.group(0))
+                )
+
+        # ---- G15: default design-skill references for UI work ---------------
+        # Both skill NAMES + the han-design URL; the style-vs-UX division with the
+        # conflict rule; human-override-wins recorded on the request envelope; and
+        # absent-degradation (note + proceed, never a blocker). REVISED spec:
+        # han-design-skill-v1 = VISUAL STYLE, ui-ux-pro-max = UX MECHANICS.
+        if "han-design-skill-v1" not in skill_md:
+            _fail("SKILL.md (G15) must name han-design-skill-v1")
+        if "ui-ux-pro-max" not in skill_md:
+            _fail("SKILL.md (G15) must name ui-ux-pro-max")
+        if "github.com/hanco1/han-design-skill-v1" not in skill_md:
+            _fail("SKILL.md (G15) must reference the han-design-skill-v1 source URL")
+        # The division of labor: han-design = visual style, ui-ux-pro-max = UX.
+        if "visual style" not in skill_lower:
+            _fail("SKILL.md (G15) must assign the VISUAL STYLE to han-design-skill-v1")
+        if "ux mechanics" not in skill_lower:
+            _fail("SKILL.md (G15) must assign the UX MECHANICS to ui-ux-pro-max")
+        # The conflict rule: visual -> han-design; usability/accessibility -> ui-ux.
+        skill_collapsed = " ".join(skill_lower.split())
+        if "conflict rule" not in skill_lower:
+            _fail("SKILL.md (G15) must state a conflict rule for the two design skills")
+        if "accessibility" not in skill_lower:
+            _fail("SKILL.md (G15) conflict rule must route accessibility calls to ui-ux-pro-max")
+        # Human override wins, recorded on the request envelope design_system line.
+        if "explicit choice always overrides" not in skill_collapsed:
+            _fail("SKILL.md (G15) must state the human's explicit choice always overrides")
+        if "design_system:" not in skill_md:
+            _fail("SKILL.md (G15) must record the choice on the design_system envelope line")
+        # Absent-degradation: note in worklog, proceed, never a blocker.
+        if "never a hard dependency" not in skill_lower and "never a blocker" not in skill_lower:
+            _fail("SKILL.md (G15) must state a missing design skill is never a blocker")
+        if "by name" not in skill_lower and "by its name" not in skill_lower:
+            _fail("SKILL.md (G15) must look skills up BY NAME (not by absolute path)")
+
+        # protocol.md Common Envelope carries the design_system line + the same
+        # division/override/lookup semantics.
+        if "design_system:" not in protocol_md:
+            _fail("protocol.md Common Envelope must carry a design_system line")
+        if "han-design-skill-v1" not in protocol_md or "ui-ux-pro-max" not in protocol_md:
+            _fail("protocol.md design_system note must name both design skills")
+
+        # NO absolute local path may be introduced by the G15 design wording. The
+        # ~/.codex/skills/<name> home-relative convention and the github URL are
+        # allowed; an absolute Windows/Unix path is a batch failure. Scan every
+        # line that mentions the design skills for absolute-path markers (a drive
+        # letter like C:\ or C:/, a /Users/ or /home/<user> prefix, or a UNC \\).
+        def _has_absolute_path(text: str) -> bool:
+            low = text.lower()
+            if "/users/" in low or "/home/" in low or "\\\\" in text:
+                return True
+            # A Windows drive-letter path: a SINGLE letter, a colon, then \ or /,
+            # NOT preceded by an alnum (so a URL scheme like ``https://`` -- many
+            # letters before the colon -- is excluded) and NOT a ``://`` scheme.
+            for i in range(len(text) - 2):
+                if not (text[i].isalpha() and text[i + 1] == ":" and text[i + 2] in "\\/"):
+                    continue
+                if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "/"):
+                    continue  # part of a longer token (e.g. a URL scheme)
+                if text[i + 2] == "/" and i + 3 < len(text) and text[i + 3] == "/":
+                    continue  # ``x://`` scheme, not a drive path
+                return True
+            return False
+
+        for doc_name, doc_text in (("SKILL.md", skill_md), ("protocol.md", protocol_md)):
+            for ln in doc_text.splitlines():
+                low = ln.lower()
+                if ("han-design" in low or "ui-ux-pro-max" in low
+                        or "design_system" in low or "skills/<name>" in low):
+                    if _has_absolute_path(ln):
+                        _fail("G15: an absolute local path appears in the design wording of "
+                              "{0}: {1!r}".format(doc_name, ln.strip()))
+
+        # ---- G3: doctor stalled_handoff exclusion (synthetic loop) ----------
+        _check_g3_doctor(tmp_path)
+
+        # ---- G7: doctor lineage/hygiene WARNING checks ----------------------
+        _check_g7_doctor(tmp_path)
+
+        # ---- G11: no pre-minted message dirs + shuffled-log invariance ------
+        _check_g11(tmp_path)
+
+        # ---- G12: handoff/auto-chain seed sensitive-content scan ------------
+        _check_g12(tmp_path)
+
+        # ---- G14: tier observability (model_observed + tier_mismatch) -------
+        _check_g14(tmp_path)
 
     print("SMOKE_OK")
     return 0

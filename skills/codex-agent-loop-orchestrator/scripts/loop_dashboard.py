@@ -332,6 +332,61 @@ def _tail(text: str, n: int) -> list[str]:
     return lines[-n:] if n > 0 else lines
 
 
+def _run_log_tail_sorted(text: str, n: int) -> list[str]:
+    """Return the run log's non-blank lines with DATA rows timestamp-ordered.
+
+    G11(b): the run log is append-only, so a late-append recovery row can be out
+    of chronological order. This keeps every NON-table line (the ``#`` heading,
+    the header row, the ``---`` separator, prose) in its original position, and
+    STABLY sorts only the pipe-delimited DATA rows by the first column that
+    parses as a timestamp -- then returns the last ``n`` lines. Rows with a
+    blank/unparseable timestamp keep their original relative order (they sort to
+    the epoch). Falls back to the plain tail if no header/timestamp is found, so
+    a non-standard log is never mangled.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if n <= 0:
+        pass  # keep all, still sort below
+
+    # Identify the table header to find the timestamp column index.
+    header_cols: Optional[list[str]] = None
+    ts_idx: Optional[int] = None
+    data_positions: list[int] = []
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = _split_md_row(line)
+        if all(set(c) <= {"-", ":", " "} for c in cells):
+            continue  # separator row
+        if header_cols is None:
+            header_cols = [c.strip().lower() for c in cells]
+            for name in ("timestamp", "at", "delivered_at", "time"):
+                if name in header_cols:
+                    ts_idx = header_cols.index(name)
+                    break
+            continue
+        data_positions.append(i)
+
+    if ts_idx is None or not data_positions:
+        # No recognizable timestamp column: preserve the existing behavior.
+        return lines[-n:] if n > 0 else lines
+
+    def _row_key(pos: int) -> tuple[Any, int]:
+        cells = _split_md_row(lines[pos])
+        raw = cells[ts_idx] if ts_idx < len(cells) else ""
+        parsed = _parse_timestamp(raw)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return (parsed or epoch, pos)
+
+    sorted_positions = sorted(data_positions, key=_row_key)
+    # Rebuild the line list: non-data lines stay put; data slots are refilled in
+    # timestamp order (stable). This keeps header/separator/prose intact.
+    reordered = list(lines)
+    for slot, src in zip(data_positions, sorted_positions):
+        reordered[slot] = lines[src]
+    return reordered[-n:] if n > 0 else reordered
+
+
 def _lane_status_label(row: dict[str, str]) -> str:
     """Normalize a registry row's status into one of a few display buckets."""
     thread_id = (row.get("thread_id", "") or "").strip().upper()
@@ -369,7 +424,25 @@ _CURRENT_HEADER_KEYS = {
     "iteration": "iteration",
     "last_updated": "last_updated",
     "heartbeat": "heartbeat",
+    # G14(a): the lane's OBSERVED model+effort (data, e.g. "gpt-5.5 xhigh
+    # (highest)"). Parsed so the lane card can show recommended vs observed.
+    "model_observed": "model_observed",
 }
+
+# G14(c): pull the abstract tier TAG (highest / second-highest) out of a
+# model_observed value like "gpt-5.5 xhigh (highest)" -- the trailing
+# parenthetical. Mirrors the doctor's ``observed_tier_tag`` extraction.
+_OBSERVED_TIER_RE = re.compile(r"\(([^)]+)\)\s*$")
+
+
+def _observed_tier_from_value(value: str) -> str:
+    """Return the abstract tier tag from a model_observed value, or ''."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    m = _OBSERVED_TIER_RE.search(value)
+    tag = (m.group(1) if m else value).strip().lower()
+    return tag if tag in ("highest", "second-highest") else ""
 # Known "## <heading>" sections of current.md, mapped to the output list key.
 # Matching is case-insensitive and tolerant of extra words in the heading.
 _CURRENT_SECTION_KEYS = {
@@ -762,6 +835,13 @@ def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
         # each (your-turn banner, needs-you sorting, honest heartbeat labels).
         "heartbeat_gap_owners": result.get("heartbeat_gap_owners", []),
         "stalled_handoffs": result.get("stalled_handoffs", []),
+        # G3/G10: request_ids held awaiting a human try-it. The dashboard renders
+        # a held slice's lane note as the BLUE "ready to try" confirm tone rather
+        # than an alarming red halt.
+        "held_for_human_qa": result.get("held_for_human_qa", []),
+        # G13: request_id -> the raising lane's recommended_answer for BLOCKED
+        # requests; the your-turn halt item renders it inline.
+        "recommended_answers": result.get("recommended_answers", {}),
         "workerless_dependencies": result.get("workerless_dependencies", []),
         "missing_dependency_blockers": result.get("missing_dependency_blockers", []),
         "git_present": result.get("git_present"),
@@ -971,6 +1051,17 @@ def build_state(
                 "goal": (req_row.get("next_action", "") or "").strip(),
                 "iteration": (req_row.get("iteration", "") or req_row.get("iter", "") or "").strip(),
             }
+        # G14(a/c): the lane's OBSERVED model+effort and its abstract tier tag,
+        # from current.md's model_observed line. observed_model is the DATA value
+        # rendered verbatim on the chip; observed_tier is the tag compared to the
+        # recommended tier; tier_mismatch is amber when both are present and
+        # differ (never a mismatch when observed is not yet stamped).
+        observed_model = (summary.get("model_observed", "") or "").strip()
+        observed_tier = _observed_tier_from_value(observed_model)
+        recommended_tier = (row.get("tier", "") or "").strip().lower()
+        tier_mismatch = bool(
+            recommended_tier and observed_tier and recommended_tier != observed_tier
+        )
         lanes.append(
             {
                 "lane": lane,
@@ -979,6 +1070,10 @@ def build_state(
                 "write_scope": (row.get("write_scope", "") or "").strip(),
                 # F8 advisory model tier (abstract word from agent-lanes.md).
                 "recommended_tier": (row.get("tier", "") or "").strip(),
+                # G14: observed model DATA + its abstract tier tag + mismatch.
+                "observed_model": observed_model,
+                "observed_tier": observed_tier,
+                "tier_mismatch": tier_mismatch,
                 "status": _lane_status_label(row),
                 "status_raw": (row.get("status", "") or "").strip(),
                 "heartbeat": _heartbeat_freshness(
@@ -996,8 +1091,12 @@ def build_state(
     # Evidence records.
     evidence = _load_evidence_records(evidence_dir)
 
-    # Run-log tail.
-    run_log_tail = _tail(_read_text(run_log_path), RUNLOG_TAIL)
+    # Run-log tail. G11(b): the run log is append-only, so a late-append honest
+    # recovery row can sit out of chronological order. The displayed tail sorts
+    # DATA rows by their timestamp cell (header/separator preserved) so the tail
+    # shows the chronologically-latest transitions, matching the timestamp-sorted
+    # reconstruction the in-process doctor now uses.
+    run_log_tail = _run_log_tail_sorted(_read_text(run_log_path), RUNLOG_TAIL)
 
     # Doctor snapshot (in-process).
     doctor_snapshot = _doctor_snapshot(loop_dir)

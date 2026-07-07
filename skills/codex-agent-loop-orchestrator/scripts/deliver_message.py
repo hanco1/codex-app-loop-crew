@@ -175,6 +175,37 @@ def atomic_write(target: Path, body: str) -> None:
     fsync_dir(target.parent)
 
 
+def archive_message(loop_dir: Path, request_id: str, message_type: str,
+                    iteration: str, body: str) -> Optional[str]:
+    """Archive a message into the durable ``messages/<request_id>/`` store.
+
+    G11(a): the request-scoped message directory is created ONLY at the moment a
+    real message file is written into it -- never pre-created before the
+    ``request_id`` is final. Run 2 left two empty ``messages/<request_id>/``
+    stray dirs behind because a request was re-keyed after its directory had
+    already been minted; routing every archive through this helper (which
+    ``mkdir``s the dir in the same call that writes the file) makes an empty
+    stray dir impossible to produce through the tooling.
+
+    Returns the posix path of the archived file, or ``None`` when there is no
+    ``request_id`` to key it under (no request-scoped store applies then, so no
+    directory is created). Never raises for a missing dir; it creates what it
+    needs, but only alongside a real write.
+    """
+    request_id = (request_id or "").strip()
+    if not request_id:
+        # No final id -> no request-scoped store, and crucially no empty dir.
+        return None
+    mtype = slugify(message_type, default="MESSAGE") if message_type else "MESSAGE"
+    itr = slugify(iteration, default="1") if iteration else "1"
+    msg_dir = loop_dir / "messages" / request_id
+    # mkdir + write happen together: the directory never exists without a file.
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    target = msg_dir / "{mtype}-iter-{itr}.md".format(mtype=mtype, itr=itr)
+    _rewrite_atomic(target, body)
+    return posix_path(str(target))
+
+
 def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
     """Refresh ``lane``'s heartbeat when it sends a message (F7).
 
@@ -387,6 +418,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Do not stamp the --from-lane heartbeat on delivery (default: stamp it).",
     )
+    parser.add_argument(
+        "--also-archive",
+        action="store_true",
+        help=(
+            "Also archive a copy into the durable messages/<request_id>/ store "
+            "(the dir is created only when the message is written; requires "
+            "--request-id). G11: never pre-creates an empty request dir."
+        ),
+    )
     args = parser.parse_args(argv)
 
     lane = args.to_lane.strip()
@@ -444,6 +484,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("delivered {0}".format(posix_path(str(target))))
     print("indexed {0}".format(posix_path(str(inbox_dir / "index.md"))))
     print("reader should process inbox/new then move to inbox/cur")
+
+    # G11(a): optionally archive a durable copy into messages/<request_id>/.
+    # The dir is minted only here, alongside the write, so a re-keyed request
+    # can never leave an empty stray dir behind.
+    if args.also_archive:
+        archived = archive_message(
+            loop_dir, args.request_id, args.message_type, args.iteration, body
+        )
+        if archived:
+            print("archived {0}".format(archived))
 
     # F7: delivering a message is proof the sender lane is alive, so stamp its
     # heartbeat (agent-lanes.md heartbeat column + lanes/<lane>/current.md

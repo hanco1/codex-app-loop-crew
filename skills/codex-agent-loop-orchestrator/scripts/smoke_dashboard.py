@@ -756,6 +756,31 @@ def _check_batch2_markup(html_full: str) -> None:
     if "awaiting_objective" not in html_full:
         _fail("F3: script never reads state.awaiting_objective")
 
+    # G10 human-gate tones: the amber human-GATE and blue result-CONFIRM lane
+    # note classes must be styled, and the classifier must read the loop-level
+    # intake + held-for-human-qa context that drives them (the run-2 red-intake
+    # fix). RED stays reserved for a genuine request-level halt.
+    for cls in ("lane-note-gate", "lane-note-confirm"):
+        if "." + cls not in html_full:
+            _fail("G10: served HTML is missing the tone CSS class .{0}".format(cls))
+    if "held_for_human_qa" not in html_full:
+        _fail("G10: script never reads doctor.held_for_human_qa for the blue confirm tone")
+    if "laneNoteCtx" not in html_full:
+        _fail("G10: renderLanes must build and thread the laneNoteCtx tone context")
+    if "awaitingObjective" not in html_full:
+        _fail("G10: classifyLaneNote must read the intake (awaitingObjective) gate signal")
+
+    # G13: the your-turn halt item renders the lane's recommended_answer when
+    # present. The classifier must read the doctor's recommended_answers map, the
+    # renderer must emit the .yt-recommended span with the localized label, and
+    # the value is machine text (no i18n on the value).
+    if "recommended_answers" not in html_full:
+        _fail("G13: script never reads doctor.recommended_answers")
+    if "yt-recommended" not in html_full:
+        _fail("G13: the your-turn item must render a .yt-recommended span for the proposal")
+    if "yourturn_recommended_label" not in html_full:
+        _fail("G13: the recommended-answer LABEL must flow through the i18n dictionary")
+
     # F6: the your-turn banner, its three color classes, and the analyzer +
     # renderer wiring. Green/amber/blue must all be styled.
     for cls in ("yt-green", "yt-amber", "yt-blue"):
@@ -869,12 +894,17 @@ def _check_batch2_i18n(rows: list) -> None:
         "awaiting_objective_title", "awaiting_objective_body",
         "lane_note_halt_label", "lane_note_gated_label", "lane_note_waiting_label",
         "lane_note_infra_label", "lane_note_scope_label",
+        # G10 human-gate tones (amber gate + blue confirm) and their wait phrases.
+        "lane_note_gate_label", "lane_note_confirm_label", "lane_note_intake_wait",
+        "lane_note_confirm_wait", "lane_note_dep_wait",
         # F6 your-turn banner
         "yourturn_badge_running", "yourturn_badge_gate", "yourturn_badge_confirm",
         "yourturn_running_headline", "yourturn_gate_headline", "yourturn_confirm_headline",
         "yourturn_where_lane", "yourturn_item_halt", "yourturn_item_stalled",
         "yourturn_item_workerless", "yourturn_item_missing_dep", "yourturn_item_confirm",
         "yourturn_running_active",
+        # G13 recommended-answer label.
+        "yourturn_recommended_label",
         # F9 rank-1 + F14 goal
         "lane_needs_you_flag", "lane_goal_label",
         # F13 honest heartbeat
@@ -901,31 +931,265 @@ def _check_batch2_i18n(rows: list) -> None:
             _fail("Batch 2 i18n key {0!r} has an empty 'zh' value".format(k))
 
 
+def _check_g10_tones(base: str, tmp: Path) -> None:
+    """G10: human-gate states render amber/blue, never the run-2 red.
+
+    Two proofs, one static (the classifier's tone ORDER in source) and two
+    runtime (the state signals the client tones read):
+
+    STATIC -- in ``dashboard.html`` the ``classifyLaneNote`` function must decide
+    the amber intake GATE and the blue human-QA CONFIRM tones BEFORE it can ever
+    reach the red ``lane-note-halt`` branch, so an intake wait / a held result
+    can never fall through to red (the exact run-2 regression). We assert the
+    amber ``lane-note-gate`` and blue ``lane-note-confirm`` returns both precede
+    the red ``lane-note-halt`` return inside that function's body.
+
+    RUNTIME (a) -- a fresh loop still at intake (goal.md is the placeholder, no
+    real request) exposes ``awaiting_objective: true`` on /api/state; that is the
+    signal the client turns into the AMBER intake gate for the waiting lane
+    (instead of the old red "BLOCKED -- NEEDS YOU").
+
+    RUNTIME (b) -- a user-facing slice held at REVIEWING with a
+    ``human_qa_requested`` run-log row (and no confirmation) surfaces its
+    request_id in ``doctor.held_for_human_qa``; that is the signal the client
+    turns into the BLUE "ready to try" confirm tone.
+    """
+    # ---- STATIC: tone order inside classifyLaneNote --------------------------
+    dash_src = (Path(loop_dashboard.__file__).resolve().parent / "dashboard.html").read_text(
+        encoding="utf-8")
+    fn_start = dash_src.find("function classifyLaneNote(")
+    if fn_start < 0:
+        _fail("G10: classifyLaneNote not found in dashboard.html")
+    # Bound the scan to the function body (up to the next top-level function).
+    fn_end = dash_src.find("\n      function ", fn_start + 1)
+    body = dash_src[fn_start: fn_end if fn_end > 0 else len(dash_src)]
+    i_gate = body.find('"lane-note-gate"')
+    i_confirm = body.find('"lane-note-confirm"')
+    i_halt = body.find('"lane-note-halt"')
+    if i_gate < 0 or i_confirm < 0 or i_halt < 0:
+        _fail("G10: classifyLaneNote must return all three tones (gate/confirm/halt)")
+    if not (i_gate < i_halt):
+        _fail("G10: the amber intake GATE branch must precede the red halt branch "
+              "(an intake wait must never fall through to red)")
+    if not (i_confirm < i_halt):
+        _fail("G10: the blue human-QA CONFIRM branch must precede the red halt branch")
+
+    # ---- RUNTIME (a): awaiting-objective loop exposes the intake signal ------
+    intake_loop = tmp / "g10_intake_loop"
+    _bootstrap(intake_loop)
+    st_intake = loop_dashboard.build_state(intake_loop)
+    if st_intake.get("awaiting_objective") is not True:
+        _fail("G10: a fresh intake loop must expose awaiting_objective:true "
+              "(the amber intake-gate signal)")
+
+    # ---- RUNTIME (b): a held user-facing slice exposes held_for_human_qa -----
+    held_loop = tmp / "g10_held_loop"
+    _bootstrap(held_loop)
+    held_req = "REQ-20260707-101010-frontend"
+    (held_loop / "requests.md").write_text(
+        "# Requests\n\n## Queue\n\n"
+        "| request_id | status | owner_lane | iteration | source_docs "
+        "| last_message | next_action | updated_at |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "| {rid} | REVIEWING | frontend | 1 | goal.md | reviewed "
+        "| awaiting human sign-off | 2026-07-07T10:10:00Z |\n".format(rid=held_req),
+        encoding="utf-8",
+    )
+    # A human_qa_requested run-log row with NO matching confirmation -> held.
+    (held_loop / "loop-run-log.md").write_text(
+        "# Loop Run Log\n\n"
+        "| at | request_id | from_status | to_status | note |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 2026-07-07T10:10:00Z | {rid} | IMPLEMENTATION_DONE | REVIEWING "
+        "| human_qa_requested: try the UI at http://127.0.0.1:8011 |\n".format(rid=held_req),
+        encoding="utf-8",
+    )
+    st_held = loop_dashboard.build_state(held_loop)
+    held = (st_held.get("doctor") or {}).get("held_for_human_qa") or []
+    if held_req not in held:
+        _fail("G10: a held user-facing slice must appear in doctor.held_for_human_qa "
+              "(the blue confirm-tone signal); got {0!r}".format(held))
+
+
+def _check_g11_dashboard(tmp: Path) -> None:
+    """G11(b): the dashboard state builder timestamp-sorts the run-log tail.
+
+    Writes an append-only run log whose rows are OUT of chronological order (a
+    late-append recovery row, which run 2 legally produced) and asserts
+    ``build_state``'s ``run_log_tail`` lists the data rows in chronological
+    order -- matching the timestamp-sorted reconstruction the in-process doctor
+    uses, so the dashboard never shows a stale ordering.
+    """
+    loop = tmp / "g11_dash_loop"
+    _bootstrap(loop)
+    runlog = loop / "loop-run-log.md"
+    header = (
+        "# Loop Run Log\n\n"
+        "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+    )
+    rid = "REQ-20260707-073729-data-eng"
+    # Deliberately out of order: 08:00 appended, then a 07:37 recovery row after.
+    shuffled = [
+        ("2026-07-07T08:00:00Z", rid, "2", "IMPLEMENTING", "REVIEWING", "review", "late"),
+        ("2026-07-07T07:37:29Z", rid, "1", "REQUESTED", "IMPLEMENTING", "data-eng", "recovery"),
+        ("2026-07-07T07:50:00Z", rid, "1", "IMPLEMENTING", "REVIEWING", "review", "mid"),
+    ]
+    runlog.write_text(
+        header + "".join("| " + " | ".join(r) + " |\n" for r in shuffled),
+        encoding="utf-8",
+    )
+    state = loop_dashboard.build_state(loop)
+    tail = state.get("run_log_tail") or []
+    ts_seen = []
+    for line in tail:
+        if line.strip().startswith("|") and "20260707" in line:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if cells:
+                ts_seen.append(cells[0])
+    if len(ts_seen) != 3:
+        _fail("G11: dashboard run_log_tail should carry the 3 data rows; got {0!r}".format(ts_seen))
+    if ts_seen != sorted(ts_seen):
+        _fail("G11: dashboard run_log_tail must be timestamp-ordered on a shuffled "
+              "log; got {0!r}".format(ts_seen))
+
+
+def _check_g14_dashboard(tmp: Path) -> None:
+    """G14(c): the dashboard state carries recommended + observed tier per lane.
+
+    Bootstraps with adoption-time observed-model stamping so implementation
+    MATCHES its recommended tier and product MISMATCHES, then asserts the
+    ``build_state`` lane objects carry ``observed_model`` (the DATA value),
+    ``observed_tier`` (the abstract tag), and ``tier_mismatch`` (True only for
+    product). The chip renders these; the amber styling keys off tier_mismatch.
+    A lane with no observed model reports tier_mismatch False (not-yet-observed).
+    """
+    loop = tmp / "g14_dash_loop"
+    _bootstrap(loop, extra_argv=[
+        "--observed-model", "implementation=gpt-5.5 xhigh (highest)",
+        "--observed-model", "product=gpt-5.5 xhigh (highest)",
+    ])
+    state = loop_dashboard.build_state(loop)
+    by_lane = {l.get("lane"): l for l in state.get("lanes", [])}
+    impl = by_lane.get("implementation") or {}
+    prod = by_lane.get("product") or {}
+    rev = by_lane.get("review") or {}
+    if impl.get("observed_model") != "gpt-5.5 xhigh (highest)":
+        _fail("G14: implementation lane must carry observed_model verbatim; got {0!r}".format(
+            impl.get("observed_model")))
+    if impl.get("observed_tier") != "highest":
+        _fail("G14: implementation observed_tier should be 'highest'")
+    if impl.get("tier_mismatch") is not False:
+        _fail("G14: implementation (observed matches recommended) must not be a tier_mismatch")
+    if prod.get("tier_mismatch") is not True:
+        _fail("G14: product (observed highest vs recommended second-highest) must be tier_mismatch True")
+    if prod.get("observed_tier") != "highest":
+        _fail("G14: product observed_tier should be 'highest'")
+    # A not-yet-observed lane: no observed model, no mismatch.
+    if rev.get("observed_model"):
+        _fail("G14: review lane should have no observed_model (not stamped)")
+    if rev.get("tier_mismatch") is not False:
+        _fail("G14: a not-yet-observed lane must report tier_mismatch False")
+
+
+def _check_g13_recommended(tmp: Path) -> None:
+    """G13: BLOCKED requests surface the raising lane's recommended_answer.
+
+    A BLOCKED request whose archived BLOCKED envelope carries a
+    ``recommended_answer`` exposes it (verbatim machine text) in the dashboard
+    state's ``doctor.recommended_answers`` map keyed by request_id -- the your-
+    turn halt item renders it. A BLOCKED request with NO recommended_answer is
+    simply absent from the map (no empty/garbage entry).
+    """
+    loop = tmp / "g13_loop"
+    _bootstrap(loop)
+    rid = "REQ-20260707-140000-implementation"
+    mdir = loop / "messages" / rid
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / "BLOCKED-iter-1.md").write_text(
+        "# BLOCKED\n\nmessage_type: BLOCKED\nrequest_id: {rid}\nstatus: BLOCKED\n"
+        "blocker:\n- Missing the production catalog key.\n"
+        "recommended_answer:\n- Use the bundled local mock catalog for the MVP.\n"
+        "expected_reply:\n- Product updates scope.\n".format(rid=rid),
+        encoding="utf-8",
+    )
+    # A second BLOCKED request with NO recommended_answer.
+    rid2 = "REQ-20260707-150000-frontend"
+    mdir2 = loop / "messages" / rid2
+    mdir2.mkdir(parents=True, exist_ok=True)
+    (mdir2 / "BLOCKED-iter-1.md").write_text(
+        "# BLOCKED\n\nstatus: BLOCKED\nblocker:\n- Waiting on a design call.\n",
+        encoding="utf-8",
+    )
+    (loop / "requests.md").write_text(
+        "# Requests\n\n## Queue\n\n"
+        "| request_id | status | owner_lane | iteration | source_docs "
+        "| last_message | next_action | updated_at |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "| {r1} | BLOCKED | implementation | 1 | goal.md | blocked "
+        "| decide the catalog source | 2026-07-07T14:00:00Z |\n"
+        "| {r2} | BLOCKED | frontend | 1 | goal.md | blocked "
+        "| decide the layout | 2026-07-07T15:00:00Z |\n".format(r1=rid, r2=rid2),
+        encoding="utf-8",
+    )
+    state = loop_dashboard.build_state(loop)
+    ra = (state.get("doctor") or {}).get("recommended_answers") or {}
+    if ra.get(rid) != "Use the bundled local mock catalog for the MVP.":
+        _fail("G13: dashboard state must expose the BLOCKED request's recommended_answer "
+              "verbatim; got {0!r}".format(ra.get(rid)))
+    if rid2 in ra:
+        _fail("G13: a BLOCKED request with no recommended_answer must not appear in the map")
+
+
 def _check_f8_tier_markup(html_full: str, rows: list) -> None:
-    """Assert the F8 recommended-tier lane chip markup, wiring, and i18n.
+    """Assert the F8/G14 tier lane chip markup, wiring, and i18n.
 
     Covers, on the SERVED HTML (before any JS runs):
       * fillLaneCard reads lane.recommended_tier and renders a neutral chip;
-      * the three F8 i18n keys exist with non-empty en AND zh;
-      * NO concrete model name (gpt-*) appears ANYWHERE in the served page --
-        tiers stay abstract in the UI too.
+      * G14(c): fillLaneCard also reads lane.observed_model / lane.tier_mismatch
+        and renders the observed chip (amber on mismatch); the two G14 i18n keys
+        exist with non-empty en AND zh;
+      * the F8 i18n keys exist with non-empty en AND zh;
+      * NO concrete model NAME LITERAL (gpt-*) is hardcoded anywhere in the
+        served page. G14 note: the observed model+effort is DATA rendered at
+        runtime from ``lane.observed_model`` (a variable, never a source
+        literal), so this ban is on hardcoded policy/UI strings only -- the
+        served static HTML legitimately carries the VARIABLE reference but no
+        model literal. The ban is enforced on BOTH the whole served page and,
+        specifically, every i18n dictionary value (the user-visible strings).
     """
     if "lane.recommended_tier" not in html_full:
         _fail("F8: fillLaneCard never reads lane.recommended_tier")
     if "lane_meta_tier_label" not in html_full:
         _fail("F8: served HTML is missing the lane_meta_tier_label chip binding")
+    # G14(c): the observed-tier chip must be wired from the runtime DATA fields.
+    if "lane.observed_model" not in html_full:
+        _fail("G14: fillLaneCard never reads lane.observed_model for the observed chip")
+    if "lane.tier_mismatch" not in html_full:
+        _fail("G14: fillLaneCard never reads lane.tier_mismatch for the amber styling")
     by_key = {row.get("key"): row for row in rows}
-    for k in ("lane_meta_tier_label", "lane_tier_highest", "lane_tier_second_highest"):
+    for k in ("lane_meta_tier_label", "lane_tier_highest", "lane_tier_second_highest",
+              "lane_meta_observed_label", "lane_tier_mismatch_note"):
         row = by_key.get(k)
         if row is None:
-            _fail("F8 i18n dictionary is missing required key {0!r}".format(k))
+            _fail("F8/G14 i18n dictionary is missing required key {0!r}".format(k))
         if not (row.get("en") or "").strip():
-            _fail("F8 i18n key {0!r} has an empty 'en' value".format(k))
+            _fail("F8/G14 i18n key {0!r} has an empty 'en' value".format(k))
         if not (row.get("zh") or "").strip():
-            _fail("F8 i18n key {0!r} has an empty 'zh' value".format(k))
-    # Grep-proof: no gpt-* model name anywhere in the served dashboard.
+            _fail("F8/G14 i18n key {0!r} has an empty 'zh' value".format(k))
+    # Grep-proof (surgical for G14): no gpt-* model NAME LITERAL may be hardcoded
+    # in the served dashboard -- not in any i18n VALUE (user-visible strings),
+    # and not anywhere else in the page. The observed model+effort is rendered
+    # from runtime data (lane.observed_model), so the ban targets literals, which
+    # this substring check catches (a variable name is not "gpt-").
+    for row in rows:
+        for field in ("en", "zh", "subtitle_en", "subtitle_zh"):
+            if "gpt-" in (row.get(field) or "").lower():
+                _fail("F8/G14: a concrete model name (gpt-*) is hardcoded in i18n "
+                      "value {0!r}/{1}".format(row.get("key"), field))
     if "gpt-" in html_full.lower():
-        _fail("F8: a concrete model name (gpt-*) leaked into the served HTML")
+        _fail("F8/G14: a concrete model name (gpt-*) literal leaked into the served "
+              "HTML (observed model must be rendered from runtime data, not a literal)")
 
 
 def _strip_comments_and_docstrings(source: str) -> str:
@@ -1680,6 +1944,29 @@ def main() -> int:
                       "non_terminal_requests"):
                 if f not in doc_snap:
                     _fail("doctor snapshot must pass through the Batch 1 field {0!r}".format(f))
+            # G10: the doctor snapshot must also pass through held_for_human_qa
+            # (the blue confirm tone reads it) as a list.
+            if "held_for_human_qa" not in doc_snap:
+                _fail("G10: doctor snapshot must pass through held_for_human_qa")
+            if not isinstance(doc_snap.get("held_for_human_qa"), list):
+                _fail("G10: doctor.held_for_human_qa should be a list")
+
+            # (G10) HUMAN-GATE TONES. Prove the two run-2-fix signals end to end.
+            _check_g10_tones(base, Path(tmp))
+
+            # (G11) The dashboard state builder sorts run-log rows by timestamp:
+            # a shuffled append-only log (late-append recovery rows) yields a
+            # chronologically-ordered run_log_tail.
+            _check_g11_dashboard(Path(tmp))
+
+            # (G13) BLOCKED envelopes carry recommended_answer; the dashboard
+            # surfaces it (present -> rendered; absent -> empty).
+            _check_g13_recommended(Path(tmp))
+
+            # (G14) Tier observability: the dashboard state carries observed_model
+            # / observed_tier / tier_mismatch per lane (chip renders them; amber
+            # on mismatch).
+            _check_g14_dashboard(Path(tmp))
 
             # (8) POLICY: default value, valid update, invalid rejections.
             status, body = _http_get(base + "/api/state")

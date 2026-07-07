@@ -77,13 +77,26 @@ CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no 
 
 A freshly bootstrapped `goal.md`/`tracker.md` contains only placeholder `Done When` lines. **Placeholders mean there is no objective yet - and "no objective yet" is the ABSENCE of a request, not a blocked request.** Do not mint a `PLANNED -> BLOCKED` "no goal yet" placeholder request; a first-contact loop that shows a red BLOCKED row before the human has spoken looks like failure. Instead, run a short intake conversation and create the first real request only after the human answers.
 
-Run the Task-Size Gate first (see Identity And Fit). If the work plausibly fits one session, say so and recommend a direct session rather than a loop. If a loop is warranted, ask the human, in plain language:
+Run the Task-Size Gate first (see Identity And Fit). If the work plausibly fits one session, say so and recommend a direct session rather than a loop.
+
+**Intake is an interview, not a questionnaire.** Grill the objective one step at a time:
+
+- **Ask ONE question at a time and wait for the answer** before the next. A bulk list of questions is bewildering and loses the dependency order between answers.
+- **Attach your own RECOMMENDED answer to every question**, so the human edits a proposal instead of authoring cold ("I'd recommend X because Y - does that hold, or do you want Z?").
+- **Look up any fact the repo or host can answer - never ask it.** The stack, the test runner, the existing UI surface, whether a tool is installed: read the files or `tool_search`; reserve questions for genuine decisions only the human can make.
+- **Stop rule:** when the objective is checkable (a concrete Done-When is in hand), STOP asking and write `goal.md`. Do not over-interview - a checkable objective is the signal to move, not to keep drilling.
+
+The questions to cover, one at a time (each with your recommended answer):
 
 1. **Objective and Done-When.** What is the single durable objective, and what concrete, checkable conditions mean it is done? Write the answers into `goal.md` (Objective + Done When) and mirror the conditions into `tracker.md` before creating any request.
 2. **Which fork - build the software, or be the operations team?** Building software (the default) means lanes ship code/tests/docs behind a machine-checkable gate. Being the operations team means the lanes *do the ongoing work* (ingest data, produce content). Only take the operations fork when every checkpoint has a machine-checkable acceptance; otherwise scope the gate to structure and add an explicit human-quality review step (see Identity And Fit). If the work recurs, offer to build a reusable tool instead of standing up a team.
 3. **Which cut - by discipline, or by feature?** The default is a **discipline cut**: lanes are development disciplines (product, backend-or-data-eng, frontend, research, security, review), each owning one kind of work across the whole product. A **feature cut** (a lane per product feature) fragments write scopes and re-derives the same discipline in every lane; take it only when features are genuinely independent deliverables with disjoint files. When in doubt, cut by discipline.
 
+**One MANDATORY question for user-facing goals.** If the deliverable is something a human operates (a UI, a dashboard, an interactive tool), you MUST ask: *"walk me through how you'll actually operate this - input method, file selection, what you look at first."* This is the question run 2 never asked: the loop shipped a path textbox while the user wanted a file picker, and nobody found out until after the pause. Answer it and the file-picker-vs-path-textbox gap dies at intake.
+
 Only after the human answers step 1 do you create the first request and append the first run-log row. The intake conversation itself is not a request.
+
+**Redacted-sample ritual (when the goal names human-provided real data).** If any Done-When condition depends on the human's real data (a real bank statement, export, or invoice), get the redacted-sample approval ONCE at intake: ask the human to approve a sanitized excerpt (a few rows with identifying detail scrubbed) or a field-shape spec (which column is the ISO date, which is merchant text, which is the signed amount, and a realistic row count). Later slices assert **field-level correctness** against that approved derivative - row count > 0, valid calendar dates, merchant non-empty and non-numeric, sign convention - and record only counts/booleans as evidence, never a raw row. "Parses without error" alone is never sufficient real-data evidence (run 2 parsed cleanly and still produced `merchant="9"` and 0 imported rows). See `references/protocol.md` "Real-input correctness".
 
 ### Proposing Lanes
 
@@ -231,7 +244,7 @@ Lane threads should not run on whatever light model the host defaults a new thre
 
 - **Coding lanes get the highest available tier.** A coding lane is one that *builds code* - implementation, backend, data-eng, frontend. These carry the hardest reasoning load, so they recommend the **highest** tier the calling host offers.
 - **Every other lane gets the second-highest available tier.** Product, review, security, research, docs, and the like recommend the **second-highest** tier.
-- **The human only ever opts DOWN.** A person may lower a lane's tier in the registry (see the advisory column below); the skill honors that and never silently raises a lane back up past this policy.
+- **The human may set ANY lane's tier - up OR down (G14e).** A person may raise or lower any lane's tier in the registry (see the advisory column below): lower a lane to save tokens, or *raise* one when its reasoning is the binding constraint (for example set product to the highest tier when acceptance-criteria quality is what gates the whole loop). The recorded tier column IS the policy for that lane; the skill honors it exactly and **never silently deviates** from the recorded tier - it neither downgrades to a host default nor raises past the recorded value on its own. Whatever tier the registry records is the tier the lane runs; a change is a human edit to that column, never a silent drift.
 
 **Resolve tiers at runtime - never hardcode a model name.** Tiers are expressed abstractly ("highest available", "second-highest available") because the concrete model list is host-specific. When you `tool_search` for `codex_app.create_thread`, read its own `model` parameter description: it embeds the calling host's live model list and each model's supported reasoning efforts, and the host validates the combination when the tool runs. Map "highest available" to the top model in that list and "second-highest available" to the next one down; pick a high reasoning effort (`thinking`) that the chosen model supports.
 
@@ -242,6 +255,10 @@ codex_app.create_thread(prompt=<lane kickoff>, target=..., model=<resolved highe
 ```
 
 `model` and `thinking` are optional; omitting them is the safe degradation path (the thread just starts at the host default), so never fail a dispatch because you could not resolve a tier - fall back to the advisory column and tell the human.
+
+**Resolving the create_thread guidance conflict (G14d).** `create_thread`'s own parameter description typically says *"do not specify a model unless the user explicitly requests one."* That does not conflict with this policy: **the loop's recorded tier policy IS the user's explicit request.** The human set up this loop and its tier column (and may edit any lane's tier up or down per G14e), so passing `model` + `thinking` for a lane is honoring an explicit user choice, not overriding a default. Pass them accordingly; do not withhold the tier out of deference to the generic "no model unless asked" default.
+
+**Record the OBSERVED model at creation/adoption (G14a).** As soon as a lane's thread is created or adopted, record what it is ACTUALLY running in that lane's `lanes/<lane>/current.md` `model_observed:` line, as observed DATA with the abstract tier tag in parentheses - for example `model_observed: <model-id> <effort> (<tier>)`. The concrete model id is data (it is fine here because this line is a recorded observation, not policy text); the `(highest)` / `(second-highest)` tag is what the doctor compares to the registry tier. This is what makes the recommended-vs-observed tier visible in the dashboard and lets the doctor flag a `tier_mismatch`, so a human who opens the thread and sees a different model can tell an intentional setting from a silent drift. When you adopt a hand-created thread with `--set-thread`, you can stamp it in the same call: `--observed-model '<lane>=<model-id> <effort> (<tier>)'`.
 
 **The advisory `tier` column records the recommendation on disk.** `bootstrap_agent_loop.py` writes a `tier` column in `agent-lanes.md` (abstract words `highest` / `second-highest`) and assigns it by the policy above when it registers a lane. It prints the tier hint alongside its `set_thread_title` hint on `--set-thread`, and `--set-thread` adoption preserves an existing tier (a human opt-down is never clobbered). The dashboard renders the recommended tier as a small neutral chip on each lane card, read from this column.
 
@@ -305,26 +322,87 @@ When the human opens the thread, they should pick the lane's recommended model t
 
 ## Lane Behavior
 
-When product creates an implementation request, it must define scope, non-goals, acceptance criteria, source docs, and expected reply.
+When product creates an implementation request, it must define scope, non-goals, acceptance criteria, source docs, and expected reply. Each acceptance criterion must name a **red-capable** verify command - one that can FAIL on that criterion's violation, not merely exit 0 when the code runs; a criterion with no command that can go red is a vibe, so sharpen it or drop it (see `references/protocol.md` "Red-capable acceptance criteria").
 
 When implementation receives a request, it reads the named source docs and loop files, implements only the requested scope, runs verification, updates its worklog/current state, and returns `IMPLEMENTATION_DONE`.
 
-When review receives a request, it evaluates against acceptance criteria, not implementation intent. It sends `REVIEW_DONE` on pass or `FIX_REQUEST` with exact failed criteria and evidence on fail.
+When review receives a request, it evaluates against acceptance criteria, not implementation intent, across three named categories: **unmet/partial criteria**; **scope creep** (changed files or behavior outside the request's declared `scope`/`non_goals` - flagged even if it works, using the `scope` globs as the mechanical yardstick); and **looks-done-but-wrong**. It also answers one standing **ease-of-misuse** question ("can a caller/input reach a wrong-but-accepted outcome the criteria did not forbid? name the path or state none found") and records the answer in `REVIEW_DONE`. Each `FIX_REQUEST` finding carries a `severity` (`blocker` | `should-fix` | `nit`): **only a blocker forces a fix cycle and increments `iteration`**; should-fix/nit findings may be accepted-with-notes or batched, so a review that finds only nits sends `REVIEW_DONE` (with the notes), not `FIX_REQUEST`. See `references/loop-state.md` "Review checklist", "Ease-of-misuse question", and "Finding severity".
 
-When a fix is requested, implementation reuses the original `request_id`, increments `iteration`, and sends another `IMPLEMENTATION_DONE`.
+When a **blocker** fix is requested, implementation reuses the original `request_id`, increments `iteration`, and sends another `IMPLEMENTATION_DONE`. (Only blockers force a fix cycle; should-fix/nit findings are accepted-with-notes or batched and do not increment `iteration` - see the review-lane wording above.)
 
 ### In-Turn Report-Back Ritual (hard gate, not advice)
 
-Codex threads run one turn and stop, so a handoff MUST complete inside the same turn as the work. Finishing the code, or even getting `SHIP_CHECK_OK`, is not the end of your turn - if your turn ends there, the requester waits forever and a human has to hand-carry the baton.
+**Close the turn** every time you finish a slice. The full ritual is defined
+once in `references/protocol.md` ("Close the turn"); it is a hard gate, not
+advice. Finishing the code - even reaching `SHIP_CHECK_OK` - is not the end of
+your turn: if your turn ends there, the requester waits forever and a human has
+to hand-carry the baton. Read the single source for the exact step list; the
+doctor flags a request whose work is done but that never advanced as
+`stalled_handoff`, naming the lane to nudge.
 
-**Your turn is NOT finished until you have, in this same turn:**
+### Human Direct-Ask Ritual (hard gate)
 
-1. **Sent the reply message** to the next lane - `send_message_to_thread` (or the `codex_app.*` equivalent), or the durable file-inbox fallback (`deliver_message.py`) when no thread tool is available.
-2. **Updated `requests.md`** - move the request to its next status and owner (do not leave it parked in `IMPLEMENTING`/`REVIEWING` after the work is done).
-3. **Appended the `loop-run-log.md` row** for that transition, in the same step that updated `requests.md`.
-4. **Refreshed your heartbeat** - the `heartbeat` column in `agent-lanes.md` and the `last_updated`/`heartbeat` mirror in your lane `current.md`. (`deliver_message.py --from-lane <you>` does this for you.)
+Cardinal rule: **no code ships without a request_id and independent review.**
 
-All four are mandatory every time you close a slice. Do not stop after step 1's work is done and leave the reply, the ledger, the log, or the heartbeat for "next turn" - there is no guaranteed next turn. The doctor flags a request whose work is done but that never advanced as `stalled_handoff`, naming the lane to nudge.
+When a human asks a lane directly to do work ("just restyle the header", "add a
+pie chart"), the lane's job is to **record the preference and route it into the
+normal lifecycle**:
+
+1. Capture the ask as a preference in the lane's `current.md`/`worklog.md` so it
+   is durable.
+2. Route it: ask **product** to mint an `IMPLEMENTATION_REQUEST` for it, or
+   self-mint a request row and cc product. Offer the human the exit in one
+   sentence: *"ask product to create the request; it takes one message."*
+3. The change then ships the way every change ships - a request row in
+   `requests.md`, recorded evidence, and an independent review pass before
+   `ACCEPTED`. A direct ask is a shortcut to the request, never a shortcut past
+   review.
+
+Routing the ask is the whole job here; it is fast (one message to product) and
+it keeps the lineage and the independent review that catch the defects a solo
+lane misses.
+
+**Product dispatches; it does not implement.** Even a one-line chart ask becomes
+an `IMPLEMENTATION_REQUEST` to the owning lane (frontend owns the UI shell, the
+build lane owns the core). Product writing the code itself puts a change outside
+its write scope with no request and no review - the exact bypass this gate
+exists to close.
+
+### Design Skills For UI Work (G15)
+
+When a lane does UI work - the frontend lane, or any request marked
+`user_facing: true` - it applies **both** installed design skills by default,
+with a clear division of labor:
+
+- **`han-design-skill-v1` owns the VISUAL STYLE.** Source:
+  `https://github.com/hanco1/han-design-skill-v1`. The Han house aesthetic is the
+  DEFAULT look - typography, color, layout mood, visual identity. Reach for it for
+  anything about how the UI *looks*.
+- **`ui-ux-pro-max` owns the UX MECHANICS.** Interaction patterns, accessibility,
+  responsive behavior, component usability, and chart/table ergonomics. Reach for
+  it for anything about how the UI *works* and how usable/accessible it is.
+
+**Conflict rule.** When the two disagree, the axis decides: a **visual** call
+(what it looks like) goes to `han-design-skill-v1`; a **usability or
+accessibility** call (how it works, whether everyone can use it) goes to
+`ui-ux-pro-max`. This split is stable, so a lane rarely has to arbitrate.
+
+**The human's explicit choice ALWAYS overrides and is recorded.** If the human
+names a different design system (or turns one off), that wins over this default.
+Record the choice on the request itself: the `IMPLEMENTATION_REQUEST` envelope
+carries a `design_system:` line (see `references/protocol.md` "Common Envelope")
+naming the design skill(s) in force for that request - the durable, per-request
+record. (This request-envelope line is the chosen mechanism over a separate
+decision entry: it travels with the request the UI lane actually reads, so the
+lane cannot miss it.)
+
+**Lookup by NAME, never by path; absence is never a blocker.** Look each skill up
+by its NAME in the host's standard skills locations (for example
+`~/.codex/skills/<name>`). Do not hardcode an absolute local path - skills move
+between machines. When a skill is **not installed**, note that in the lane's
+worklog ("han-design-skill-v1 not found; proceeding with plain good practice")
+and proceed - a missing design skill degrades to ordinary good UI practice, it is
+never a hard dependency and never blocks the request.
 
 ## Verification Integrity
 
@@ -341,7 +419,8 @@ verification cannot run -> BLOCKED, never ACCEPTED
 - Do not emit a completion token from unverified state. `SHIP_CHECK_OK` is valid only when every checkpoint verify command was actually run and its recorded exit code in `docs/loop/evidence/*.json` is 0; otherwise the loop is not shippable. The gate reads those recorded exit codes; it never runs the commands for you.
 - "Tests not run", "could not build", or "unverified" are blockers, not acceptances. Review must send `FIX_REQUEST` or `BLOCKED`, never `REVIEW_DONE`, when evidence is absent.
 - Record the exact command, exit code, and output location in the message and the lane worklog so the next lane can re-run it.
-- Passing the gate does not end your turn. A green `SHIP_CHECK_OK` with no reply sent, no `requests.md` transition, and no run-log row is a stalled handoff, not a completed one: complete the In-Turn Report-Back Ritual above in the SAME turn, or the loop does not advance.
+- Passing the gate does not end your turn. A green `SHIP_CHECK_OK` with no reply sent, no `requests.md` transition, and no run-log row is a stalled handoff, not a completed one: **close the turn** (the ritual in `references/protocol.md`) in the SAME turn, or the loop does not advance.
+- **User-facing slices need a human-QA sign-off before `ACCEPTED`.** A request marked `user_facing: true` (a UI slice, dashboard, or interactive tool - anything a person operates) does not reach `ACCEPTED` on machine evidence alone. Machine evidence still comes FIRST and is unchanged; then, after `REVIEW_DONE`, product asks the human to operate the feature (one message: URL + a 30-second try), the request HOLDS at `REVIEWING` with `next_action: awaiting human sign-off` and a `human_qa_requested` run-log row, and only a `human_qa: confirmed` run-log row unlocks the `ACCEPTED` transition. The tracker checkpoint stays `[~]` while it holds. This hold is normal waiting, not a stall (see `references/loop-state.md` "Human-QA Gate").
 
 ## Continuation And Auto-Chain
 
@@ -351,6 +430,7 @@ Use Codex Loop Engineering for long work:
 - Keep `tracker.md` as the phase dashboard.
 - Keep `constraints.md` as boundaries.
 - Keep `handoff.md` as the continuation state.
+- **Reference sensitive material, never quote it into a handoff or auto-chain seed.** `handoff.md` is re-read (and can be pasted into a fresh thread) on every continuation, so an account number or a full path into a private-sample directory (`data/`, `uploads/`, `private_samples/`, or any dir `constraints.md` marks sensitive) sitting in it leaks across sessions. Name the artifact ("the TD statement", "the redacted sample") instead; the doctor flags obvious leaks with a `handoff_sensitive_content` WARNING.
 
 Only create a continuation thread when `auto_chain_next_session: true`, unchecked work remains, no blocker exists, state files are updated, and the thread health check in `references/loop-state.md` can be completed. Returned thread IDs are provisional until verified.
 
@@ -365,6 +445,7 @@ Stop and report clearly when:
 - `budget_exhausted: true` is set in `docs/loop/loop-budget.md`;
 - a blocker needs credentials, approval, external data, or destructive action;
 - lanes would need to write the same files concurrently;
+- a lane is asked to change code with no backing request row (route it through the Human Direct-Ask Ritual first; its cardinal rule applies);
 - the next action would violate `constraints.md`;
 - `max_fix_cycles` is reached;
 - auto-chain would create an unbounded or duplicate continuation.

@@ -36,6 +36,22 @@ It also enforces the hardened loop engineering invariants:
   or ``auto_chain_ready``: the memory cache is fail-open, the completion gate is
   fail-closed. An absent ``decisions.jsonl`` degrades gracefully to zero
   warnings; ``decisions`` reports ``{total, active, stale, malformed}``.
+- G3 human-QA hold: a user-facing slice held awaiting a human sign-off (a
+  ``human_qa_requested`` run-log note with no matching ``human_qa: confirmed``
+  note for the same request_id) is NORMAL WAITING, so ``stalled_handoff`` is
+  suppressed for it. The hold is read from the append-only ``loop-run-log.md``
+  (durable), not from the mutable ``next_action`` cell. Exposed as
+  ``held_for_human_qa``.
+- G7 lineage/hygiene checks, all WARNING-only (never touch handoff/auto-chain):
+  ``orphan_evidence`` (an evidence file naming a request_id with no row in
+  requests.md; SETUP-* records are legitimate), ``evidence_naming`` (an evidence
+  filename matching neither the flat REQ contract nor SETUP-*), and
+  ``uncommitted_work`` (when git is present AND every request is terminal, a
+  non-exempt dirty/untracked file under a lane's write_scope, named with the
+  owning lane). ``uncommitted_work`` is the one check that shells out to
+  ``git status --porcelain``; that call is isolated, timed out, and fails
+  silent-safe (any failure -> no warning). It is skipped entirely when git is
+  absent.
 """
 
 from __future__ import annotations
@@ -102,6 +118,59 @@ STALE_RE = re.compile(r"(?i)\b(stale|pending re-creation|unreadable|unopenable|n
 MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*max_fix_cycles\s*:\s*(\d+)\b")
 BUDGET_EXHAUSTED_RE = re.compile(r"(?im)^\s*budget_exhausted\s*:\s*true\b")
 
+# G7 evidence-lineage naming contract (references/protocol.md "Evidence
+# Records"). An evidence filename is either:
+#   REQ-YYYYMMDD-HHMMSS-<lane>-iter-<n>-<slug>.json   (request evidence)
+#   SETUP-<...>.json                                   (setup/health records)
+# EVIDENCE_REQID_RE captures the request_id prefix (everything before the
+# ``-iter-`` marker) so it can be looked up in requests.md. SETUP records carry
+# no request row and are always legitimate.
+EVIDENCE_REQID_RE = re.compile(
+    r"^(?P<request_id>REQ-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9-]*?)-iter-\d+-.+$"
+)
+EVIDENCE_SETUP_RE = re.compile(r"^SETUP-.+$")
+
+# G7 uncommitted_work exemptions: data/DB artifacts (per constraints.md
+# conventions) and the dashboard's own log files never count as dirty work that
+# should have been committed at pause. Matched with fnmatch against the posix
+# path relative to the git root.
+UNCOMMITTED_EXEMPT_GLOBS = [
+    "data/**",
+    "**/data/**",
+    "uploads/**",
+    "**/uploads/**",
+    "private_samples/**",
+    "**/private_samples/**",
+    "*.sqlite",
+    "**/*.sqlite",
+    "*.sqlite3",
+    "**/*.sqlite3",
+    "*.db",
+    "**/*.db",
+    "docs/loop/dashboard.*",
+    "**/docs/loop/dashboard.*",
+]
+
+# G12 handoff sensitive-content scan (WARNING-only). Before a handoff/auto-chain
+# seed is trusted, obvious sensitive material in it is flagged so the human
+# references-not-quotes it. Pure stdlib regex, no new dependency.
+#
+# Default sensitive-directory names (the loop's data/DB conventions, matching
+# UNCOMMITTED_EXEMPT_GLOBS above); a full path that descends into one of these is
+# a leak of a private-sample location into a durable, re-seeded handoff.
+G12_SENSITIVE_DIR_NAMES = ("data", "uploads", "private_samples")
+# constraints.md lines that MARK a directory sensitive. Any bare ``word/`` token
+# on such a line joins the sensitive-dir set for this loop (so a project can name
+# its own private dir and have handoff leaks of it flagged).
+G12_SENSITIVE_MARKER_RE = re.compile(r"(?i)\b(sensitive|private|secret|raw|never (?:upload|commit|log))\b")
+G12_DIR_TOKEN_RE = re.compile(r"`?([A-Za-z0-9][A-Za-z0-9_.-]*)/`?")
+# An account-number-like digit run: 12+ digits, optionally grouped by spaces or
+# dashes (so "1234 5678 9012 3456" and "123456789012" both match). Anchored on
+# word-ish boundaries so ordinary short numbers (dates, ports, counts) do not
+# trip it. A path segment / an ISO timestamp will not match (they carry letters
+# or ``:``/``T`` inside the run).
+G12_ACCOUNT_NUMBER_RE = re.compile(r"(?<![\w-])(?:\d[ -]?){12,}\d(?![\w-])|(?<![\w-])\d{12,}(?![\w-])")
+
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -132,6 +201,75 @@ def parse_table(path: Path) -> list[dict[str, str]]:
             cells += [""] * (len(headers) - len(cells))
         rows.append(dict(zip(headers, cells[: len(headers)])))
     return rows
+
+
+def observed_tier_tag(current_text: str) -> str:
+    """G14(b): extract the abstract tier TAG from a lane's model_observed line.
+
+    The lane records its observed model+effort in current.md as, e.g.::
+
+        model_observed: gpt-5.5 xhigh (highest)
+
+    The concrete model id is observed DATA; the trailing ``(highest)`` /
+    ``(second-highest)`` parenthetical is the abstract tier TAG the doctor
+    compares to the registry ``tier`` column. This returns that lowercased tag
+    (``highest`` / ``second-highest``) or ``""`` when the line is absent, empty,
+    or carries no recognizable tag. Read only from the header block (above the
+    first ``##`` section) so a stray token in prose is never mistaken for it.
+    """
+    for raw in (current_text or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("##"):
+            break  # header block ended; do not scan sections
+        low = stripped.lower()
+        if not low.startswith("model_observed:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if not value:
+            return ""
+        m = re.search(r"\(([^)]+)\)\s*$", value)
+        tag = (m.group(1) if m else "").strip().lower()
+        if tag in ("highest", "second-highest"):
+            return tag
+        # Tolerate a bare tag with no parentheses (whole value IS the tag).
+        low_val = value.lower()
+        if low_val in ("highest", "second-highest"):
+            return low_val
+        return ""
+    return ""
+
+
+def parse_run_log_sorted(loop_dir: Path) -> list[dict[str, str]]:
+    """Parse ``loop-run-log.md`` rows and sort them by their timestamp.
+
+    G11(b): the run log is APPEND-ONLY, so a late-append honest recovery row can
+    land out of chronological order (run 2 rows 37-39 were exactly this -- legal,
+    but out of file order). Any reconstruction that reasons about the *sequence*
+    of transitions must order by the ``timestamp`` cell, not by file/row order.
+
+    The sort is STABLE: rows whose timestamp is blank or unparseable keep their
+    original relative position (and sort as the epoch so they never jump ahead of
+    real timestamps), so a malformed row never reorders the rest. Set-based
+    reconstructions (e.g. the human-QA hold) are already order-independent; this
+    helper guarantees the ORDERED ones agree on a shuffled log too.
+    """
+    rows = parse_table(loop_dir / "loop-run-log.md")
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def _key(indexed: tuple[int, dict[str, str]]) -> tuple[datetime, int]:
+        idx, row = indexed
+        raw = (
+            row.get("timestamp", "")
+            or row.get("at", "")
+            or row.get("delivered_at", "")
+            or row.get("time", "")
+        )
+        parsed = parse_timestamp(raw)
+        # Fall back to epoch (keeps unparseable rows first, in original order via
+        # the tie-breaking original index) so a bad cell never scrambles order.
+        return (parsed or epoch, idx)
+
+    return [row for _, row in sorted(enumerate(rows), key=_key)]
 
 
 def find_checkboxes(text: str) -> list[dict[str, str]]:
@@ -229,7 +367,9 @@ def count_fix_cycles_from_log(loop_dir: Path) -> dict[str, int]:
     compare against ``max_fix_cycles``.
     """
     counts: dict[str, int] = {}
-    rows = parse_table(loop_dir / "loop-run-log.md")
+    # G11(b): reconstruct from timestamp-ordered rows so a late-append recovery
+    # row cannot change the reconstructed transition count on a shuffled log.
+    rows = parse_run_log_sorted(loop_dir)
     for row in rows:
         request_id = (
             row.get("request_id", "")
@@ -467,6 +607,298 @@ def detect_git_health(loop_dir: Path) -> dict[str, Any]:
     return {"git_present": git_present, "hook_installed": hook_installed}
 
 
+def _posix(path: str) -> str:
+    """Normalize a path to forward slashes for stable glob matching."""
+    return str(path).replace("\\", "/").strip()
+
+
+def _looks_like_glob(token: str) -> bool:
+    """Keep path/glob tokens, drop English prose tokens (matches the guard)."""
+    if any(ch in token for ch in "*?[]"):
+        return True
+    if "/" in token:
+        return True
+    if "." in token and " " not in token:
+        return True
+    return False
+
+
+def _split_scope_globs(write_scope: str) -> list[str]:
+    """Split a ``write_scope`` cell into glob patterns, dropping free text.
+
+    Mirrors ``precommit_scope_guard.split_scope_globs`` so the doctor's
+    uncommitted-work attribution uses the same scope semantics as the guard.
+    """
+    globs: list[str] = []
+    for raw in write_scope.split(";"):
+        token = _posix(raw)
+        if not token:
+            continue
+        if _looks_like_glob(token):
+            globs.append(token)
+    return globs
+
+
+def _glob_matches(path: str, pattern: str) -> bool:
+    """Match ``path`` against ``pattern`` with ``**`` recursive support.
+
+    Mirrors ``precommit_scope_guard.glob_matches``: a trailing ``/**`` also
+    matches the directory prefix itself, and a trailing ``/`` matches contents.
+    """
+    import fnmatch
+
+    pattern = _posix(pattern)
+    candidate = _posix(path)
+    if fnmatch.fnmatch(candidate, pattern):
+        return True
+    if pattern.endswith("/**"):
+        prefix = pattern[: -len("/**")]
+        if candidate == prefix or candidate.startswith(prefix + "/"):
+            return True
+    if pattern.endswith("/"):
+        base = pattern[:-1]
+        if candidate == base or candidate.startswith(pattern):
+            return True
+    return False
+
+
+def _path_matches_any(path: str, globs: list[str]) -> bool:
+    return any(_glob_matches(path, pattern) for pattern in globs)
+
+
+def check_evidence_lineage(loop_dir: Path, request_ids: set[str]) -> dict[str, Any]:
+    """G7 (a)/(b): lineage cross-check of evidence filenames (filesystem-only).
+
+    Scans ``evidence/*.json`` (non-recursive, the same shape the completion gate
+    sees) and classifies each filename against the flat naming contract:
+
+    - ``orphan_evidence``: the filename parses to a ``REQ-...`` request_id via
+      the flat contract, but that request_id has no row in ``requests.md``. This
+      is the lineage hole that would have flagged a lane shipping code with no
+      request. SETUP-* records carry no request row and are always legitimate.
+    - ``evidence_naming``: the filename matches NEITHER the ``REQ-...`` contract
+      NOR ``SETUP-...`` -- a malformed name that no lifecycle produced (e.g. a
+      hand-written ``frontend-...-verification.json``).
+
+    Both are WARNING-only and never touch handoff_ready/auto_chain. Returns
+    machine-readable lists so the dashboard can render them via the existing
+    doctor passthrough.
+    """
+    evidence_dir = loop_dir / "evidence"
+    orphan_evidence: list[dict[str, str]] = []
+    evidence_naming: list[dict[str, str]] = []
+    if not evidence_dir.is_dir():
+        return {"orphan_evidence": orphan_evidence, "evidence_naming": evidence_naming}
+
+    for path in sorted(evidence_dir.glob("*.json")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if EVIDENCE_SETUP_RE.match(name):
+            # SETUP records are legitimate; they have no request row.
+            continue
+        match = EVIDENCE_REQID_RE.match(name)
+        if match is None:
+            # Does not match the flat contract at all -> malformed name.
+            evidence_naming.append({"file": name})
+            continue
+        request_id = match.group("request_id")
+        if request_id not in request_ids:
+            orphan_evidence.append({"file": name, "request_id": request_id})
+
+    return {"orphan_evidence": orphan_evidence, "evidence_naming": evidence_naming}
+
+
+def _git_status_porcelain(git_root: Path) -> Optional[list[tuple[str, str]]]:
+    """Return ``[(xy, path), ...]`` from ``git status --porcelain``, or None.
+
+    This is the one place the doctor shells out (the rest of the doctor is
+    filesystem-only; F4 detected git by walking for a .git dir, never via
+    subprocess). Detecting dirty/untracked-vs-tracked genuinely needs git's
+    index, so it is isolated here, timed out, and fails silent-safe: ANY failure
+    (git missing, non-zero exit, timeout, OSError) returns None, so the
+    uncommitted_work check simply does not fire rather than crashing or lying.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(git_root), "status", "--porcelain", "-z"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    raw = out.stdout.decode("utf-8", "replace")
+    # -z output is NUL-separated; a rename record adds a second NUL-separated
+    # field (the original path) which we skip.
+    parts = raw.split("\0")
+    i = 0
+    while i < len(parts):
+        chunk = parts[i]
+        if not chunk:
+            i += 1
+            continue
+        # Porcelain v1: 2 status chars, a space, then the path.
+        xy = chunk[:2]
+        path = chunk[3:] if len(chunk) > 3 else ""
+        entries.append((xy, _posix(path)))
+        if "R" in xy or "C" in xy:
+            i += 1  # skip the rename/copy source path field
+        i += 1
+    return entries
+
+
+def check_uncommitted_work(
+    loop_dir: Path,
+    lanes: list[dict[str, str]],
+    all_requests_terminal: bool,
+    git_present: bool,
+) -> list[dict[str, Any]]:
+    """G7 (c): warn on uncommitted in-scope work when the loop is paused/idle.
+
+    Only runs when git is present AND every request is terminal (a paused or idle
+    loop): mid-flight dirty files are normal work-in-progress, not a hygiene
+    problem. When git is absent the check is skipped entirely and silently.
+
+    For each non-exempt dirty/untracked path reported by ``git status
+    --porcelain``, attribute it to the lane whose ``write_scope`` covers it and
+    emit an ``uncommitted_work`` finding naming that lane. Exempt paths (data/DB
+    artifacts, dashboard logs) are dropped. WARNING-only; never a gate.
+    """
+    if not git_present or not all_requests_terminal:
+        return []
+    git_dir = find_git_dir(loop_dir)
+    if git_dir is None:
+        return []
+    # The working tree root is the parent of the .git dir (for a normal repo).
+    # find_git_dir returns the .git directory itself; its parent is the worktree.
+    git_root = git_dir.parent
+    entries = _git_status_porcelain(git_root)
+    if entries is None:
+        # Fail silent-safe: could not determine status, so do not warn.
+        return []
+
+    # Build lane -> write-scope globs (relative to the repo root).
+    lane_globs: list[tuple[str, list[str]]] = []
+    for row in lanes:
+        lane = row.get("lane", "").strip()
+        if not lane:
+            continue
+        globs = _split_scope_globs(row.get("write_scope", ""))
+        if globs:
+            lane_globs.append((lane, globs))
+
+    findings: list[dict[str, Any]] = []
+    for xy, path in entries:
+        if not path:
+            continue
+        if _path_matches_any(path, UNCOMMITTED_EXEMPT_GLOBS):
+            continue
+        owner = None
+        for lane, globs in lane_globs:
+            if _path_matches_any(path, globs):
+                owner = lane
+                break
+        if owner is None:
+            # Not inside any lane's write_scope: not this check's concern.
+            continue
+        findings.append({"path": path, "lane": owner, "status": xy.strip() or "?"})
+    return findings
+
+
+def _sensitive_dir_names(constraints_text: str) -> set[str]:
+    """Collect sensitive-directory names for the G12 handoff scan.
+
+    Starts from the loop's default private/data dir names and adds any bare
+    ``word/`` token that appears on a constraints.md line MARKED sensitive
+    (matching ``G12_SENSITIVE_MARKER_RE``: sensitive/private/secret/raw/never
+    upload|commit|log). So a project that names its own private-sample directory
+    in constraints.md has handoff leaks of that directory flagged too. Common
+    non-sensitive tokens are excluded so an ordinary ``src/`` or ``docs/`` on a
+    marked line is not treated as private.
+    """
+    names = set(G12_SENSITIVE_DIR_NAMES)
+    benign = {"src", "docs", "tests", "test", "app", "scripts", "http", "https", "www"}
+    for line in constraints_text.splitlines():
+        if not G12_SENSITIVE_MARKER_RE.search(line):
+            continue
+        for token in G12_DIR_TOKEN_RE.findall(line):
+            low = token.strip().lower()
+            if low and low not in benign and not low.startswith(("http", "www")):
+                names.add(low)
+    return names
+
+
+def check_handoff_sensitive_content(loop_dir: Path) -> list[dict[str, str]]:
+    """G12: scan the handoff/auto-chain seed text for obvious sensitive content.
+
+    The handoff file is the durable continuation seed: whatever it carries is
+    re-read (and can be pasted into a fresh thread) on every auto-chain. So a
+    raw account number or a full path into a private-sample directory sitting in
+    it is a privacy leak that survives across sessions. This is a WARNING-only
+    hygiene check (never a gate, never touches handoff_ready/auto_chain): the fix
+    is for the human to REFERENCE, not quote, the sensitive material.
+
+    Two pure-stdlib-regex patterns, both conservative (few false positives):
+
+    - an account-number-like digit run (12+ digits, optionally grouped by spaces
+      or dashes) -- ``G12_ACCOUNT_NUMBER_RE``;
+    - a full path that descends into a constraint-marked sensitive directory
+      (``data/``, ``uploads/``, ``private_samples/``, plus any dir a
+      constraints.md sensitive line names).
+
+    Returns a list of ``{kind, sample}`` findings (``sample`` is a short,
+    already-safe descriptor -- an account run is masked to its last 4 digits, a
+    path keeps only the sensitive-dir segment onward -- so the doctor's own
+    output never re-leaks the material). Empty list when handoff.md is absent or
+    clean. Never raises.
+    """
+    handoff_text = read_text(loop_dir / "handoff.md")
+    if not handoff_text:
+        return []
+    constraints_text = read_text(loop_dir / "constraints.md")
+    sensitive_dirs = _sensitive_dir_names(constraints_text)
+
+    findings: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    # (1) Account-number-like digit runs. Mask to the last 4 so the finding is
+    # safe to surface (we never echo the full run back).
+    for m in G12_ACCOUNT_NUMBER_RE.finditer(handoff_text):
+        digits = re.sub(r"\D", "", m.group(0))
+        if len(digits) < 12:
+            continue
+        masked = "*" * (len(digits) - 4) + digits[-4:]
+        key = ("account_number", masked)
+        if key not in seen:
+            seen.add(key)
+            findings.append({"kind": "account_number", "sample": masked})
+
+    # (2) Full paths into a sensitive directory. Match a posix-ish path token
+    # that contains ``<sensitive_dir>/<something>``; keep only from the sensitive
+    # segment onward in the reported sample (never the absolute prefix, which
+    # could itself carry a username).
+    path_token_re = re.compile(r"[A-Za-z0-9_./\\-]+")
+    for token in path_token_re.findall(handoff_text):
+        norm = token.replace("\\", "/")
+        segs = [s for s in norm.split("/") if s]
+        for i, seg in enumerate(segs):
+            if seg.lower() in sensitive_dirs and i + 1 < len(segs):
+                sample = "/".join(segs[i:])
+                key = ("sensitive_path", sample.lower())
+                if key not in seen:
+                    seen.add(key)
+                    findings.append({"kind": "sensitive_path", "sample": sample})
+                break
+    return findings
+
+
 def _pending_inbox_count(loop_dir: Path, lane: str) -> int:
     """Count undelivered messages in ``lane``'s Maildir inbox (inbox/new/*.md).
 
@@ -543,6 +975,95 @@ def classify_missing_dependency_blocker(loop_dir: Path, request_id: str) -> Opti
     }
 
 
+def blocked_recommended_answer(loop_dir: Path, request_id: str) -> str:
+    """G13: extract the lane's ``recommended_answer`` from a BLOCKED message.
+
+    Every BLOCKED / approval-needed envelope carries a ``recommended_answer`` --
+    the raising lane's proposed resolution (see references/protocol.md "BLOCKED")
+    -- so the human edits a proposal instead of authoring a decision cold. This
+    reads the newest ``BLOCKED-*.md`` archived under ``messages/<request_id>/``
+    and returns that one-line value (the machine text verbatim), or ``""`` when
+    absent. Supports the value inline (``recommended_answer: use the mock``) or
+    on a following ``- `` list line. Never raises.
+    """
+    request_id = (request_id or "").strip()
+    if not request_id:
+        return ""
+    msg_dir = loop_dir / "messages" / request_id
+    if not msg_dir.is_dir():
+        return ""
+    blocked_files = sorted(
+        (p for p in msg_dir.glob("BLOCKED*") if p.is_file()),
+        key=lambda p: p.name,
+    )
+    for path in reversed(blocked_files):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            low = line.strip().lower()
+            if low.startswith("recommended_answer:"):
+                inline = line.split(":", 1)[1].strip()
+                if inline:
+                    return inline
+                # Value on the following list line(s): take the first bullet.
+                for follow in lines[i + 1:]:
+                    fs = follow.strip()
+                    if not fs:
+                        continue
+                    if fs.startswith("-"):
+                        return fs.lstrip("-").strip()
+                    break
+                return ""
+    return ""
+
+
+def requests_held_for_human_qa(loop_dir: Path) -> set[str]:
+    """G3: request_ids currently held awaiting a human-QA sign-off.
+
+    A user-facing slice, after REVIEW_DONE, HOLDS at REVIEWING while product asks
+    the human to operate the feature (see references/protocol.md "Human-QA gate
+    for user-facing slices"). The hold is recorded durably in the append-only
+    ``loop-run-log.md`` as a ``human_qa_requested`` note; the sign-off that
+    releases the hold is a later ``human_qa: confirmed`` note for the same
+    request_id.
+
+    We detect the hold from the RUN LOG rather than the mutable ``next_action``
+    cell because the run log is append-only and timestamp-durable: a
+    ``next_action`` marker is overwritten on every transition and would silently
+    lose the hold, whereas the ``human_qa_requested`` row survives. A request is
+    "held" when it has at least one ``human_qa_requested`` note and NO matching
+    ``human_qa: confirmed`` note. Once confirmed, it is no longer held (and
+    proceeds to ACCEPTED). Absent a run log, no request is held.
+    """
+    requested: set[str] = set()
+    confirmed: set[str] = set()
+    # G11(b): read timestamp-ordered rows. The requested/confirmed reconstruction
+    # is already set-based (order-independent), but sorting keeps every run-log
+    # reader on one ordering so a shuffled log yields identical conclusions.
+    rows = parse_run_log_sorted(loop_dir)
+    for row in rows:
+        request_id = (
+            row.get("request_id", "")
+            or row.get("request", "")
+            or row.get("req", "")
+        ).strip()
+        if not request_id:
+            continue
+        note = (row.get("note", "") or "").strip().lower()
+        if not note:
+            continue
+        # "human_qa: confirmed ..." must be checked before the substring
+        # "human_qa_requested" so a confirmation is never miscounted as a request.
+        if "human_qa: confirmed" in note or "human_qa_confirmed" in note:
+            confirmed.add(request_id)
+        elif "human_qa_requested" in note:
+            requested.add(request_id)
+    return {rid for rid in requested if rid not in confirmed}
+
+
 def _has_archived_review_done(loop_dir: Path, request_id: str) -> bool:
     """True if a REVIEW_DONE message is archived for ``request_id``.
 
@@ -594,6 +1115,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     lane_file_missing: dict[str, list[str]] = {}
     lane_summaries: list[dict[str, Any]] = []
     orphan_suspects: list[str] = []
+    tier_mismatches: list[dict[str, str]] = []
     for row in lanes:
         lane = row.get("lane", "").strip()
         if not lane:
@@ -616,6 +1138,28 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         )
         if is_orphan:
             orphan_suspects.append(lane)
+        # G14(b): compare the OBSERVED tier tag (from current.md model_observed)
+        # to the registry's recommended ``tier`` cell. A mismatch means the lane
+        # is running a tier different from the recorded policy (the run-2 "silent
+        # downgrade" fear); surfaced so it is never silent. Only compared when
+        # BOTH are present and abstract; a blank observed tag (not yet stamped)
+        # is not a mismatch, just not-yet-observed.
+        recommended_tier = (row.get("tier", "") or "").strip().lower()
+        current_text = read_text(loop_dir / "lanes" / lane / "current.md")
+        observed_tier = observed_tier_tag(current_text)
+        tier_mismatch = bool(
+            recommended_tier
+            and observed_tier
+            and recommended_tier != observed_tier
+        )
+        if tier_mismatch:
+            tier_mismatches.append(
+                {
+                    "lane": lane,
+                    "recommended": recommended_tier,
+                    "observed": observed_tier,
+                }
+            )
         lane_summaries.append(
             {
                 "lane": lane,
@@ -625,6 +1169,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 "heartbeat": heartbeat_raw,
                 "heartbeat_age_mins": round(age_mins, 2) if age_mins is not None else None,
                 "orphan_suspect": is_orphan,
+                # G14: advisory recommended tier + observed tier tag (abstract).
+                "recommended_tier": recommended_tier,
+                "observed_tier": observed_tier,
+                "tier_mismatch": tier_mismatch,
             }
         )
 
@@ -636,6 +1184,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     non_terminal_requests: list[dict[str, Any]] = []
     thrash_requests: list[dict[str, Any]] = []
     missing_evidence_requests: list[str] = []
+    # G13: request_id -> recommended_answer for BLOCKED requests (the raising
+    # lane's proposed resolution). BLOCKED is terminal, so this map -- not
+    # non_terminal_requests -- is how the dashboard reaches a blocked request's
+    # recommendation.
+    recommended_answers: dict[str, str] = {}
     for row in requests:
         request_id = row.get("request_id", "").strip()
         if not request_id:
@@ -655,6 +1208,18 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             or row.get("last_message", "")
         )
         has_evidence = not is_empty_cell(evidence_cell)
+        # G13: a BLOCKED request carries the raising lane's recommended_answer
+        # (from its archived BLOCKED envelope) so the dashboard can render the
+        # proposed resolution inline on the your-turn item. Read only for BLOCKED
+        # requests to avoid touching the message store for every row. BLOCKED is
+        # a TERMINAL status (so it is not in non_terminal_requests); the value is
+        # therefore also surfaced in the request_id -> answer map below.
+        recommended_answer = (
+            blocked_recommended_answer(loop_dir, request_id)
+            if status == "BLOCKED" else ""
+        )
+        if recommended_answer:
+            recommended_answers[request_id] = recommended_answer
         summary = {
             "request_id": request_id,
             "status": status,
@@ -663,6 +1228,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             "next_action": row.get("next_action", ""),
             "fix_cycles": fix_cycles,
             "has_evidence": has_evidence,
+            "recommended_answer": recommended_answer,
         }
         request_summaries.append(summary)
         if status not in TERMINAL_REQUEST_STATUSES:
@@ -679,6 +1245,13 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                     "max_fix_cycles": max_fix_cycles,
                 }
             )
+
+    # The set of request_ids that actually have a row in requests.md, used by the
+    # G7 orphan_evidence lineage check. A loop is "paused/idle" (all terminal)
+    # for the G7 uncommitted_work check when there are requests and none is
+    # non-terminal; an empty queue is treated as not-yet-started, not paused.
+    registered_request_ids = {s["request_id"] for s in request_summaries}
+    all_requests_terminal = bool(request_summaries) and not non_terminal_requests
 
     stale_markers = [
         line.strip()
@@ -701,6 +1274,26 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     git_health = detect_git_health(loop_dir)
     git_present = git_health["git_present"]
     hook_installed = git_health["hook_installed"]
+
+    # G7 lineage cross-check (mechanical teeth for G6): every evidence file must
+    # name a request_id that exists in requests.md and must match the flat naming
+    # contract. All WARNING-only; never touches handoff_ready/auto_chain.
+    lineage = check_evidence_lineage(loop_dir, registered_request_ids)
+    orphan_evidence = lineage["orphan_evidence"]
+    evidence_naming = lineage["evidence_naming"]
+
+    # G7 uncommitted_work: when git is present AND the loop is paused/idle (every
+    # request terminal), non-exempt dirty/untracked files under a lane's
+    # write_scope get a warning naming the owning lane. Skipped silently when git
+    # is absent. WARNING-only.
+    uncommitted_work = check_uncommitted_work(
+        loop_dir, lanes, all_requests_terminal, git_present
+    )
+
+    # G12 handoff redaction: scan the durable handoff/auto-chain seed text for
+    # obvious sensitive content (account-number-like digit runs, full paths into
+    # a constraint-marked sensitive dir). WARNING-only; never a gate.
+    handoff_sensitive = check_handoff_sensitive_content(loop_dir)
 
     # F7 mandatory heartbeats: a lane that OWNS an active (non-terminal) request
     # must report a heartbeat. This is distinct from orphan_suspect (which fires
@@ -791,6 +1384,13 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # reply, updating requests.md, or appending the run-log row, so the requester
     # waits forever. It is a WARNING that names the lane + request as a genuine
     # your-turn nudge; it never blocks handoff.
+    # G3: requests held awaiting a human-QA sign-off are NORMAL WAITING (the
+    # human's turn), not a stalled handoff. A user-facing slice that passed
+    # review and machine evidence HOLDS at REVIEWING until the human operates it
+    # and confirms; without this exclusion the done-by-review signal below would
+    # misreport that legitimate hold as a lane to nudge.
+    held_for_human_qa = requests_held_for_human_qa(loop_dir)
+
     stalled_handoff_requests: list[dict[str, str]] = []
     pre_acceptance_states = {"REQUESTED", "IMPLEMENTING", "REVIEWING"}
     for request in non_terminal_requests:
@@ -798,6 +1398,9 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         if status not in pre_acceptance_states:
             continue
         request_id = request["request_id"]
+        if request_id in held_for_human_qa:
+            # Held for human QA: normal waiting, not a stall. Do not nudge a lane.
+            continue
         done_by_gate = request_id in gate_passing_requests
         done_by_review = _has_archived_review_done(loop_dir, request_id)
         if done_by_gate or done_by_review:
@@ -999,6 +1602,80 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 "message": f"{request_id} has no recorded evidence",
             }
         )
+    # G7 (a) orphan_evidence: an evidence file naming a request_id with no row in
+    # requests.md. WARNING-only lineage teeth for G6.
+    for item in orphan_evidence:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "orphan_evidence",
+                "message": "evidence file {file} names request_id {rid} which has no "
+                "row in requests.md (unlinked evidence -- route the change through "
+                "product and mint a request)".format(
+                    file=item["file"], rid=item["request_id"]
+                ),
+            }
+        )
+    # G7 (b) evidence_naming: an evidence filename that matches neither the flat
+    # REQ-...-iter-N-... contract nor SETUP-...; a name no lifecycle produced.
+    for item in evidence_naming:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "evidence_naming",
+                "message": "evidence file {file} does not match the flat naming "
+                "contract (REQ-YYYYMMDD-HHMMSS-<lane>-iter-<n>-<slug>.json or "
+                "SETUP-*.json)".format(file=item["file"]),
+            }
+        )
+    # G7 (c) uncommitted_work: at a paused/idle loop, a non-exempt dirty file
+    # under a lane's write_scope should have been committed as that lane.
+    for item in uncommitted_work:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "uncommitted_work",
+                "message": "uncommitted file {path} is inside lane {lane}'s "
+                "write_scope while the loop is paused/idle; commit it as that lane "
+                "(a paused loop is a fully committed loop)".format(
+                    path=item["path"], lane=item["lane"]
+                ),
+            }
+        )
+    # G12 handoff_sensitive_content: the handoff/auto-chain seed carries obvious
+    # sensitive material (masked in the message). Reference it, do not quote it.
+    for item in handoff_sensitive:
+        if item["kind"] == "account_number":
+            detail = "an account-number-like digit run ({0})".format(item["sample"])
+        else:
+            detail = "a full path into a sensitive directory ({0})".format(item["sample"])
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "handoff_sensitive_content",
+                "message": "handoff.md (the durable auto-chain seed) contains {0}; "
+                "reference sensitive material by name, do not quote it into a "
+                "re-seeded handoff".format(detail),
+            }
+        )
+    # G14(b) tier_mismatch: a lane's OBSERVED tier tag differs from the registry's
+    # recommended tier column. WARNING-only -- surfaced so a divergence from the
+    # recorded tier policy is never silent (the run-2 "silent downgrade" fear);
+    # the human either accepts the observed tier or re-opens the thread at policy.
+    for item in tier_mismatches:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "tier_mismatch",
+                "message": "lane {lane} is running the {observed} tier but the "
+                "registry recommends {recommended}; either update the registry "
+                "tier (a human may set any lane up or down) or re-open the thread "
+                "at the recommended tier -- the skill never silently deviates".format(
+                    lane=item["lane"], observed=item["observed"],
+                    recommended=item["recommended"],
+                ),
+            }
+        )
     if not gate_available:
         warnings.append(
             {
@@ -1079,6 +1756,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "orphan_suspects": orphan_suspects,
         "heartbeat_gap_owners": heartbeat_gap_owners,
         "stalled_handoffs": stalled_handoff_requests,
+        "held_for_human_qa": sorted(held_for_human_qa),
         "workerless_dependencies": workerless_dependencies,
         "missing_dependency_blockers": missing_dependency_blockers,
         "stale_heartbeat_mins": stale_heartbeat_mins,
@@ -1089,6 +1767,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             "thrash": thrash_requests,
             "missing_evidence": missing_evidence_requests,
         },
+        # G13: request_id -> recommended_answer for BLOCKED requests.
+        "recommended_answers": recommended_answers,
         "max_fix_cycles": max_fix_cycles,
         "budget": {
             "present": budget_present,
@@ -1098,6 +1778,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "evidence_dir_present": evidence_dir_present,
         "git_present": git_present,
         "hook_installed": hook_installed,
+        "orphan_evidence": orphan_evidence,
+        "evidence_naming": evidence_naming,
+        "uncommitted_work": uncommitted_work,
+        "handoff_sensitive_content": handoff_sensitive,
+        "tier_mismatches": tier_mismatches,
         "evidence_recorded_ok": evidence_recorded_ok,
         "gate_available": gate_available,
         "completion_gate_ok": completion_gate_ok,

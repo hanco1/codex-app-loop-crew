@@ -378,6 +378,7 @@ status: idle
 iteration:
 last_updated:
 heartbeat:
+model_observed:
 
 ## Current Checkpoint
 
@@ -593,6 +594,79 @@ def parse_thread_mapping(values: list[str]) -> dict[str, str]:
     return mapping
 
 
+def parse_observed_models(values: list[str]) -> dict[str, str]:
+    """Parse --observed-model lane=<observed model+effort> pairs (G14(a)).
+
+    The value is observed DATA written verbatim into the lane's current.md
+    model_observed line, e.g. ``implementation=gpt-5.5 xhigh (highest)``. The
+    only split is on the FIRST ``=`` so the value may itself contain spaces and
+    parentheses. Empty lane or value is a loud error.
+    """
+    mapping: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"--observed-model must be lane=<observed>, got: {value}")
+        lane, observed = value.split("=", 1)
+        lane = lane.strip()
+        observed = observed.strip()
+        if not lane or not observed:
+            raise SystemExit(f"Invalid --observed-model value: {value}")
+        mapping[lane] = observed
+    return mapping
+
+
+def stamp_observed_model(current_path: Path, observed: str) -> bool:
+    """Write the ``model_observed:`` line in a lane's current.md (G14(a)).
+
+    Rewrites the existing ``model_observed:`` line in place (never adds other
+    fields), or inserts one right after the ``heartbeat:`` header line if the
+    file predates this template. The value is observed DATA, written verbatim.
+    Returns True if the file changed. Best-effort: a missing/unreadable file is a
+    no-op (returns False), never an exception.
+    """
+    if not observed or not current_path.exists():
+        return False
+    try:
+        original = current_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    lines = original.splitlines(keepends=True)
+    replacement = "model_observed: " + observed
+    out: list[str] = []
+    changed = False
+    found = False
+    for line in lines:
+        suffix = "\n" if line.endswith("\n") else ""
+        body = line[: -len(suffix)] if suffix else line
+        low = body.strip().lower()
+        if low.startswith("model_observed:"):
+            found = True
+            if body != replacement:
+                changed = True
+            out.append(replacement + suffix)
+        else:
+            out.append(line)
+    if not found:
+        # Insert after the heartbeat: header line for older current.md files.
+        rebuilt: list[str] = []
+        inserted = False
+        for line in out:
+            rebuilt.append(line)
+            if not inserted and line.strip().lower().startswith("heartbeat:"):
+                rebuilt.append(replacement + "\n")
+                inserted = True
+        if inserted:
+            out = rebuilt
+            changed = True
+    if not changed:
+        return False
+    try:
+        current_path.write_text("".join(out), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def parse_extra_lanes(values: list[str]) -> dict[str, dict[str, str]]:
     lanes: dict[str, dict[str, str]] = {}
     for value in values:
@@ -698,6 +772,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--observed-model",
+        action="append",
+        default=[],
+        help=(
+            "G14(a): stamp a lane's OBSERVED model+effort into its current.md "
+            "model_observed line at adoption, e.g. --observed-model "
+            "'implementation=gpt-5.5 xhigh (highest)'. This is observed DATA, not "
+            "policy: the value is written verbatim (the '(highest)'/'(second-highest)' "
+            "tier tag lets the doctor compare it to the registry tier). Optional; "
+            "the lane can also fill the line itself."
+        ),
+    )
+    parser.add_argument(
         "--extra-lane",
         action="append",
         default=[],
@@ -735,6 +822,7 @@ def main() -> int:
     requests = loop_dir / "requests.md"
     loop_policy = loop_dir / "loop-policy.md"
     thread_mapping = parse_thread_mapping(args.set_thread)
+    observed_models = parse_observed_models(args.observed_model)
 
     base_lanes = {} if args.no_default_lanes else dict(DEFAULT_LANES)
     lane_defaults = {
@@ -796,6 +884,7 @@ def main() -> int:
     ]
 
     wrote: list[Path] = []
+    stamped_observed: list[str] = []
     if write_if_missing(requests, REQUESTS_TEMPLATE):
         wrote.append(requests)
     if write_if_missing(loop_policy, LOOP_POLICY_TEMPLATE):
@@ -857,6 +946,11 @@ def main() -> int:
         workspace_readme = workspace_dir / "README.md"
         if write_if_missing(workspace_readme, LANE_WORKSPACE_README_TEMPLATE.format(title=title)):
             wrote.append(workspace_readme)
+        # G14(a): stamp the OBSERVED model+effort into current.md at adoption
+        # when provided. Written verbatim (observed data, not policy).
+        if lane in observed_models:
+            if stamp_observed_model(lane_dir / "current.md", observed_models[lane]):
+                stamped_observed.append(lane)
 
     registry.write_text(render_registry(rows), encoding="utf-8")
 
@@ -867,6 +961,8 @@ def main() -> int:
     print(f"ensured {messages_dir}")
     print(f"ensured {evidence_dir}")
     print(f"ensured {memory_dir}")
+    for lane in stamped_observed:
+        print(f"stamped model_observed for {lane}")
     if thread_mapping:
         # Thread-title guidance (F1): title each Codex thread with the BARE lane
         # name only. Do not prefix a project name or a "loop lane:" boilerplate

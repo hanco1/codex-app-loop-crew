@@ -28,6 +28,52 @@ Rules:
 - Product makes final tracker completion decisions unless the loop files delegate that authority.
 - Terminal states are `ACCEPTED` and `BLOCKED`.
 
+### Human-QA gate for user-facing slices
+
+A request whose deliverable is **human-operated** does not reach `ACCEPTED` on
+machine evidence alone. Machine evidence is still required FIRST (the completion
+gate and independent review are unchanged); the human sign-off is an ADDITIVE
+step layered on top, and only for user-facing slices.
+
+**Marking a request user-facing.** A request is user-facing when its
+`IMPLEMENTATION_REQUEST` envelope carries `user_facing: true` (mirrored from a
+`user_facing: true` marker on the goal/tracker checkpoint it serves). This one
+line - not a new status token, not a new schema column - is the whole marker. A
+UI slice, a dashboard, an interactive CLI, anything a person operates by hand is
+user-facing; a pure library or internal data-core slice is not.
+
+**The gate (after `REVIEW_DONE`, before `ACCEPTED`).** For a user-facing
+request, once review passes:
+
+1. Product asks the human to **operate the feature** in ONE message naming the
+   URL (or launch command) and a 30-second try - for example: *"open
+   http://127.0.0.1:8011, import your statement, and confirm the monthly total
+   and merchant names look right."*
+2. The request **HOLDS**: it stays at `REVIEWING` (the existing token - do NOT
+   invent a new status), its `next_action` cell reads
+   `awaiting human sign-off: <try>`, and a run-log row records the ask:
+
+   ```md
+   | <ts> | <request_id> | <iter> | REVIEWING | REVIEWING | product | human_qa_requested: <try> |
+   ```
+
+   The tracker checkpoint stays `[~]` (in progress), never `[x]`, while it holds.
+3. When the human confirms, product records the sign-off as a run-log row BEFORE
+   the `ACCEPTED` transition:
+
+   ```md
+   | <ts> | <request_id> | <iter> | REVIEWING | REVIEWING | product | human_qa: confirmed <who/when> |
+   ```
+
+   Only then does product move the request to `ACCEPTED`, append the acceptance
+   run-log row, and mark the tracker checkpoint `[x]`.
+
+The hold is **normal waiting, not a stall**: the doctor detects the
+`human_qa_requested` run-log row without a matching `human_qa: confirmed` row for
+the same `request_id` and suppresses `stalled_handoff` for it (a held request is
+your-turn for the HUMAN, not a lane to nudge). See `references/loop-state.md`
+"Human-QA Gate" and the doctor's `stalled_handoff` exclusion.
+
 ## Deterministic Completion Gate
 
 A request may move to `ACCEPTED` (and auto-chain may proceed) only after a
@@ -268,18 +314,63 @@ Rules:
 - Append the row in the same step that updates `requests.md`, so the log and the queue never diverge.
 - Count FIX_REQUESTED <-> IMPLEMENTING transitions for the same `request_id` from this log when applying the Anti-Thrash rule.
 
-### In-turn report-back (the run-log row is step 3 of 4)
+### Close the turn (the in-turn report-back ritual - single source of truth)
 
-A Codex thread runs one turn and stops, so appending this row is not a
-follow-up chore - it is part of closing your turn. **Your turn is not finished
-until, in the same turn, you have (1) sent the reply message
-(`send_message_to_thread` / `codex_app.*`, or the `deliver_message.py`
-file-inbox fallback), (2) advanced the request in `requests.md`, (3) appended
-this run-log row, and (4) refreshed your heartbeat** (the `heartbeat` column in
-`agent-lanes.md` and the `last_updated`/`heartbeat` mirror in lane
-`current.md`). Finishing the work - even reaching `SHIP_CHECK_OK` - and ending
-the turn there leaves the requester waiting forever; the doctor reports that
-done-but-unadvanced state as `stalled_handoff`, naming the lane to nudge.
+This section is the ONE authoritative definition of the in-turn report-back
+ritual. `SKILL.md` and `references/loop-state.md` point here by the leading
+token **"close the turn"** and do not restate the step list; when the ritual
+changes, change it here and nowhere else.
+
+A Codex thread runs one turn and stops, so a handoff MUST complete inside the
+same turn as the work. Finishing the code - even reaching `SHIP_CHECK_OK` - is
+not the end of your turn: if your turn ends there, the requester waits forever
+and a human has to hand-carry the baton.
+
+**To close the turn you must, in this same turn:**
+
+1. **Send the reply message** to the next lane - `send_message_to_thread` (or
+   the `codex_app.*` equivalent), or the durable file-inbox fallback
+   (`deliver_message.py`) when no thread tool is available.
+2. **Advance `requests.md`** - move the request to its next status and owner (do
+   not leave it parked in `IMPLEMENTING`/`REVIEWING` after the work is done).
+3. **Append the `loop-run-log.md` row** for that transition, in the same step
+   that updated `requests.md`.
+4. **Refresh your heartbeat** - the `heartbeat` column in `agent-lanes.md` and
+   the `last_updated`/`heartbeat` mirror in lane `current.md`.
+   (`deliver_message.py --from-lane <you>` does this for you.)
+5. **Commit your slice as your lane** - `CODEX_LANE=<lane> git commit -m "..."`.
+   A closed slice that is not committed leaves the scope guard inert (it only
+   runs at commit time) and the next lane builds on uncommitted state.
+
+All steps are mandatory every time you close a slice. Do not stop after the
+work is done and leave the reply, the ledger, the log, the heartbeat, or the
+commit for "next turn" - there is no guaranteed next turn. The doctor reports a
+request whose work is done but that never advanced as `stalled_handoff`, naming
+the lane to nudge.
+
+**Product's accept/pause path: a paused loop is a fully committed loop.** Before
+product accepts a slice or pauses the loop, run `git status --porcelain` and
+commit every non-exempt dirty or untracked file as its owning lane
+(`CODEX_LANE=<lane> git commit ...`) so the tree is clean at the pause. Data and
+DB artifacts stay exempt per `constraints.md` (for example `data/`, `uploads/`,
+`private_samples/`, `*.sqlite`/`*.sqlite3`/`*.db`); everything else must be
+committed. A pause with an in-scope dirty file is not a paused loop - it is an
+un-guarded one.
+
+**UI addendum: re-smoke the LIVE instance.** If your change affects a running
+serving process (a localhost dashboard, an app server), restart that process and
+re-run the smoke against the LIVE instance before reporting DONE. A green smoke
+against a stale process that never picked up your change is not evidence the
+change works.
+
+**Handoff hygiene: reference sensitive material, never quote it.** `handoff.md`
+and any auto-chain/continuation seed are re-read on every continuation and can be
+pasted into a fresh thread, so a raw account number or a full path into a
+constraint-marked sensitive directory (`data/`, `uploads/`, `private_samples/`,
+or any dir `constraints.md` marks sensitive) left in them leaks across sessions.
+Name the artifact ("the TD statement", "the redacted sample") instead of pasting
+its contents; the doctor scans the seed and emits a `handoff_sensitive_content`
+WARNING when it finds an obvious leak.
 
 ## Decision Log
 
@@ -320,12 +411,29 @@ created_at: YYYY-MM-DDTHH:MM:SSZ
 source_docs:
 - docs/loop/goal.md
 - docs/loop/tracker.md
+design_system:
+- han-design-skill-v1 (visual style), ui-ux-pro-max (UX mechanics)
 delivery:
 - channel: send_message_to_thread | lane_inbox | manual
 - target_thread_id:
 - delivery_status: pending | sent | failed | stale
 - sent_at:
 ```
+
+**`design_system` (G15).** For UI work (the frontend lane, or any request marked
+`user_facing: true`) this line records the design skills in force for the
+request. The DEFAULT for UI work is both skills with a division of labor:
+`han-design-skill-v1` owns the VISUAL STYLE (the Han house aesthetic - typography,
+color, layout mood), and `ui-ux-pro-max` owns the UX MECHANICS (interaction,
+accessibility, responsive behavior, component/chart/table usability). On a
+conflict, a visual call goes to `han-design-skill-v1` and a usability/
+accessibility call goes to `ui-ux-pro-max`. The human's explicit choice ALWAYS
+overrides this default and is recorded here, on the request the UI lane reads
+(this per-request envelope line is the chosen record over a separate decision
+entry). Skills are looked up by NAME in the host's standard skills locations
+(e.g. `~/.codex/skills/<name>`); an absent skill is noted in the worklog and the
+lane proceeds with plain good practice - never a blocker. Omit or leave this line
+blank for non-UI requests. See `SKILL.md` "Design Skills For UI Work".
 
 ## IMPLEMENTATION_REQUEST
 
@@ -345,6 +453,7 @@ source_docs:
 - docs/loop/tracker.md
 - docs/product/specs/mvp-color-match.md
 goal: Implement the MVP color matching flow from the approved spec.
+user_facing: false
 scope:
 - src/**
 - tests/**
@@ -352,14 +461,92 @@ non_goals:
 - Do not redesign the UI shell.
 - Do not add authentication.
 acceptance_criteria:
-- User can choose foundation and lipstick shades.
-- App returns three compatible color recommendations.
-- Existing tests pass and one regression test covers the recommendation rule.
+- User can choose foundation and lipstick shades. VERIFY `python -m unittest tests.ui.test_shade_picker` (fails if either selector is missing).
+- App returns three compatible color recommendations. VERIFY `python -m unittest tests.core.test_recommend` asserts exactly three results and undertone compatibility (fails on zero, four, or an incompatible pick).
+- Existing tests pass and one regression test covers the recommendation rule. VERIFY `python -m unittest discover -s tests` (fails on any regression).
 expected_reply:
 - changed_files
 - verification commands and results
 - blockers, if any
 ```
+
+### Red-capable acceptance criteria (each criterion names a command that can FAIL)
+
+Every acceptance criterion in an `IMPLEMENTATION_REQUEST` must name the exact
+command that proves it, and that command must be **red-capable**: able to FAIL
+on that specific criterion's violation, not merely exit `0` because the code
+ran. **A criterion with no command that can go red is a vibe: sharpen it or drop
+it.** Name the command inline on the criterion (the `VERIFY <command>` suffix
+above); the implementation lane records its real exit code as evidence, and the
+completion gate reads that exit code.
+
+Exemplar pair - the difference between a vibe and a red-capable criterion:
+
+- **Bad (a vibe):** "parsing works." The obvious check - "run the parser, it
+  exits 0" - passes on garbage output: it cannot distinguish a correct parse
+  from a parser that emits `merchant="9"` and `date="2026-06-00"` and still
+  returns 0.
+- **Good (red-capable):** "`python -m unittest tests.core.test_parse_fields`
+  asserts merchant is non-numeric text, dates are valid ISO calendar days, and
+  amounts carry a sign - and FAILS on any garbage field." The command goes red
+  precisely on the failure the user would see.
+
+**Canonical counterexample (run 2).** The request
+`REQ-20260707-073729-data-eng` shipped an accepted slice whose evidence
+`REQ-20260707-073729-data-eng-iter-1-td-pdf-smoke.json` recorded `exit_code: 0`
+- yet the running app produced `merchant="9"` and `date="2026-06-00"` and
+imported 0 rows from the user's real statement. The smoke command exercised the
+plumbing and exited 0 without asserting a single field value, so it could not go
+red on exactly the defect the user hit. That is tautological evidence: a command
+whose success is indistinguishable from garbage. Red-capable criteria exist to
+make this impossible - see the review gate's tautological-evidence guard in
+`references/loop-state.md`.
+
+### Real-input correctness (field-level, not "parses without error")
+
+When `goal.md` names **human-provided real data** (for example a real TD bank
+statement PDF, an exported CSV, a real invoice), at least one acceptance
+criterion must assert **field-level correctness** on that data - not merely that
+the parser ran. "Parses without error" alone is NEVER sufficient real-data
+evidence: run 2's importer parsed without error and still produced `merchant="9"`
+and 0 imported rows.
+
+The field-level criterion must assert, against the real input or a human-approved
+redacted derivative, at minimum:
+
+- **row count > 0** - the real file actually produced transactions;
+- **valid calendar dates** - every parsed date is a real ISO calendar day (no
+  `2026-06-00`, no month 13, no day 32);
+- **merchant/payee non-empty and non-numeric** - the merchant field is real text,
+  not a stray digit like `9`;
+- **sign convention holds** - amounts carry the sign the document uses (debits
+  and credits/refunds land on the correct side).
+
+The verify command must be red-capable on each of these (it FAILS if row count is
+0, a date is invalid, a merchant is empty/numeric, or a sign is flipped).
+
+#### The redacted-sample ritual (privacy holds; evidence records only counts/booleans)
+
+Real financial input must never be copied into prompts, committed files, run
+logs, or evidence records. So the correctness check runs against a
+**human-approved redacted derivative**, approved ONCE at intake:
+
+1. **At intake**, the human approves either a sanitized excerpt (a few rows with
+   account numbers and identifying detail scrubbed) OR a field-shape spec (for
+   example: "column 1 is an ISO date, column 3 is merchant text, column 4 is a
+   signed amount; a real month has 20-60 rows"). This one approval is the whole
+   privacy gate.
+2. **Lanes verify against that approved derivative** and its field shape, never
+   against raw un-approved contents.
+3. **Evidence records only counts and booleans** - `rows_parsed: 42`,
+   `all_dates_valid: true`, `merchant_nonempty: true`, `signs_ok: true`,
+   `exit_code: 0` - and never a raw merchant string, account number, or
+   transaction line. The redacted excerpt itself lives outside the repo (or in a
+   constraints-exempted `private_samples/` path), never in `docs/loop/evidence/`.
+
+This keeps the never-upload constraint intact while still making the field-level
+criterion red-capable: the assertion runs on approved shape, the record carries
+only the pass/fail counts.
 
 ## IMPLEMENTATION_DONE
 
@@ -435,13 +622,22 @@ review_result: pass
 criteria_results:
 - Criterion 1: pass, verified by tests/recommend.test.ts
 - Criterion 2: pass, verified by manual code review
+scope_creep: none - all changed files inside the request's scope globs
+ease_of_misuse: none found - inputs cannot reach a wrong-but-accepted outcome the criteria did not forbid
 evidence:
 - npm test: passed
 remaining_risks:
-- None known.
+- None known. (any should-fix/nit findings accepted-with-notes go here)
 expected_reply:
 - Product marks the tracker checkpoint complete or sends ACCEPTANCE_DECISION.
 ```
+
+`REVIEW_DONE` records the three-category review result: the per-criterion
+`criteria_results`, a `scope_creep` line (changed files vs the request's `scope`
+globs - flag creep even if it works), and a mandatory `ease_of_misuse` line
+answering *"can a caller/input reach a wrong-but-accepted outcome the criteria
+did not forbid? Name the path or state none found."* See
+`references/loop-state.md` "Review checklist" and "Ease-of-misuse question".
 
 ## FIX_REQUEST
 
@@ -460,6 +656,7 @@ source_docs:
 - docs/product/specs/mvp-color-match.md
 failed_criteria:
 - Criterion 2 failed: recommendations do not include undertone compatibility.
+severity: blocker
 evidence:
 - tests/recommend.test.ts lacks undertone coverage.
 requested_fix:
@@ -469,6 +666,14 @@ expected_reply:
 - verification commands and results
 - blockers, if any
 ```
+
+Each `FIX_REQUEST` finding carries a `severity`: `blocker`, `should-fix`, or
+`nit`. **Only a `blocker` forces a fix cycle and increments `iteration`.**
+`should-fix`/`nit` findings may be accepted-with-notes (recorded in
+`REVIEW_DONE`'s `remaining_risks`) or batched into a follow-up request - they do
+NOT bounce the request back and do NOT increment `iteration`. A review that finds
+only nits sends `REVIEW_DONE` with the notes, not `FIX_REQUEST`. See
+`references/loop-state.md` "Finding severity".
 
 ## BLOCKED
 
@@ -489,9 +694,22 @@ blocker:
 - Missing API key for the production color catalog.
 needed_from_human:
 - Confirm whether to use a local mock catalog for MVP.
+recommended_answer:
+- Use the bundled local mock catalog for the MVP; wire the production key in a later slice.
 expected_reply:
 - Product updates scope, provides input, or marks request blocked.
 ```
+
+**Every BLOCKED / approval-needed message carries a `recommended_answer`.** The
+lane that raises the block already knows the situation best, so it proposes the
+resolution it would pick -- the human edits a proposal instead of authoring a
+decision cold. This generalizes the missing-dependency blocker's exact install
+command (below): there the recommended answer is literally the install line;
+here it is the lane's proposed scope call, default, or config. Keep it to one
+concrete, actionable line (a command, a value, or a "do X" sentence), not a
+menu. The human always overrides; the recommendation just removes the blank
+page. The dashboard renders it inline on the your-turn item so seeing the block
+and seeing the proposed answer are the same glance.
 
 ### Missing-Dependency Blocker (a blocker with a built-in exit ramp)
 
