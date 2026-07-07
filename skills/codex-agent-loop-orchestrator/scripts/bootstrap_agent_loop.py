@@ -110,6 +110,9 @@ max_fix_cycles: 3
 auto_dispatch: true
 auto_chain_next_session: false
 
+<!-- dependency_install controls the missing-dependency exit ramp (F16): ask = always ask the human before installing anything (default); auto-pip-only = a lane may auto-install a pip-installable Python package but must still ask before installing a system binary; never = never install, always stay BLOCKED for a human to resolve. Keep the "dependency_install: <value>" line format. -->
+dependency_install: ask
+
 ## Anti-Thrash Policy
 
 - Cap consecutive FIX_REQUESTED <-> IMPLEMENTING cycles for one request at `max_fix_cycles`.
@@ -495,8 +498,85 @@ deliverables exist.
 """
 
 
-# Columns of the agent-lanes.md registry table, in order.
-REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat"]
+# Columns of the agent-lanes.md registry table, in order. ``tier`` is the F8
+# advisory model-tier column (last, so header-driven readers and any code that
+# treats ``heartbeat`` as a fixed position keep working). Its values are the
+# ABSTRACT tier words below, never a concrete model name.
+REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat", "tier"]
+
+# F8 per-lane model-tier policy (advisory; the actual tiers are host-specific and
+# resolved at runtime from the create_thread tool's own model-parameter
+# description). Tiers are expressed ABSTRACTLY here and NEVER as model names:
+#   HIGHEST_TIER        -> the highest tier the calling host offers.
+#   SECOND_HIGHEST_TIER -> the next tier down.
+# Policy: coding lanes (they build code) recommend the highest tier; every other
+# lane recommends the second-highest. The human may opt a lane DOWN in the
+# registry; the skill never silently opts a lane UP past this policy.
+HIGHEST_TIER = "highest"
+SECOND_HIGHEST_TIER = "second-highest"
+
+# Name tokens that mark a lane as a CODING lane (builds code -> highest tier).
+# Matched as case-insensitive substrings so custom team names still classify
+# (e.g. "data-engineering" -> data-eng, "ui-frontend" -> frontend). Kept as
+# tokens, not exact names, because real teams rename lanes.
+CODING_LANE_TOKENS = (
+    "implementation",
+    "backend",
+    "data-eng",
+    "dataeng",
+    "frontend",
+    "fullstack",
+    "full-stack",
+    "infra",
+    "platform",
+)
+
+
+def recommended_tier_for(lane: str) -> str:
+    """Return the advisory tier word for ``lane`` per the F8 policy.
+
+    Coding lanes (name contains a CODING_LANE_TOKENS token) recommend the
+    highest tier; every other lane recommends the second-highest. Abstract tier
+    words only -- never a model name.
+    """
+    low = (lane or "").strip().lower()
+    for token in CODING_LANE_TOKENS:
+        if token in low:
+            return HIGHEST_TIER
+    return SECOND_HIGHEST_TIER
+
+
+def render_registry(rows: dict[str, dict[str, str]]) -> str:
+    """Render the full agent-lanes.md text from a lane->row mapping.
+
+    Single source of truth for the registry table layout (columns + cell order),
+    so every writer -- bootstrap's template/registration, --set-thread adoption,
+    and the dashboard's add_lane -- emits the SAME columns and can never clobber
+    a trailing column (like the F8 ``tier``) by rebuilding with a short row.
+    Missing cells fall back to sensible defaults; ``tier`` defaults to the
+    policy recommendation for the lane so an upgraded legacy row gains one.
+    """
+    lines = [
+        "# Agent Lanes",
+        "",
+        "| " + " | ".join(REGISTRY_COLUMNS) + " |",
+        "| " + " | ".join("---" for _ in REGISTRY_COLUMNS) + " |",
+    ]
+    for lane in sorted(rows):
+        row = rows[lane]
+        lines.append(
+            "| {lane} | {thread_id} | {role} | {write_scope} | {worklog} | {status} | {heartbeat} | {tier} |".format(
+                lane=lane,
+                thread_id=row.get("thread_id", "UNVERIFIED"),
+                role=row.get("role", ""),
+                write_scope=row.get("write_scope", ""),
+                worklog=row.get("worklog", ""),
+                status=row.get("status", "needs-thread"),
+                heartbeat=row.get("heartbeat", "-") or "-",
+                tier=(row.get("tier") or "").strip() or recommended_tier_for(lane),
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 def parse_thread_mapping(values: list[str]) -> dict[str, str]:
@@ -541,8 +621,13 @@ def parse_presets(values: list[str]) -> dict[str, dict[str, str]]:
 def existing_rows(path: Path) -> dict[str, dict[str, str]]:
     """Read existing registry rows.
 
-    Backward compatible with the legacy 6-column table (no heartbeat column).
-    Missing trailing cells default to '-' so older registries upgrade cleanly.
+    Backward compatible with the legacy 6-column table (no heartbeat column) and
+    the 7-column table (no tier column). Missing trailing cells default so older
+    registries upgrade cleanly: a missing ``heartbeat`` becomes '-', and a
+    missing ``tier`` is left blank here so render_registry fills it with the
+    policy recommendation. An EXISTING tier cell is preserved verbatim, so a
+    human opt-DOWN survives every round-trip (template rerun, --set-thread
+    adoption, dashboard add_lane).
     """
     if not path.exists():
         return {}
@@ -566,6 +651,9 @@ def existing_rows(path: Path) -> dict[str, dict[str, str]]:
         worklog = cells[4]
         status = cells[5]
         heartbeat = cells[6] if len(cells) >= 7 else "-"
+        # tier is the 8th cell when present; blank means "not yet set" so the
+        # renderer supplies the policy default without overriding an opt-down.
+        tier = cells[7] if len(cells) >= 8 else ""
         rows[lane] = {
             "thread_id": thread_id,
             "role": role,
@@ -573,6 +661,7 @@ def existing_rows(path: Path) -> dict[str, dict[str, str]]:
             "worklog": worklog,
             "status": status,
             "heartbeat": heartbeat or "-",
+            "tier": tier,
         }
     return rows
 
@@ -600,7 +689,13 @@ def main() -> int:
         "--set-thread",
         action="append",
         default=[],
-        help="Set a lane thread ID, e.g. --set-thread product=codex:019...",
+        help=(
+            "Set a lane thread ID, e.g. --set-thread product=codex:019... "
+            "The lane must already have a registry row on disk (or be "
+            "registered by this same invocation); adoption fills the EXISTING "
+            "row in place and never creates a new one. Naming a lane with no "
+            "row is a loud error, not a silent no-op."
+        ),
     )
     parser.add_argument(
         "--extra-lane",
@@ -653,6 +748,29 @@ def main() -> int:
             "--extra-lane."
         )
 
+    # F11 completion: --set-thread adoption fills an EXISTING registry row. The
+    # on-disk registry is the source of truth for which lanes exist, so a lane
+    # already on disk is adoptable even when this invocation's lane_defaults do
+    # not mention it (the real dogfood case: a custom lane adopted in a later,
+    # flagless run). A lane with NO row on disk and NOT registered by this
+    # invocation is an error: fail loudly BEFORE any writes -- a silently
+    # ignored adoption line is worse than no ritual, and creating a fresh row
+    # here would mint exactly the duplicate the adoption ritual exists to
+    # prevent.
+    if thread_mapping:
+        known_lanes = set(existing_rows(registry)) | set(lane_defaults)
+        unknown = sorted(set(thread_mapping) - known_lanes)
+        if unknown:
+            raise SystemExit(
+                "--set-thread names lane(s) with no registry row: {0}. "
+                "Known lanes: {1}. Fix the lane name, or register the lane "
+                "first (--extra-lane/--preset); adoption fills an EXISTING "
+                "row and never creates one.".format(
+                    ", ".join(unknown),
+                    ", ".join(sorted(known_lanes)) or "(none)",
+                )
+            )
+
     loop_dir.mkdir(parents=True, exist_ok=True)
     lanes_dir.mkdir(parents=True, exist_ok=True)
     messages_dir.mkdir(parents=True, exist_ok=True)
@@ -698,13 +816,26 @@ def main() -> int:
                 "worklog": worklog,
                 "status": "needs-thread",
                 "heartbeat": "-",
+                # F8 advisory tier: policy default for a brand-new lane.
+                "tier": recommended_tier_for(lane),
             },
         )
         # Ensure any pre-existing row gains a heartbeat default on upgrade.
         rows[lane].setdefault("heartbeat", "-")
-        if lane in thread_mapping:
-            rows[lane]["thread_id"] = thread_mapping[lane]
-            rows[lane]["status"] = "registered"
+        # Ensure any pre-existing (legacy) row gains a tier on upgrade WITHOUT
+        # overriding a human opt-down: only fill it when it is missing or blank.
+        if not (rows[lane].get("tier") or "").strip():
+            rows[lane]["tier"] = recommended_tier_for(lane)
+
+    # Apply --set-thread adoption over the FULL row set -- existing on-disk rows
+    # included -- not just this invocation's lane_defaults (F11 completion: the
+    # documented adoption one-liner must fill a custom lane's EXISTING row even
+    # in a later, flagless run). Every lane here passed the validation above, so
+    # rows[lane] is guaranteed to exist: flip thread_id and status in place;
+    # tier and every other cell are preserved (render_registry keeps them).
+    for lane, thread_id in thread_mapping.items():
+        rows[lane]["thread_id"] = thread_id
+        rows[lane]["status"] = "registered"
 
     for lane in sorted(rows):
         lane_dir = lanes_dir / lane
@@ -727,26 +858,7 @@ def main() -> int:
         if write_if_missing(workspace_readme, LANE_WORKSPACE_README_TEMPLATE.format(title=title)):
             wrote.append(workspace_readme)
 
-    lines = [
-        "# Agent Lanes",
-        "",
-        "| " + " | ".join(REGISTRY_COLUMNS) + " |",
-        "| " + " | ".join("---" for _ in REGISTRY_COLUMNS) + " |",
-    ]
-    for lane in sorted(rows):
-        row = rows[lane]
-        lines.append(
-            "| {lane} | {thread_id} | {role} | {write_scope} | {worklog} | {status} | {heartbeat} |".format(
-                lane=lane,
-                thread_id=row["thread_id"],
-                role=row["role"],
-                write_scope=row["write_scope"],
-                worklog=row["worklog"],
-                status=row["status"],
-                heartbeat=row.get("heartbeat", "-") or "-",
-            )
-        )
-    registry.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    registry.write_text(render_registry(rows), encoding="utf-8")
 
     print(f"wrote {registry}")
     if wrote:
@@ -755,6 +867,28 @@ def main() -> int:
     print(f"ensured {messages_dir}")
     print(f"ensured {evidence_dir}")
     print(f"ensured {memory_dir}")
+    if thread_mapping:
+        # Thread-title guidance (F1): title each Codex thread with the BARE lane
+        # name only. Do not prefix a project name or a "loop lane:" boilerplate
+        # (threads came out "<project> loop lane: review"); the bare lane name is
+        # what the loop refers to. Project context, if needed, lives in the
+        # dashboard project name, not the thread title.
+        for lane in sorted(thread_mapping):
+            print(
+                "next: set_thread_title({thread!r}, {lane!r})  # bare lane name, no project/'loop lane:' prefix".format(
+                    thread=thread_mapping[lane], lane=lane
+                )
+            )
+            # F8 tier hint: print the advisory recommended tier alongside the
+            # create_thread/set_thread_title hints (abstract tier word, never a
+            # model name). When the host's create_thread accepts a model param,
+            # pass this tier's resolved model; otherwise the human picks this
+            # tier by hand when opening the thread.
+            print(
+                "  tier: {tier} available  # advisory: pass model={tier}-available tier to create_thread, or pick it by hand".format(
+                    tier=(rows.get(lane, {}).get("tier") or recommended_tier_for(lane)).strip()
+                )
+            )
     return 0
 
 

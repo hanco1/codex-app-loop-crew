@@ -22,6 +22,14 @@ Required:
 
 Do not start loop engineering for a tiny one-off edit, a vague idea without acceptance criteria, or a task that requires credentials, production actions, deletion, billing changes, or private external data without approval.
 
+### Task-Size Gate
+
+Before starting a loop, size the task. If the work plausibly fits **one session** - roughly under two hours, one agent, low audit/recoverability need, and no sensitive-data gates - say so and **recommend a direct session instead of a loop**. The loop's process cost (evidence trail, independent review, durable handoff state) only pays for itself on multi-session, multi-agent, sensitive-data-gated, or must-survive-compaction work. Spinning up a loop for a one-shot MVP makes the task more complicated than it is.
+
+### Intake, Not A Placeholder Block
+
+When `goal.md`/`Done When` still hold bootstrap placeholders, there is **no objective yet, which is the ABSENCE of a request** - not a blocked request. Run an intake conversation with the human (objective + Done-When; build-the-software vs be-the-operations-team; discipline-cut vs feature-cut) and create the first request **only after** the human answers. Never mint a `PLANNED -> BLOCKED` "no goal yet" placeholder request: a red BLOCKED row before first contact misreports absence as failure.
+
 ## Checkpoint Close Gate
 
 A checkpoint is closed enough to hand off only when:
@@ -34,6 +42,17 @@ A checkpoint is closed enough to hand off only when:
 - Blockers and risks are documented.
 
 If any item is missing, continue in the current session until the checkpoint can be audited.
+
+### In-Turn Report-Back (mandatory before the turn ends)
+
+Codex threads run one turn and stop, so the handoff must finish inside the same turn as the work. **Your turn is not finished until you have, in this turn:**
+
+1. sent the reply message (`send_message_to_thread` / `codex_app.*`, or the `deliver_message.py` file-inbox fallback);
+2. updated `requests.md` (advance status + owner);
+3. appended the `loop-run-log.md` row for that transition;
+4. refreshed your heartbeat (the `heartbeat` column in `agent-lanes.md` and the `last_updated`/`heartbeat` mirror in lane `current.md`).
+
+Do not end the turn after the work (even after `SHIP_CHECK_OK`) with the reply, ledger, run-log, or heartbeat left undone: there is no guaranteed next turn, and the requester will wait forever. The doctor reports a done-but-unadvanced request as `stalled_handoff`.
 
 ## Handoff Readiness Gate
 
@@ -221,6 +240,31 @@ budget_exhausted: true -> stop, mark BLOCKED, report remaining work
 - When `budget_exhausted: true`, do not send new `IMPLEMENTATION_REQUEST`s, do not auto-chain, and do not open a continuation thread. Move the active request to `BLOCKED` and append the transition to the run log.
 - Report spent versus budget and the next action a human can authorize (raise budget, re-scope, or stop).
 - Treat budget exhaustion like any other human gate: it requires explicit approval to resume.
+
+## Missing-Dependency Gate
+
+A `BLOCKED` on a missing tool or package is a distinct blocker type with a
+built-in exit ramp, not a dead end. The lane records exactly what is missing and
+the exact install command, distinguishing a `pip`-installable package from a
+`system` binary that needs an installer/choco, and marks the `BLOCKED` message
+with the greppable `blocker: missing_dependency` format (see
+`references/protocol.md` "Missing-Dependency Blocker").
+
+Core rule:
+
+```text
+missing dependency -> BLOCKED with install commands + ask the human, per loop-policy dependency_install
+```
+
+- `dependency_install` in `loop-policy.md` decides the flow: `ask` (default,
+  always ask), `auto-pip-only` (may auto-install a `pip` package but always asks
+  before a `system` binary), or `never` (never install; stay `BLOCKED`).
+- Installing mutates the human's environment, so a `system` binary always needs
+  explicit approval regardless of the knob.
+- On approval, install, re-run the exact failed verify command, record fresh
+  evidence, and unblock the SAME `request_id` with an incremented `iteration` -
+  never a new request, and never accept on the assumption that the install
+  worked. The completion gate must see real re-verified evidence.
 
 ## Heartbeat / Orphan Recovery
 

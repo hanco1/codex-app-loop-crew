@@ -5,7 +5,7 @@ A tiny stdlib-only web server that renders the loop's durable files as a live
 page. It is a VIEW over ``docs/loop`` and nothing more: agents never read it,
 deleting it does not affect the loop, and it holds no state of its own.
 
-Endpoints (only four, everything else is 404/405):
+Endpoints (only five, everything else is 404/405):
 
 - ``GET  /``           serves ``dashboard.html`` (the file next to this script);
 - ``GET  /api/state``  returns a JSON snapshot assembled by READING files only:
@@ -32,9 +32,16 @@ Endpoints (only four, everything else is 404/405):
   ``loop-policy.md`` atomically (preserving the rest of the file), and returns
   ``{"ok": true, "max_fix_cycles": ...}`` or a 400 with a reason. This is a
   HUMAN control that bounds fix-cycle token burn; agents read the policy file,
-  never this API.
+  never this API;
+- ``POST /api/project`` a write. Body ``{"name": <str>}``. Validates the name
+  (non-empty after trim, no control chars / line breaks, <= 80 chars) and
+  writes it atomically into ``docs/loop/project.md`` -- a dedicated display-only
+  file that documents its own convention. This is the THIRD AND FINAL write
+  endpoint: the human project label shown in the masthead + browser tab title.
 
-The server binds ``127.0.0.1`` only. No other endpoint writes anything.
+The server binds ``127.0.0.1`` only. The write endpoints are EXACTLY three
+(``/api/lanes``, ``/api/policy``, ``/api/project``); no other endpoint writes
+anything.
 
 Codex host coupling lives in ONE place: the ``usage`` and ``account`` sections
 are the only ones that read the Codex host's UNDOCUMENTED data surfaces (session
@@ -163,12 +170,55 @@ WORKLOG_TAIL = 15
 RUNLOG_TAIL = 20
 CURRENT_MAX_CHARS = 4000
 
-# Registry columns, in the order bootstrap writes them.
-REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat"]
+# Registry columns, in the order bootstrap writes them. The trailing ``tier`` is
+# the F8 advisory model-tier column; parsing here is header-driven so the exact
+# order only matters for the shared render_registry writer in bootstrap.
+REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat", "tier"]
 
 # A heartbeat older than this many minutes is flagged "stale" in the freshness
 # label. This is display-only; the doctor keeps its own orphan-suspect logic.
 STALE_HEARTBEAT_MINS = 30
+
+# ---- Tracker progress (F14) ----
+# A tracker checkbox line: "- [ ] text" / "- [x] ..." / "- [~] ..." / "- [!] ...".
+# Mirrors the doctor's CHECKBOX_RE exactly so the two agree on what a checkpoint
+# is. Only the "## Checkpoints" section is treated as the milestone list; the
+# "Done When" / "Human QA" checkboxes below it are acceptance criteria, not
+# milestones, and are excluded from the progress count.
+_CHECKBOX_RE = re.compile(r"^\s*-\s+\[(?P<status>[ xX~!])\]\s+(?P<text>.+?)\s*$")
+# Heading that opens the milestone list in tracker.md (case-insensitive; a
+# trailing word is tolerated). Any later "## <other>" heading closes it.
+_TRACKER_CHECKPOINTS_HEADING = "checkpoints"
+# Max characters of a checkpoint's human title surfaced to the page. Titles are
+# short by convention; this only guards against a pathological one-line essay.
+CHECKPOINT_TITLE_MAX_CHARS = 200
+
+# ---- Project name (F2) ----
+# The project name is a HUMAN label shown in the masthead + browser <title>.
+# It persists in a single dedicated loop file, ``project.md`` (chosen over a
+# key in loop-policy.md so the write never risks disturbing the machine-read
+# policy line). The file documents itself; the value is the first non-heading,
+# non-blank, non-comment line. Read-only if absent -> the default (loop-dir's
+# project-root folder name) is used and no file is written until a rename POST.
+PROJECT_FILE_NAME = "project.md"
+# Validation for a submitted project name: printable, trimmed, length-bounded,
+# and free of control characters / line breaks (it lands in an HTML <title> and
+# a one-line file, both of which a newline would corrupt).
+PROJECT_NAME_MAX_CHARS = 80
+_PROJECT_NAME_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Self-documenting header written above the value so the file explains itself
+# (the plan requires the chosen file to document the convention in the file).
+_PROJECT_FILE_TEMPLATE = (
+    "# Project\n"
+    "\n"
+    "<!-- The human-facing project name shown in the loop dashboard masthead\n"
+    "     and the browser tab title. The dashboard's POST /api/project control\n"
+    "     rewrites the single value line below (atomic temp + os.replace). The\n"
+    "     value is the first non-heading, non-blank, non-comment line. Agents do\n"
+    "     not read this file; it is a display label only. -->\n"
+    "\n"
+    "{name}\n"
+)
 
 _DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 
@@ -408,6 +458,205 @@ def _current_summary(lanes_dir: Path, lane: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Tracker progress (F14): parse the "## Checkpoints" milestone list
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint_status(raw: str) -> str:
+    """Map a checkbox marker char to a display state.
+
+    ``x``/``X`` -> ``done``, ``~`` -> ``current`` (in progress), ``!`` ->
+    ``blocked``, anything else (a space) -> ``todo``.
+    """
+    if raw in ("x", "X"):
+        return "done"
+    if raw == "~":
+        return "current"
+    if raw == "!":
+        return "blocked"
+    return "todo"
+
+
+def _first_request_id(text: str) -> str:
+    """Return the first REQ-... id mentioned in ``text`` (or '')."""
+    m = re.search(r"REQ-\d{8}-\d{6}-[a-z0-9-]+", text)
+    return m.group(0) if m else ""
+
+
+def parse_tracker_progress(loop_dir: Path) -> dict[str, Any]:
+    """Parse ``tracker.md``'s ``## Checkpoints`` section into progress data.
+
+    Returns a structure the dashboard renders as a prominent Progress view:
+
+    - ``available`` (bool): False when tracker.md is missing or has no
+      ``## Checkpoints`` section (the page then shows an empty progress state);
+    - ``total`` / ``done`` / ``blocked`` (ints): milestone counts;
+    - ``current_index`` (int or None): the index of the current milestone --
+      the first ``[~]`` in-progress item, else the first ``[ ]`` todo item;
+    - ``checkpoints`` (list): each ``{index, status, title, request_id}`` where
+      ``status`` is done|current|blocked|todo and ``request_id`` is the first
+      REQ id found in that checkpoint's own text (for cross-referencing).
+
+    ONLY the ``## Checkpoints`` section is treated as milestones; the
+    ``Done When`` / ``Human QA`` acceptance checkboxes below it are excluded
+    (they are criteria, not progress). Never raises; a malformed tracker
+    degrades to ``available: False``.
+    """
+    text = _read_text(loop_dir / "tracker.md")
+    if not text:
+        return {"available": False, "total": 0, "done": 0, "blocked": 0,
+                "current_index": None, "checkpoints": []}
+
+    in_section = False
+    checkpoints: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            # Enter on "## Checkpoints"; any OTHER section heading exits.
+            if heading == _TRACKER_CHECKPOINTS_HEADING or heading.startswith(
+                _TRACKER_CHECKPOINTS_HEADING + " "
+            ):
+                in_section = True
+            else:
+                in_section = False
+            continue
+        if not in_section:
+            continue
+        m = _CHECKBOX_RE.match(raw_line)
+        if not m:
+            continue
+        title = m.group("text").strip()
+        if len(title) > CHECKPOINT_TITLE_MAX_CHARS:
+            title = title[:CHECKPOINT_TITLE_MAX_CHARS].rstrip() + "..."
+        checkpoints.append(
+            {
+                "index": len(checkpoints),
+                "status": _checkpoint_status(m.group("status")),
+                "title": title,
+                "request_id": _first_request_id(m.group("text")),
+            }
+        )
+
+    if not checkpoints:
+        return {"available": False, "total": 0, "done": 0, "blocked": 0,
+                "current_index": None, "checkpoints": []}
+
+    done = sum(1 for c in checkpoints if c["status"] == "done")
+    blocked = sum(1 for c in checkpoints if c["status"] == "blocked")
+    # The current milestone: first in-progress ([~]), else first todo ([ ]),
+    # else None (all done/blocked). Blocked items are flagged but are not the
+    # "current" pointer -- the human acts on them via the your-turn banner.
+    current_index: Optional[int] = None
+    for c in checkpoints:
+        if c["status"] == "current":
+            current_index = c["index"]
+            break
+    if current_index is None:
+        for c in checkpoints:
+            if c["status"] == "todo":
+                current_index = c["index"]
+                break
+    return {
+        "available": True,
+        "total": len(checkpoints),
+        "done": done,
+        "blocked": blocked,
+        "current_index": current_index,
+        "checkpoints": checkpoints,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Project name (F2): read-only reader (the writer lives further down)
+# ---------------------------------------------------------------------------
+
+
+def _default_project_name(loop_dir: Path) -> str:
+    """Derive the default project name from the loop-dir's project root.
+
+    The loop dir is conventionally ``<project>/docs/loop``; the project root is
+    the folder two levels up. Falls back through the nearest sensible ancestor
+    so an unusual layout still yields a non-empty label.
+    """
+    try:
+        resolved = loop_dir.resolve()
+    except OSError:
+        resolved = loop_dir
+    parts = [p for p in resolved.parts]
+    # Strip a trailing ``docs/loop`` (case-insensitive) to reach the root.
+    lowered = [p.lower() for p in parts]
+    if len(lowered) >= 2 and lowered[-1] == "loop" and lowered[-2] == "docs":
+        root_parts = parts[:-2]
+    else:
+        root_parts = parts
+    for candidate in reversed(root_parts):
+        name = candidate.strip().strip("\\/").strip()
+        # Skip a bare drive like "C:" or an empty separator remnant.
+        if name and not re.fullmatch(r"[A-Za-z]:", name):
+            return name
+    return "loop"
+
+
+def _read_project_name_value(loop_dir: Path) -> Optional[str]:
+    """Return the stored project name from ``project.md``, or None if unset.
+
+    The value is the first non-heading, non-blank, non-HTML-comment line. HTML
+    comments may span multiple lines; they are skipped wholesale. Returns None
+    when the file is absent or carries no value line (caller falls back to the
+    default). Never raises.
+    """
+    text = _read_text(loop_dir / PROJECT_FILE_NAME)
+    if not text:
+        return None
+    in_comment = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+                after = line.split("-->", 1)[1].strip()
+                if after and not after.startswith("#"):
+                    return after[:PROJECT_NAME_MAX_CHARS]
+            continue
+        if line.startswith("<!--"):
+            if "-->" not in line:
+                in_comment = True
+                continue
+            after = line.split("-->", 1)[1].strip()
+            if after and not after.startswith("#"):
+                return after[:PROJECT_NAME_MAX_CHARS]
+            continue
+        if line.startswith("#"):
+            continue
+        return line[:PROJECT_NAME_MAX_CHARS]
+    return None
+
+
+def read_project(loop_dir: Path) -> dict[str, Any]:
+    """Read the project name for /api/state (value + whether it is stored).
+
+    Returns ``{"name": str, "is_default": bool, "source_present": bool}``.
+    ``is_default`` is True when no name is stored and the loop-dir-derived
+    default is used; ``source_present`` reports whether project.md exists.
+    """
+    stored = _read_project_name_value(loop_dir)
+    if stored:
+        return {
+            "name": stored,
+            "is_default": False,
+            "source_present": (loop_dir / PROJECT_FILE_NAME).exists(),
+        }
+    return {
+        "name": _default_project_name(loop_dir),
+        "is_default": True,
+        "source_present": (loop_dir / PROJECT_FILE_NAME).exists(),
+    }
+
+
 def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
     """Parse every ``evidence/*.json`` (non-recursive) into simple records.
 
@@ -492,6 +741,7 @@ def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
         return {"available": False, "reason": "doctor error: {0}".format(exc)}
 
     decisions = result.get("decisions") or {}
+    requests = result.get("requests") or {}
     return {
         "available": True,
         "ok": result.get("ok"),
@@ -507,6 +757,20 @@ def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
             "stale": decisions.get("stale", 0),
             "malformed": decisions.get("malformed", 0),
         },
+        # Batch 1 machine-readable fields the dashboard RENDERS (F6/F9/F10/F11/
+        # F13/F16). Passed through verbatim; the page decides how to surface
+        # each (your-turn banner, needs-you sorting, honest heartbeat labels).
+        "heartbeat_gap_owners": result.get("heartbeat_gap_owners", []),
+        "stalled_handoffs": result.get("stalled_handoffs", []),
+        "workerless_dependencies": result.get("workerless_dependencies", []),
+        "missing_dependency_blockers": result.get("missing_dependency_blockers", []),
+        "git_present": result.get("git_present"),
+        "hook_installed": result.get("hook_installed"),
+        # Non-terminal requests carry the human-readable next_action + owner so
+        # a lane card can name the goal of its current request (F14) and the
+        # your-turn banner can name the advancing thread (F6/F3 discriminator:
+        # "any request advancing" => a waiting lane is not a halt).
+        "non_terminal_requests": requests.get("non_terminal", []),
         "issues": result.get("issues", []),
         "warnings": result.get("warnings", []),
     }
@@ -599,6 +863,47 @@ def _compute_account_stale(account: dict[str, Any], usage: dict[str, Any]) -> No
         account["stale_reason"] = "auth_newer_than_snapshot"
 
 
+# Signature fragments of the bootstrap goal.md placeholder (Objective +
+# Done-When lines). If goal.md still contains these AND no real request exists,
+# the loop has no objective yet -> the friendly "awaiting objective" state (F3),
+# never a failure. Kept as substrings so minor template edits still match.
+_GOAL_PLACEHOLDER_MARKERS = (
+    "State the single durable objective",
+    "Define the first concrete, verifiable completion condition",
+)
+
+
+def _is_awaiting_objective(loop_dir: Path, requests: list[dict[str, str]]) -> bool:
+    """True when the loop has no real objective yet (F3 intake state).
+
+    Detected when goal.md still carries the placeholder template markers AND
+    there is no non-placeholder request in the queue. This is the ABSENCE of a
+    goal -- the dashboard shows a friendly "awaiting objective" empty state,
+    which must never read as a failure. Never raises.
+    """
+    goal_text = _read_text(loop_dir / "goal.md")
+    if not goal_text:
+        # No goal.md at all: only "awaiting" if there is also no real request.
+        placeholder_goal = True
+    else:
+        placeholder_goal = all(m in goal_text for m in _GOAL_PLACEHOLDER_MARKERS)
+    if not placeholder_goal:
+        return False
+    # Any request that is not itself a placeholder means work has begun.
+    for req in requests:
+        rid = (req.get("request_id", "") or "").strip()
+        status = (req.get("status", "") or "").strip().upper()
+        if not rid:
+            continue
+        # A "no goal yet" placeholder request (the old F3 anti-pattern) does not
+        # count as real work; a genuine request in any lifecycle state does.
+        blob = " ".join(str(v) for v in req.values()).lower()
+        if "no goal yet" in blob or "placeholder" in blob:
+            continue
+        return False
+    return True
+
+
 def build_state(
     loop_dir: Path, now: Optional[datetime] = None, refresh: bool = False
 ) -> dict[str, Any]:
@@ -633,6 +938,15 @@ def build_state(
 
     bootstrapped = registry_path.exists()
 
+    # Requests queue (parsed first so lane cards can cross-reference the
+    # human-readable goal/next_action of the lane's CURRENT request -- F14).
+    requests = _parse_md_table(requests_path)
+    requests_by_id: dict[str, dict[str, str]] = {}
+    for req in requests:
+        rid = (req.get("request_id", "") or "").strip()
+        if rid:
+            requests_by_id[rid] = req
+
     # Registry rows + per-lane detail.
     lane_rows = _parse_md_table(registry_path)
     lanes: list[dict[str, Any]] = []
@@ -641,27 +955,43 @@ def build_state(
         if not lane:
             continue
         detail = _current_summary(lanes_dir, lane)
+        # F14: attach the human-readable goal of the lane's current request.
+        # The request row's ``next_action`` is the plainest human sentence
+        # available; its ``status`` is the machine token. This lets the card
+        # lead with WHAT is being worked on and demote the raw REQ id.
+        summary = detail["summary"]
+        rid = (summary.get("current_request_id", "") or "").strip()
+        req_row = requests_by_id.get(rid) if rid else None
+        current_request: dict[str, Any] = {}
+        if req_row is not None:
+            current_request = {
+                "request_id": rid,
+                "status": (req_row.get("status", "") or "").strip(),
+                "owner_lane": (req_row.get("owner_lane", "") or req_row.get("owner", "") or "").strip(),
+                "goal": (req_row.get("next_action", "") or "").strip(),
+                "iteration": (req_row.get("iteration", "") or req_row.get("iter", "") or "").strip(),
+            }
         lanes.append(
             {
                 "lane": lane,
                 "thread_id": (row.get("thread_id", "") or "").strip(),
                 "role": (row.get("role", "") or "").strip(),
                 "write_scope": (row.get("write_scope", "") or "").strip(),
+                # F8 advisory model tier (abstract word from agent-lanes.md).
+                "recommended_tier": (row.get("tier", "") or "").strip(),
                 "status": _lane_status_label(row),
                 "status_raw": (row.get("status", "") or "").strip(),
                 "heartbeat": _heartbeat_freshness(
                     row.get("heartbeat", "") or row.get("last_heartbeat", ""), now
                 ),
                 "current": detail["current"],
-                "summary": detail["summary"],
+                "summary": summary,
+                "current_request": current_request,
                 "worklog_tail": detail["worklog_tail"],
                 "workspace_files": detail["workspace_files"],
                 "workspace_count": detail["workspace_count"],
             }
         )
-
-    # Requests queue.
-    requests = _parse_md_table(requests_path)
 
     # Evidence records.
     evidence = _load_evidence_records(evidence_dir)
@@ -674,6 +1004,14 @@ def build_state(
 
     # Current anti-thrash cap (read-only view of loop-policy.md).
     policy = read_max_fix_cycles(loop_dir)
+
+    # Tracker progress (F14) + human project name (F2).
+    tracker_progress = parse_tracker_progress(loop_dir)
+    project = read_project(loop_dir)
+    # Awaiting-objective state (F3): a fresh loop whose goal.md is still the
+    # placeholder template AND that has no real requests yet. This is the
+    # ABSENCE of a goal, rendered as a friendly empty state -- never a failure.
+    awaiting_objective = _is_awaiting_objective(loop_dir, requests)
 
     # Codex usage snapshot, delegated to the host probe. Guarded end to end so a
     # missing probe module or a parser hiccup never blocks the rest of the state;
@@ -719,6 +1057,9 @@ def build_state(
         "doctor": doctor_snapshot,
         "policy": policy,
         "usage": usage,
+        "tracker_progress": tracker_progress,
+        "project": project,
+        "awaiting_objective": awaiting_objective,
     }
 
 
@@ -807,6 +1148,9 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
                 "worklog": (row.get("worklog", "") or "").strip(),
                 "status": (row.get("status", "") or "").strip(),
                 "heartbeat": (row.get("heartbeat", "") or "-").strip() or "-",
+                # Preserve the F8 advisory tier verbatim (a human opt-down must
+                # survive a POST /api/lanes rewrite).
+                "tier": (row.get("tier", "") or "").strip(),
             }
 
     worklog = "{0}/lanes/{1}/worklog.md".format(str(loop_dir).replace("\\", "/"), lane)
@@ -817,6 +1161,9 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
         "worklog": worklog,
         "status": "needs-thread",
         "heartbeat": "-",
+        # F8 advisory tier: policy default for the new lane (render_registry
+        # fills it from recommended_tier_for even if left blank here).
+        "tier": "",
     }
 
     # Create the lane directory + per-lane files by REUSING bootstrap's
@@ -845,7 +1192,6 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
             bootstrap_agent_loop.LANE_WORKSPACE_README_TEMPLATE.format(title=title),
         ):
             created_files.append(str(workspace_readme).replace("\\", "/"))
-        columns = bootstrap_agent_loop.REGISTRY_COLUMNS
     else:
         return {
             "ok": False,
@@ -853,26 +1199,10 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
         }
 
     # Rebuild the registry table from the full row set and write it atomically.
-    lines = [
-        "# Agent Lanes",
-        "",
-        "| " + " | ".join(columns) + " |",
-        "| " + " | ".join("---" for _ in columns) + " |",
-    ]
-    for name in sorted(rows):
-        row = rows[name]
-        lines.append(
-            "| {lane} | {thread_id} | {role} | {write_scope} | {worklog} | {status} | {heartbeat} |".format(
-                lane=name,
-                thread_id=row.get("thread_id", "UNVERIFIED"),
-                role=row.get("role", ""),
-                write_scope=row.get("write_scope", ""),
-                worklog=row.get("worklog", ""),
-                status=row.get("status", "needs-thread"),
-                heartbeat=row.get("heartbeat", "-") or "-",
-            )
-        )
-    _atomic_write(registry_path, "\n".join(lines) + "\n")
+    # Reuse bootstrap's render_registry so the column set (including the F8
+    # advisory ``tier`` column) is defined in exactly one place -- a short
+    # rebuild here would otherwise silently drop the tier column for every lane.
+    _atomic_write(registry_path, bootstrap_agent_loop.render_registry(rows))
 
     return {
         "ok": True,
@@ -880,6 +1210,8 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
         "role": role,
         "write_scope": write_scope,
         "status": "needs-thread",
+        # F8 advisory tier the new lane was registered with (policy default).
+        "tier": bootstrap_agent_loop.recommended_tier_for(lane),
         "created_files": created_files,
     }
 
@@ -982,6 +1314,63 @@ def set_max_fix_cycles(loop_dir: Path, value: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The third (and final) write path: set the project name in project.md
+# ---------------------------------------------------------------------------
+
+
+def set_project_name(loop_dir: Path, value: Any) -> dict[str, Any]:
+    """Validate and write the human project name into ``project.md`` atomically.
+
+    Steps:
+    1. coerce ``value`` to a string, trim it, and validate: non-empty after
+       trim, no control characters / line breaks, at most
+       ``PROJECT_NAME_MAX_CHARS`` chars;
+    2. render the self-documenting ``project.md`` (a heading + a comment that
+       explains the convention + the single value line);
+    3. write via temp file + ``os.replace`` (atomic) -- the SAME pattern as the
+       lane and policy writers. Creating project.md is fine (unlike the policy
+       writer, this file is display-only and has no machine consumer to half-
+       populate), but the loop must at least be bootstrapped.
+
+    Returns ``{"ok": True, "name": str}`` or ``{"ok": False, "error": ...}``.
+    Never raises for a bad request. This is the THIRD and FINAL write endpoint;
+    no other new writes exist.
+    """
+    if not isinstance(value, str):
+        # Accept only a JSON string; numbers/objects are rejected up front.
+        if value is None:
+            return {"ok": False, "error": "project name is required"}
+        return {"ok": False, "error": "project name must be a string"}
+    name = value.strip()
+    if not name:
+        return {"ok": False, "error": "project name is required"}
+    if _PROJECT_NAME_BAD_CHARS_RE.search(name):
+        return {
+            "ok": False,
+            "error": "project name must not contain control characters or line breaks",
+        }
+    if len(name) > PROJECT_NAME_MAX_CHARS:
+        return {
+            "ok": False,
+            "error": "project name must be at most {0} characters".format(
+                PROJECT_NAME_MAX_CHARS
+            ),
+        }
+
+    # The loop must be bootstrapped (a project name for an empty dir is
+    # meaningless and would scatter a stray file into an unrelated folder).
+    if not (loop_dir / "agent-lanes.md").exists():
+        return {
+            "ok": False,
+            "error": "loop is not bootstrapped (no agent-lanes.md); run bootstrap first",
+        }
+
+    project_path = loop_dir / PROJECT_FILE_NAME
+    _atomic_write(project_path, _PROJECT_FILE_TEMPLATE.format(name=name))
+    return {"ok": True, "name": name}
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -990,9 +1379,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     """Serve the dashboard page, the state JSON, and the two write endpoints.
 
     ``loop_dir`` is injected onto the server object by ``make_server`` and read
-    here via ``self.server.loop_dir``. The handler itself is stateless. The only
-    writes are ``POST /api/lanes`` (add one lane) and ``POST /api/policy`` (set
-    ``max_fix_cycles``); every other path/verb is refused.
+    here via ``self.server.loop_dir``. The handler itself is stateless. The
+    writes are EXACTLY three -- ``POST /api/lanes`` (add one lane),
+    ``POST /api/policy`` (set ``max_fix_cycles``), and ``POST /api/project``
+    (set the human project name); every other path/verb is refused.
     """
 
     server_version = "LoopDashboard/1.0"
@@ -1103,8 +1493,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         route = self._path_only()
-        if route not in ("/api/lanes", "/api/policy"):
-            # Every other POST path is refused. /api/state is GET-only.
+        # The write endpoints are EXACTLY three: /api/lanes, /api/policy, and
+        # /api/project (F2). Every other POST path is refused. /api/state is
+        # GET-only. Do not add a fourth write here without revisiting the hard
+        # invariant in the module docstring + smoke.
+        if route not in ("/api/lanes", "/api/policy", "/api/project"):
             self._send_json(404, {"error": "not found", "path": route})
             return
 
@@ -1117,8 +1510,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             lane = str(payload.get("lane", ""))
             role = str(payload.get("role", ""))
             result = add_lane(self.loop_dir, lane, role)
-        else:  # /api/policy
+        elif route == "/api/policy":
             result = set_max_fix_cycles(self.loop_dir, payload.get("max_fix_cycles"))
+        else:  # /api/project
+            result = set_project_name(self.loop_dir, payload.get("name"))
         self._send_json(200 if result.get("ok") else 400, result)
 
     # Explicitly reject other verbs with 405 (no writes anywhere else).
@@ -1216,7 +1611,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("Loop dashboard on http://{0}:{1}/  (loop-dir: {2})".format(host, port, loop_dir))
     print(
         "Read-only view. Writes: POST /api/lanes (add lane), "
-        "POST /api/policy (max_fix_cycles). Ctrl-C to stop."
+        "POST /api/policy (max_fix_cycles), POST /api/project (project name). "
+        "Ctrl-C to stop."
     )
     sys.stdout.flush()
     try:

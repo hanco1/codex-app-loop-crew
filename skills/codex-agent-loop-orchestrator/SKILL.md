@@ -7,6 +7,19 @@ description: Set up or continue a repo-local multi-agent Codex workflow with lan
 
 Create a thin orchestration layer around Codex threads. Keep project truth in repo files, keep agent identities in a registry, and use thread tools only as the message bus and session starter.
 
+## Identity And Fit
+
+This is a **software-development orchestrator**. Its native job is building and changing software: code, tests, docs, and the machine-checkable evidence that proves a checkpoint is done. Read that as your default before proposing any team shape.
+
+- **Operations-domain use is conditional.** Only run an operations team (data ingestion, content production, ongoing monitoring, human workflows) through this loop when *every* checkpoint has a machine-checkable acceptance command. Where a step's quality can only be judged by a human, do not pretend the gate covers it: scope the completion gate to **structural completeness** (the artifact exists, is well-formed, passes what can be checked) and hand the **quality** judgment to an explicit human review step. Never let a green gate imply human-quality sign-off it did not perform.
+- **Recurring work favors a tool, not a standing team.** If the task will repeat, the highest-leverage move is usually to have the loop *build a reusable tool/script* that does it, then run that tool - not to keep a multi-lane team alive doing the work by hand. Say this during intake when you notice repetition.
+
+### Task-Size Gate (do not over-build the loop)
+
+Before spinning up a loop at all, size the task. The loop's process machinery (evidence trail, independent review, durable handoff state) only pays for itself on work that is multi-day, multi-agent, sensitive-data-gated, or must survive compaction/handoff. Measured on a real one-shot MVP, a single direct session delivered *more* product for roughly one-eighth the tokens and one-fifteenth the wall time of the loop.
+
+So, during intake, **if the work plausibly fits one session** - about **under two hours, one agent, low audit/recoverability need, and no sensitive-data gates** - say so plainly and **recommend a direct session instead of a loop**. Spinning up a loop anyway, for a task that does not need it, is the skill making the task more complicated than it is. Only build the loop when at least one of these is true: the work spans multiple sessions/days, needs genuine parallel lanes, touches credentials or private/financial data behind a human gate, or must be reconstructable and independently re-verifiable by an outsider from files alone.
+
 ## Methodology vs Reference Implementation
 
 This skill is two layers. The **methodology** (`references/methodology.md`) is the transferable discipline - nine invariants that stay true even if you change the lanes, the message vocabulary, or the verification surface. Everything in this SKILL.md, the other `references/`, and the `scripts/` is **one reference implementation** that proves it on Codex. Read `references/methodology.md` to understand *why* the loop is shaped this way; read `references/build-your-own-agent.md` to re-parameterize it for a different team or verification surface. If code and methodology ever disagree, the code is the bug.
@@ -42,9 +55,48 @@ In every command example below, `<skill_dir>` means the directory that contains 
 python <skill_dir>/scripts/bootstrap_agent_loop.py --loop-dir docs/loop
 ```
 
-4. Read `agent-lanes.md`, `requests.md`, `loop-policy.md`, and the relevant lane `current.md` before sending or resuming cross-agent work.
-5. Use `tool_search` for thread tools before assuming they exist. Look for `create_thread`, `read_thread`, `send_message_to_thread`, and `set_thread_title`.
-6. On a Codex-app host, `tool_search` first for the cross-thread `codex_app.*` tools (the app's own thread/message tools) and prefer them for delivery. When they are absent (headless `codex exec`, sandboxed, or a non-app host), fall back to the durable file inbox (`deliver_message.py` / `inbox/`); the loop works identically either way because delivery is just one plane over repo files.
+4. **Version-control the loop, then arm the scope guard.** The loop's write-scope and lease enforcement is a git pre-commit hook, and invariant 1 requires the loop live under version control. Check first:
+
+```bash
+git rev-parse --is-inside-work-tree
+```
+
+If that fails (not a repo), initialize one before anything else depends on it: `git init`, make an initial commit that captures the bootstrapped loop, and append a run-log row recording the init. Then offer to arm the guard:
+
+```bash
+python <skill_dir>/scripts/install_precommit.py --loop-dir docs/loop
+```
+
+CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no lane is rejected. So pair the install with commit-as-lane guidance and use it on every commit: `CODEX_LANE=<lane> git commit -m "..."`. If a lane cannot reliably export `CODEX_LANE` yet (for example the initial bootstrap commit before any lane exists), keep the guard warn-first by invoking `precommit_scope_guard.py --allow-unscoped` for that commit rather than skipping enforcement wholesale. Without a git repo the guard cannot install and write_scope/leases silently degrade to the honor system - so the git check is not optional.
+
+5. Read `agent-lanes.md`, `requests.md`, `loop-policy.md`, and the relevant lane `current.md` before sending or resuming cross-agent work.
+6. Use `tool_search` for thread tools before assuming they exist. Look for `create_thread`, `read_thread`, `send_message_to_thread`, and `set_thread_title`.
+7. On a Codex-app host, `tool_search` first for the cross-thread `codex_app.*` tools (the app's own thread/message tools) and prefer them for delivery. When they are absent (headless `codex exec`, sandboxed, or a non-app host), fall back to the durable file inbox (`deliver_message.py` / `inbox/`); the loop works identically either way because delivery is just one plane over repo files.
+
+## Intake (before the first request)
+
+A freshly bootstrapped `goal.md`/`tracker.md` contains only placeholder `Done When` lines. **Placeholders mean there is no objective yet - and "no objective yet" is the ABSENCE of a request, not a blocked request.** Do not mint a `PLANNED -> BLOCKED` "no goal yet" placeholder request; a first-contact loop that shows a red BLOCKED row before the human has spoken looks like failure. Instead, run a short intake conversation and create the first real request only after the human answers.
+
+Run the Task-Size Gate first (see Identity And Fit). If the work plausibly fits one session, say so and recommend a direct session rather than a loop. If a loop is warranted, ask the human, in plain language:
+
+1. **Objective and Done-When.** What is the single durable objective, and what concrete, checkable conditions mean it is done? Write the answers into `goal.md` (Objective + Done When) and mirror the conditions into `tracker.md` before creating any request.
+2. **Which fork - build the software, or be the operations team?** Building software (the default) means lanes ship code/tests/docs behind a machine-checkable gate. Being the operations team means the lanes *do the ongoing work* (ingest data, produce content). Only take the operations fork when every checkpoint has a machine-checkable acceptance; otherwise scope the gate to structure and add an explicit human-quality review step (see Identity And Fit). If the work recurs, offer to build a reusable tool instead of standing up a team.
+3. **Which cut - by discipline, or by feature?** The default is a **discipline cut**: lanes are development disciplines (product, backend-or-data-eng, frontend, research, security, review), each owning one kind of work across the whole product. A **feature cut** (a lane per product feature) fragments write scopes and re-derives the same discipline in every lane; take it only when features are genuinely independent deliverables with disjoint files. When in doubt, cut by discipline.
+
+Only after the human answers step 1 do you create the first request and append the first run-log row. The intake conversation itself is not a request.
+
+### Proposing Lanes
+
+When you propose the initial team, **default to development disciplines**, not product features and not an operations framing:
+
+- **product** - goals, specs, acceptance criteria, final product judgment.
+- **backend or data-eng** - server/data/core code, schema, pipelines, tests.
+- **frontend** - UI shell, views, charts, UX, UI tests. Do not omit this for anything with a user-facing surface.
+- **research** - source-backed investigation when it recurs.
+- **security** - privacy/threat review and the human gate before sensitive data flows.
+- **review** - independent acceptance review against the criteria.
+
+Propose only the lanes the goal actually needs (three is the common floor: product, one build lane, review), and add specialists per the Lane Expansion Gate. Do not name a lane after a product feature ("dedupe agent", "merchant agent") - that is a feature cut wearing a lane costume; fold those into the discipline that owns them.
 
 ## Health Check
 
@@ -74,7 +126,7 @@ The doctor reports:
 Use these helpers alongside the bootstrap and doctor. All are stdlib-only and idempotent.
 
 - `completion_gate.py` - run before declaring the loop done or emitting `SHIP_CHECK_OK`. It is read-only: it reads the recorded evidence under `docs/loop/evidence/*.json` and prints `SHIP_CHECK_OK` only when every record for the request reports `exit_code` 0. It does not execute any command. The implementation lane must run each verify command itself and record the real exit code in an evidence file; the gate validates those records, it does not run the commands. A missing, malformed, or non-zero record means `BLOCKED`.
-- `deliver_message.py` - run instead of writing an inbox by hand. It delivers a saved message atomically (Maildir `tmp` -> `new` rename) so a crash never leaves a half-written inbox entry.
+- `deliver_message.py` - run instead of writing an inbox by hand. It delivers a saved message atomically (Maildir `tmp` -> `new` rename) so a crash never leaves a half-written inbox entry. When you pass `--from-lane`, it also **stamps that lane's heartbeat** (the `heartbeat` column in `agent-lanes.md` and, if present, `last_updated`/`heartbeat` in `lanes/<lane>/current.md`) - delivering a message is proof the sender is alive (F7). Pass `--no-heartbeat` to opt out.
 - `install_precommit.py` - run once per repo when leases and write scopes matter. It installs a git pre-commit hook that enforces each lane's `write_scope` and advisory file leases.
 
 ```bash
@@ -105,6 +157,8 @@ python <skill_dir>/scripts/loop_dashboard.py --loop-dir docs/loop
 ```
 
 On startup it prints exactly one machine-greppable line, `DASHBOARD_URL=http://127.0.0.1:<port>/`, AFTER binding. Capture that line and report that exact URL to the user - never a guessed one. If port 8765 is busy the script self-selects an ephemeral port and prints the actual bound URL. Run one dashboard per loop dir; before spawning, check whether the URL already responds so you do not start a duplicate.
+
+**The human operating model.** The human lives in the **product thread** and watches the **dashboard**; they are pulled into the loop only at gates. They do not babysit every lane. The dashboard's "your turn" banner is what names the moment and the window to go to - a human gate, a stalled handoff, a workerless lane, or a missing-dependency approval - so the human can stay in the product thread until the banner (and the rank-1 lane card) tells them exactly where to act.
 
 ## Decision Gates
 
@@ -167,7 +221,33 @@ Use `--extra-lane "lane|role|write_scope"` for custom teams.
 
 Use stable lane names. Record thread IDs only after they are verified with `read_thread` or an equivalent current-session tool. If a thread ID cannot be read, mark it stale instead of using it.
 
+Title each Codex thread with the **bare lane name** and nothing else - `set_thread_title(<thread_id>, "review")`, not `"<project> loop lane: review"`. Drop the project name and the "loop lane:" boilerplate; the loop refers to a lane by its bare name, so the title must match it exactly. Project context, when a human needs it to tell dashboards apart, comes from the dashboard project name, never the thread title.
+
 Keep write scopes disjoint where possible. Product may update loop planning files; implementation may update code; review may write review notes. Avoid letting multiple lanes casually edit the same loop file.
+
+## Model Tier Policy
+
+Lane threads should not run on whatever light model the host defaults a new thread to. Give each lane the reasoning tier its work needs, per this policy:
+
+- **Coding lanes get the highest available tier.** A coding lane is one that *builds code* - implementation, backend, data-eng, frontend. These carry the hardest reasoning load, so they recommend the **highest** tier the calling host offers.
+- **Every other lane gets the second-highest available tier.** Product, review, security, research, docs, and the like recommend the **second-highest** tier.
+- **The human only ever opts DOWN.** A person may lower a lane's tier in the registry (see the advisory column below); the skill honors that and never silently raises a lane back up past this policy.
+
+**Resolve tiers at runtime - never hardcode a model name.** Tiers are expressed abstractly ("highest available", "second-highest available") because the concrete model list is host-specific. When you `tool_search` for `codex_app.create_thread`, read its own `model` parameter description: it embeds the calling host's live model list and each model's supported reasoning efforts, and the host validates the combination when the tool runs. Map "highest available" to the top model in that list and "second-highest available" to the next one down; pick a high reasoning effort (`thinking`) that the chosen model supports.
+
+**When create_thread accepts model/effort (the common case), pass them.** Create each lane thread with the resolved tier:
+
+```text
+codex_app.create_thread(prompt=<lane kickoff>, target=..., model=<resolved highest|second-highest model>, thinking=<a high effort that model supports>)
+```
+
+`model` and `thinking` are optional; omitting them is the safe degradation path (the thread just starts at the host default), so never fail a dispatch because you could not resolve a tier - fall back to the advisory column and tell the human.
+
+**The advisory `tier` column records the recommendation on disk.** `bootstrap_agent_loop.py` writes a `tier` column in `agent-lanes.md` (abstract words `highest` / `second-highest`) and assigns it by the policy above when it registers a lane. It prints the tier hint alongside its `set_thread_title` hint on `--set-thread`, and `--set-thread` adoption preserves an existing tier (a human opt-down is never clobbered). The dashboard renders the recommended tier as a small neutral chip on each lane card, read from this column.
+
+**Degradation when create_thread lacks the model parameter.** Some hosts validate model/effort only at run time or do not expose the parameter at all. When `create_thread` cannot take a tier, the advisory column IS the recommendation: tell the human to pick that tier by hand when they open the thread. This is the same hand-created-thread path as the adoption ritual - when a human opens a thread for a lane, they set the recommended tier from the registry, then run the `--set-thread` adoption line.
+
+**Cost counterweight.** Higher tiers burn more tokens, so tier policy is paired with the loop's existing self-calibration: the dashboard's usage panel shows how much of the Codex quota this workspace has spent, and the `max_fix_cycles` slider caps how many fix-retry rounds one request gets before it is flagged BLOCKED. Those two are the throttle; the `max_fix_cycles` default is right-sized and should not be changed to compensate for tier cost.
 
 ## Request State
 
@@ -210,6 +290,19 @@ Before sending to another lane:
 
 Do not ask the human to copy/paste unless no thread tool or durable inbox fallback can be used.
 
+### Threadless Lane: Adopt A Hand-Created Thread
+
+A lane with no verified thread has no worker. Dispatching a request into its file inbox and waiting is a deadlock: nothing processes the message. This happens when `create_thread` is unavailable at dispatch time (a real mid-run host regression). Two rules:
+
+- **Do not silently wait.** When `create_thread` is unavailable and a lane needs a thread, product must tell the human in plain language: *"lane X needs a thread - open one in the Codex app and paste the adoption line below."* Surface the halt; do not leave a request rotting in an inbox.
+- **Adopt the hand-created thread into the EXISTING row.** Once the human opens a thread, adopt it by filling the lane's existing registry row - never by hand-editing `agent-lanes.md`, which duplicates the row:
+
+```bash
+python <skill_dir>/scripts/bootstrap_agent_loop.py --loop-dir docs/loop --set-thread <lane>=<thread_id>
+```
+
+When the human opens the thread, they should pick the lane's recommended model tier from the registry's advisory `tier` column (see Model Tier Policy) - coding lanes at the highest available tier, everything else at the second-highest. Then title the thread with the bare lane name (`set_thread_title(<thread_id>, "<lane>")`) and proceed with the dispatch. `--set-thread` flips the row's `thread_id` and status to `registered` in place and preserves the advisory tier; the doctor's `workerless_lane_dependency` warning (an error when another lane's active request waits on it) clears once the thread is verified.
+
 ## Lane Behavior
 
 When product creates an implementation request, it must define scope, non-goals, acceptance criteria, source docs, and expected reply.
@@ -219,6 +312,19 @@ When implementation receives a request, it reads the named source docs and loop 
 When review receives a request, it evaluates against acceptance criteria, not implementation intent. It sends `REVIEW_DONE` on pass or `FIX_REQUEST` with exact failed criteria and evidence on fail.
 
 When a fix is requested, implementation reuses the original `request_id`, increments `iteration`, and sends another `IMPLEMENTATION_DONE`.
+
+### In-Turn Report-Back Ritual (hard gate, not advice)
+
+Codex threads run one turn and stop, so a handoff MUST complete inside the same turn as the work. Finishing the code, or even getting `SHIP_CHECK_OK`, is not the end of your turn - if your turn ends there, the requester waits forever and a human has to hand-carry the baton.
+
+**Your turn is NOT finished until you have, in this same turn:**
+
+1. **Sent the reply message** to the next lane - `send_message_to_thread` (or the `codex_app.*` equivalent), or the durable file-inbox fallback (`deliver_message.py`) when no thread tool is available.
+2. **Updated `requests.md`** - move the request to its next status and owner (do not leave it parked in `IMPLEMENTING`/`REVIEWING` after the work is done).
+3. **Appended the `loop-run-log.md` row** for that transition, in the same step that updated `requests.md`.
+4. **Refreshed your heartbeat** - the `heartbeat` column in `agent-lanes.md` and the `last_updated`/`heartbeat` mirror in your lane `current.md`. (`deliver_message.py --from-lane <you>` does this for you.)
+
+All four are mandatory every time you close a slice. Do not stop after step 1's work is done and leave the reply, the ledger, the log, or the heartbeat for "next turn" - there is no guaranteed next turn. The doctor flags a request whose work is done but that never advanced as `stalled_handoff`, naming the lane to nudge.
 
 ## Verification Integrity
 
@@ -231,9 +337,11 @@ verification cannot run -> BLOCKED, never ACCEPTED
 ```
 
 - If a checkpoint's verify command cannot run (missing tooling, credentials, environment, or data), mark the request `BLOCKED` and report what is needed. Do not record "accepted with caveat".
+- A `BLOCKED` on a **missing dependency** is a distinct blocker type with a built-in exit ramp, not a dead end: record exactly what is missing and the exact install command (distinguishing a `pip` package from a `system` binary), mark the message with the greppable `blocker: missing_dependency` format, and ask the human per `dependency_install` in `loop-policy.md` (`ask` / `auto-pip-only` / `never`). On approval, install, re-run the exact failed verify, record fresh evidence, and unblock the SAME `request_id` (increment `iteration`). See `references/protocol.md` "Missing-Dependency Blocker".
 - Do not emit a completion token from unverified state. `SHIP_CHECK_OK` is valid only when every checkpoint verify command was actually run and its recorded exit code in `docs/loop/evidence/*.json` is 0; otherwise the loop is not shippable. The gate reads those recorded exit codes; it never runs the commands for you.
 - "Tests not run", "could not build", or "unverified" are blockers, not acceptances. Review must send `FIX_REQUEST` or `BLOCKED`, never `REVIEW_DONE`, when evidence is absent.
 - Record the exact command, exit code, and output location in the message and the lane worklog so the next lane can re-run it.
+- Passing the gate does not end your turn. A green `SHIP_CHECK_OK` with no reply sent, no `requests.md` transition, and no run-log row is a stalled handoff, not a completed one: complete the In-Turn Report-Back Ritual above in the SAME turn, or the loop does not advance.
 
 ## Continuation And Auto-Chain
 

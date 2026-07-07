@@ -404,6 +404,165 @@ def loop_dir_join(loop_dir: Path, doc: str) -> Path:
     return candidate
 
 
+# Marker the pre-commit hook installer writes so we can recognize a hook this
+# skill owns. Kept in sync with install_precommit.py's HOOK_MARKER by value; a
+# drift here only weakens the advisory hook_installed field, never a gate.
+HOOK_MARKER = "# codex-agent-loop-orchestrator:lease-precommit"
+
+
+def find_git_dir(start: Path) -> Optional[Path]:
+    """Walk upward from ``start`` looking for a git dir, stdlib-only.
+
+    Returns the resolved ``.git`` directory (or the dir a ``.git`` file points
+    at, for worktrees/submodules) when found, else None. Never shells out to
+    git: this box's sandbox cannot reliably run subprocesses, and the doctor is
+    read-only.
+    """
+    try:
+        current = start.resolve()
+    except OSError:
+        current = start
+    for candidate in [current, *current.parents]:
+        dotgit = candidate / ".git"
+        if dotgit.is_dir():
+            return dotgit
+        if dotgit.is_file():
+            # A ``.git`` FILE (worktree/submodule) points at the real gitdir.
+            try:
+                text = dotgit.read_text(encoding="utf-8")
+            except OSError:
+                return dotgit
+            for line in text.splitlines():
+                line = line.strip()
+                if line.lower().startswith("gitdir:"):
+                    pointer = line.split(":", 1)[1].strip()
+                    resolved = Path(pointer)
+                    if not resolved.is_absolute():
+                        resolved = (candidate / pointer).resolve()
+                    return resolved
+            return dotgit
+    return None
+
+
+def detect_git_health(loop_dir: Path) -> dict[str, Any]:
+    """Report whether the loop is under git and whether the scope guard is armed.
+
+    ``git_present``: a git dir was found at or above ``loop_dir``.
+    ``hook_installed``: a ``hooks/pre-commit`` exists and carries this skill's
+    ``HOOK_MARKER`` (so an unrelated hand-written pre-commit hook does not read
+    as armed). Both are advisory health fields; neither is a gate.
+    """
+    git_dir = find_git_dir(loop_dir)
+    git_present = git_dir is not None
+    hook_installed = False
+    if git_dir is not None:
+        hook_path = git_dir / "hooks" / "pre-commit"
+        if hook_path.is_file():
+            try:
+                hook_installed = HOOK_MARKER in hook_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                hook_installed = False
+    return {"git_present": git_present, "hook_installed": hook_installed}
+
+
+def _pending_inbox_count(loop_dir: Path, lane: str) -> int:
+    """Count undelivered messages in ``lane``'s Maildir inbox (inbox/new/*.md).
+
+    A file in ``new`` is a message the receiving lane has not yet processed. If
+    the lane has no worker (no verified thread), those messages are stuck. A
+    missing inbox tree returns 0.
+    """
+    new_dir = loop_dir / "lanes" / lane / "inbox" / "new"
+    if not new_dir.is_dir():
+        return 0
+    return sum(1 for path in new_dir.glob("*.md") if path.is_file())
+
+
+def classify_missing_dependency_blocker(loop_dir: Path, request_id: str) -> Optional[dict[str, Any]]:
+    """Parse a missing-dependency marker out of a request's BLOCKED message.
+
+    A missing-dependency blocker is written into the durable BLOCKED message
+    under ``messages/<request_id>/`` with a greppable, flat marker (documented in
+    references/protocol.md "Missing-Dependency Blocker"):
+
+        blocker: missing_dependency
+        dependency: pip | pytesseract | pip install pytesseract
+        dependency: system | tesseract | choco install tesseract
+
+    Each ``dependency:`` line is ``kind | name | install-command`` (``|``
+    separated); ``kind`` is ``pip`` (pip-installable package) or ``system`` (a
+    system binary needing an installer/choco). This function returns a dict with
+    the parsed dependencies, or None when no missing-dependency marker is found.
+    Only the newest BLOCKED-*.md is read (highest iteration wins by name sort).
+    """
+    request_id = (request_id or "").strip()
+    if not request_id:
+        return None
+    msg_dir = loop_dir / "messages" / request_id
+    if not msg_dir.is_dir():
+        return None
+    blocked_files = sorted(
+        (p for p in msg_dir.glob("BLOCKED*") if p.is_file()),
+        key=lambda p: p.name,
+    )
+    if not blocked_files:
+        return None
+    text = ""
+    for path in reversed(blocked_files):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "blocker: missing_dependency" in text:
+            break
+    else:
+        return None
+    if "blocker: missing_dependency" not in text:
+        return None
+
+    deps: list[dict[str, str]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("dependency:"):
+            continue
+        payload = stripped.split(":", 1)[1].strip()
+        parts = [p.strip() for p in payload.split("|")]
+        kind = parts[0].lower() if parts else ""
+        name = parts[1] if len(parts) > 1 else ""
+        install = parts[2] if len(parts) > 2 else ""
+        if kind not in ("pip", "system"):
+            kind = "system"  # fail safe: unknown kind is treated as a system binary
+        deps.append({"kind": kind, "name": name, "install": install})
+    return {
+        "request_id": request_id,
+        "dependencies": deps,
+        "has_pip": any(d["kind"] == "pip" for d in deps),
+        "has_system": any(d["kind"] == "system" for d in deps),
+    }
+
+
+def _has_archived_review_done(loop_dir: Path, request_id: str) -> bool:
+    """True if a REVIEW_DONE message is archived for ``request_id``.
+
+    The durable message store lives at ``messages/<request_id>/``; a
+    ``REVIEW_DONE-*.md`` there means review passed the request even if the
+    request row never advanced. Used only for the F10 stall heuristic; a missing
+    directory just returns False.
+    """
+    request_id = (request_id or "").strip()
+    if not request_id:
+        return False
+    msg_dir = loop_dir / "messages" / request_id
+    if not msg_dir.is_dir():
+        return False
+    for path in msg_dir.glob("REVIEW_DONE*"):
+        if path.is_file():
+            return True
+    return False
+
+
 def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime] = None) -> dict[str, Any]:
     if now is None:
         now = datetime.now(timezone.utc)
@@ -535,6 +694,47 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     evidence_dir = loop_dir / "evidence"
     evidence_dir_present = evidence_dir.exists() and evidence_dir.is_dir()
 
+    # git health (F4): is the loop under version control, and is the write-scope
+    # pre-commit guard armed? Both are advisory health fields, never gates. A
+    # missing repo means write_scope/leases degrade to the honor system, so it
+    # is a WARNING (invariant 1 wants version control) but never blocks handoff.
+    git_health = detect_git_health(loop_dir)
+    git_present = git_health["git_present"]
+    hook_installed = git_health["hook_installed"]
+
+    # F7 mandatory heartbeats: a lane that OWNS an active (non-terminal) request
+    # must report a heartbeat. This is distinct from orphan_suspect (which fires
+    # for any registered lane whose heartbeat is stale regardless of whether it
+    # owns work) and distinct from the dashboard's display-only staleness. Here
+    # the trigger is narrow and protocol-level: an active non-terminal request
+    # whose owner lane has a MISSING heartbeat, or one older than the stale
+    # window. Build a lane -> heartbeat-state lookup, then scan the owners.
+    lane_by_name = {ls["lane"]: ls for ls in lane_summaries}
+    heartbeat_gap_owners: list[dict[str, str]] = []
+    seen_owner_lanes: set[str] = set()
+    for request in non_terminal_requests:
+        owner = (request.get("owner_lane") or "").strip()
+        if not owner or owner in seen_owner_lanes:
+            continue
+        lane_info = lane_by_name.get(owner)
+        if lane_info is None:
+            # An unregistered owner is already an owner_issue error; skip here.
+            continue
+        raw_hb = (lane_info.get("heartbeat") or "").strip()
+        age = lane_info.get("heartbeat_age_mins")
+        missing = not raw_hb or raw_hb.upper() in EMPTY_CELL_VALUES or age is None
+        stale = age is not None and age > stale_heartbeat_mins
+        if missing or stale:
+            seen_owner_lanes.add(owner)
+            heartbeat_gap_owners.append(
+                {
+                    "lane": owner,
+                    "request_id": request["request_id"],
+                    "reason": "missing" if missing else "stale",
+                    "age_mins": age,
+                }
+            )
+
     # evidence_recorded_ok: every non-terminal request has a non-empty evidence
     # cell in requests.md. This only proves the cell was filled in; it does NOT
     # prove any verification command exited 0. Vacuously true with no
@@ -556,6 +756,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     gate_available = GATE_AVAILABLE
     gate_failed_requests: list[str] = []
     gate_load_errors: list[dict[str, str]] = []
+    gate_passing_requests: set[str] = set()
     if gate_available:
         gate_records, gate_load_errors = completion_gate.load_evidence(evidence_dir)
         recorded_ids = sorted(
@@ -574,9 +775,95 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             gate_result = completion_gate.evaluate(gate_records, [], request_id)
             if not gate_result["ok"]:
                 gate_failed_requests.append(request_id)
+            else:
+                # This request's own evidence all exits 0: it is SHIP_CHECK_OK.
+                gate_passing_requests.add(request_id)
     completion_gate_ok = (
         gate_available and not gate_failed_requests and not gate_load_errors
     )
+
+    # F10 stalled_handoff: a request still parked in a pre-acceptance,
+    # non-terminal state (REQUESTED / IMPLEMENTING / REVIEWING) whose WORK is
+    # demonstrably done -- either its own evidence already reports SHIP_CHECK_OK,
+    # or an archived REVIEW_DONE message exists for it -- but no forward
+    # transition happened. This is the systemic cross-thread stall: a lane
+    # finished (even got the gate green) then its turn ended without sending the
+    # reply, updating requests.md, or appending the run-log row, so the requester
+    # waits forever. It is a WARNING that names the lane + request as a genuine
+    # your-turn nudge; it never blocks handoff.
+    stalled_handoff_requests: list[dict[str, str]] = []
+    pre_acceptance_states = {"REQUESTED", "IMPLEMENTING", "REVIEWING"}
+    for request in non_terminal_requests:
+        status = request["status"]
+        if status not in pre_acceptance_states:
+            continue
+        request_id = request["request_id"]
+        done_by_gate = request_id in gate_passing_requests
+        done_by_review = _has_archived_review_done(loop_dir, request_id)
+        if done_by_gate or done_by_review:
+            stalled_handoff_requests.append(
+                {
+                    "request_id": request_id,
+                    "lane": (request.get("owner_lane") or "").strip() or "(unassigned)",
+                    "status": status,
+                    "evidence": "SHIP_CHECK_OK" if done_by_gate else "archived REVIEW_DONE",
+                }
+            )
+
+    # F11 workerless_lane_dependency: a lane with NO verified thread (status
+    # needs-thread / unverified) that nonetheless has work waiting on it -- it
+    # owns a non-terminal request, or messages are stuck in its inbox/new. With
+    # create_thread absent (a real mid-run host regression), such a lane has no
+    # worker to process the dispatched request, so the requester waits forever.
+    # This is a WARNING, and ESCALATES to an ERROR when another lane's active
+    # request depends on the loop advancing (i.e. some OTHER lane is actively
+    # working a non-terminal request): then the deadlock stalls live work, not
+    # just an idle branch.
+    workerless_lanes = {
+        ls["lane"] for ls in lane_summaries if ls["status"] == "needs-thread"
+    }
+    # Does any OTHER (verified) lane own an active non-terminal request?
+    verified_active_owners = {
+        (req.get("owner_lane") or "").strip()
+        for req in non_terminal_requests
+        if (req.get("owner_lane") or "").strip()
+        and (req.get("owner_lane") or "").strip() not in workerless_lanes
+    }
+    workerless_dependencies: list[dict[str, Any]] = []
+    for lane in sorted(workerless_lanes):
+        owns_nonterminal = [
+            req["request_id"]
+            for req in non_terminal_requests
+            if (req.get("owner_lane") or "").strip() == lane
+        ]
+        pending_inbox = _pending_inbox_count(loop_dir, lane)
+        if not owns_nonterminal and pending_inbox == 0:
+            # No thread but also no waiting work: that is just unverified_lane_thread.
+            continue
+        escalate = bool(verified_active_owners)
+        workerless_dependencies.append(
+            {
+                "lane": lane,
+                "requests": owns_nonterminal,
+                "pending_inbox": pending_inbox,
+                "severity": "error" if escalate else "warning",
+            }
+        )
+
+    # F16 missing-dependency blocker: a BLOCKED request whose durable BLOCKED
+    # message carries the greppable ``blocker: missing_dependency`` marker is a
+    # distinct blocker type with a built-in exit ramp (record what is missing +
+    # exact install commands, ask the human for one-line approval, install,
+    # re-run the failed verify, unblock the SAME request_id). The doctor
+    # classifies it and surfaces the install commands so the dashboard/human can
+    # act with zero hops, instead of rendering a generic red dead-end.
+    missing_dependency_blockers: list[dict[str, Any]] = []
+    for request in request_summaries:
+        if request["status"] != "BLOCKED":
+            continue
+        classified = classify_missing_dependency_blocker(loop_dir, request["request_id"])
+        if classified is not None:
+            missing_dependency_blockers.append(classified)
 
     issues: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
@@ -621,6 +908,87 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 "severity": "warning",
                 "code": "budget_exhausted",
                 "message": "loop-budget.md has budget_exhausted: true",
+            }
+        )
+    if not git_present:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "git_absent",
+                "message": "loop dir is not under git; write_scope/leases degrade to "
+                "the honor system (run git init, then install_precommit.py)",
+            }
+        )
+    elif not hook_installed:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "hook_absent",
+                "message": "git repo present but the write_scope pre-commit guard is not "
+                "installed (run install_precommit.py)",
+            }
+        )
+    for owner in heartbeat_gap_owners:
+        if owner["reason"] == "missing":
+            detail = "has no heartbeat"
+        else:
+            detail = "heartbeat is {0} min old (> {1})".format(owner["age_mins"], stale_heartbeat_mins)
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "stale_heartbeat_active_owner",
+                "message": "lane {lane} owns active request {req} but {detail}; "
+                "refresh the heartbeat in the in-turn ritual".format(
+                    lane=owner["lane"], req=owner["request_id"], detail=detail
+                ),
+            }
+        )
+    for stalled in stalled_handoff_requests:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "stalled_handoff",
+                "message": "request {req} is still {status} but its work is done "
+                "({evidence}); nudge lane {lane} to send the reply, advance "
+                "requests.md, and append the run-log row".format(
+                    req=stalled["request_id"],
+                    status=stalled["status"],
+                    evidence=stalled["evidence"],
+                    lane=stalled["lane"],
+                ),
+            }
+        )
+    for dep in workerless_dependencies:
+        waiting = []
+        if dep["requests"]:
+            waiting.append("owns " + ", ".join(dep["requests"]))
+        if dep["pending_inbox"]:
+            waiting.append("{0} message(s) stuck in inbox/new".format(dep["pending_inbox"]))
+        detail = "; ".join(waiting) if waiting else "work waiting"
+        message = (
+            "lane {lane} has a pending dispatched request but no verified thread "
+            "({detail}); open a Codex thread for it and adopt it "
+            "(bootstrap_agent_loop.py --set-thread {lane}=<thread_id>)".format(
+                lane=dep["lane"], detail=detail
+            )
+        )
+        entry = {"severity": dep["severity"], "code": "workerless_lane_dependency", "message": message}
+        if dep["severity"] == "error":
+            issues.append(entry)
+        else:
+            warnings.append(entry)
+    for blocker in missing_dependency_blockers:
+        cmds = "; ".join(
+            "{0} [{1}]".format(dep["install"], dep["kind"]) for dep in blocker["dependencies"] if dep["install"]
+        )
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "missing_dependency",
+                "message": "request {req} is BLOCKED on a missing dependency (has an "
+                "install-and-retry exit ramp): {cmds}".format(
+                    req=blocker["request_id"], cmds=cmds or "(no install command recorded)"
+                ),
             }
         )
     for request_id in missing_evidence_requests:
@@ -709,6 +1077,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "lanes": lane_summaries,
         "lane_file_missing": lane_file_missing,
         "orphan_suspects": orphan_suspects,
+        "heartbeat_gap_owners": heartbeat_gap_owners,
+        "stalled_handoffs": stalled_handoff_requests,
+        "workerless_dependencies": workerless_dependencies,
+        "missing_dependency_blockers": missing_dependency_blockers,
         "stale_heartbeat_mins": stale_heartbeat_mins,
         "requests": {
             "total": len(request_summaries),
@@ -724,6 +1096,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         },
         "run_log_present": run_log_present,
         "evidence_dir_present": evidence_dir_present,
+        "git_present": git_present,
+        "hook_installed": hook_installed,
         "evidence_recorded_ok": evidence_recorded_ok,
         "gate_available": gate_available,
         "completion_gate_ok": completion_gate_ok,
@@ -774,6 +1148,8 @@ def print_text(result: dict[str, Any]) -> None:
     print(f"Budget: {budget_state}")
     print(f"Run log present: {result['run_log_present']}")
     print(f"Evidence dir present: {result['evidence_dir_present']}")
+    print(f"Git present: {result.get('git_present', False)}")
+    print(f"Scope-guard hook installed: {result.get('hook_installed', False)}")
     print(f"Max fix cycles: {result['max_fix_cycles']}")
 
     print("\nLanes:")

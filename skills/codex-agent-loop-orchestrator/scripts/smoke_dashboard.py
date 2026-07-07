@@ -722,6 +722,212 @@ def _check_usage_limits_layout_markup(html_full: str) -> None:
         _fail("script never calls the /api/state?refresh=1 refresh variant")
 
 
+def _check_batch2_markup(html_full: str) -> None:
+    """Assert the Batch 2 (dashboard humanization) markup + wiring exist.
+
+    Covers, on the SERVED HTML (before any JS runs), the STRUCTURAL contract for
+    each Batch 2 fix -- the per-behavior runtime assertions live in main() against
+    a seeded loop. Every check here would fail loudly if a regression dropped a
+    fix's markup or its wiring hook.
+    """
+    # F14: the tracker-derived Progress section, its count element, and the
+    # milestones list + the renderProgress wiring.
+    for needle in ('id="progress-section"', 'id="progress-count"',
+                   'id="progress-fill"', 'id="progress-current-title"',
+                   'id="milestones"'):
+        if needle not in html_full:
+            _fail("F14: served HTML is missing the progress element {0!r}".format(needle))
+    if "renderProgress" not in html_full:
+        _fail("F14: script is missing the renderProgress wiring")
+    if "parse_tracker_progress" and "tracker_progress" not in html_full:
+        _fail("F14: script never reads state.tracker_progress")
+
+    # F3: the FIVE distinct blocked-taxonomy state classes must all be styled,
+    # plus the friendly awaiting-objective empty state. The classifier + empty
+    # state must be wired in the script.
+    for cls in ("lane-note-halt", "lane-note-gated", "lane-note-waiting",
+                "lane-note-infra", "lane-note-scope"):
+        if "." + cls not in html_full:
+            _fail("F3: served HTML is missing the taxonomy CSS class .{0}".format(cls))
+    if 'id="awaiting-objective"' not in html_full:
+        _fail("F3: served HTML is missing the #awaiting-objective empty state")
+    if "classifyLaneNote" not in html_full:
+        _fail("F3: script is missing the classifyLaneNote taxonomy classifier")
+    if "awaiting_objective" not in html_full:
+        _fail("F3: script never reads state.awaiting_objective")
+
+    # F6: the your-turn banner, its three color classes, and the analyzer +
+    # renderer wiring. Green/amber/blue must all be styled.
+    for cls in ("yt-green", "yt-amber", "yt-blue"):
+        if "." + cls not in html_full:
+            _fail("F6: served HTML is missing the your-turn banner class .{0}".format(cls))
+    if 'id="yourturn"' not in html_full:
+        _fail("F6: served HTML is missing the #yourturn banner")
+    for hook in ("analyzeNeedsYou", "renderYourTurn"):
+        if hook not in html_full:
+            _fail("F6: script is missing the wiring hook {0!r}".format(hook))
+
+    # F2: the project title + rename control markup, and the rename wiring that
+    # POSTs the third write endpoint. The <title> must be set to include the
+    # project (renderProject sets document.title).
+    for needle in ('id="project-title"', 'id="project-edit-btn"',
+                   'id="project-rename"', 'id="project-input"',
+                   'id="project-save-btn"'):
+        if needle not in html_full:
+            _fail("F2: served HTML is missing the project control {0!r}".format(needle))
+    if "/api/project" not in html_full:
+        _fail("F2: script never POSTs the /api/project endpoint")
+    if "renderProject" not in html_full or "document.title" not in html_full:
+        _fail("F2: script must set document.title via renderProject")
+
+    # F9: the needs-you sort + rank-1 affordance wiring.
+    for hook in ("sortLanesNeedsYou", "laneRankGroup"):
+        if hook not in html_full:
+            _fail("F9: script is missing the sort hook {0!r}".format(hook))
+    if "needs-you" not in html_full:
+        _fail("F9: served HTML is missing the .needs-you rank-1 card class")
+
+    # F12: the in-place lane reconcile must key cards by data-lane and preserve
+    # an open <details> across polls. Assert the reconcile does NOT clear the
+    # grid with textContent="" and DOES restore the open state.
+    if "data-lane" not in html_full:
+        _fail("F12: lane cards must be keyed by data-lane for in-place update")
+    if 'grid.textContent = ""' in html_full:
+        _fail("F12: renderLanes must not wipe the grid with textContent='' "
+              "(it stomps open <details>/scroll/focus)")
+    if "fillLaneCard" not in html_full:
+        _fail("F12: script is missing the fillLaneCard in-place builder")
+    # The reconcile must remember and restore the open <details> state.
+    if "wasOpen" not in html_full or ".open = true" not in html_full:
+        _fail("F12: renderLanes must preserve the open <details> state across polls")
+    # F12 FOCUS preservation (verifier finding): focus identity must survive the
+    # poll, not just the open state. The reconcile must (a) capture where focus
+    # lives BEFORE touching the DOM, (b) reorder minimally via insertBefore
+    # (an unconditional per-lane appendChild is a remove+reinsert that blurs
+    # focus even when the order is unchanged -- the exact regression found),
+    # and (c) restore focus by stable identity at the END of the pass with
+    # preventScroll. Assert each piece of that mechanism.
+    for hook in ("captureLaneFocus", "restoreLaneFocus"):
+        if hook not in html_full:
+            _fail("F12: script is missing the focus-preservation hook {0!r}".format(hook))
+    if "document.activeElement" not in html_full:
+        _fail("F12: the reconcile never inspects document.activeElement "
+              "(cannot capture/restore focus)")
+    if "preventScroll" not in html_full:
+        _fail("F12: focus restore must pass preventScroll so the page does not jump")
+    if "insertBefore" not in html_full:
+        _fail("F12: renderLanes must reorder minimally via insertBefore")
+    if "grid.appendChild(card)" in html_full:
+        _fail("F12: renderLanes still unconditionally re-appends every card "
+              "(appendChild on an inserted node is a remove+reinsert that "
+              "blurs focus each poll); reorder only out-of-position cards")
+
+    # i18n BINDINGS (verifier findings): the browser-tab <title> and the modal
+    # placeholders are user-visible strings and must carry dictionary bindings
+    # in the SOURCE markup, not just be patched by id at runtime.
+    if '<title data-i18n="page_title">' not in html_full:
+        _fail("i18n: the <title> element must carry a data-i18n binding")
+    for needle in ('data-i18n-placeholder="modal_lane_name_placeholder"',
+                   'data-i18n-placeholder="modal_role_placeholder"'):
+        if needle not in html_full:
+            _fail("i18n: missing placeholder binding {0!r}".format(needle))
+    if '"[data-i18n-placeholder]"' not in html_full:
+        _fail("i18n: applyStaticI18n must apply placeholders via the generic "
+              "[data-i18n-placeholder] loop")
+
+    # F13: the honest heartbeat labeler + the idle-vs-overdue keys.
+    if "heartbeatLabel" not in html_full:
+        _fail("F13: script is missing the heartbeatLabel honest-label helper")
+    if "heartbeat_gap_owners" not in html_full:
+        _fail("F13: script never reads doctor.heartbeat_gap_owners for overdue gating")
+
+    # F15: the prominent staleness line + the live-source note + reset helpers.
+    for needle in ('id="usage-staleness"', 'id="usage-asof-line"'):
+        if needle not in html_full:
+            _fail("F15: served HTML is missing the staleness element {0!r}".format(needle))
+    for hook in ("usageAsOfLine", "usage_resets_today_prefix", "usage_live_source_note"):
+        if hook not in html_full:
+            _fail("F15: script/dictionary is missing the staleness hook {0!r}".format(hook))
+
+
+def _check_batch2_i18n(rows: list) -> None:
+    """Assert every new Batch 2 i18n key exists with a non-empty en AND zh.
+
+    Complements the general i18n integrity check (which enforces non-empty
+    en/zh for ALL keys) by pinning the specific keys each Batch 2 fix
+    introduced, so a regression cannot silently drop one back to an inline
+    literal. ``rows`` is the parsed ``strings`` array.
+    """
+    by_key = {}
+    for row in rows:
+        by_key[row.get("key")] = row
+    required = [
+        # F14 progress
+        "progress_kicker", "progress_heading", "progress_count_label",
+        "progress_blocked_flag", "progress_current_label", "progress_empty",
+        # F3 awaiting-objective + taxonomy labels
+        "awaiting_objective_title", "awaiting_objective_body",
+        "lane_note_halt_label", "lane_note_gated_label", "lane_note_waiting_label",
+        "lane_note_infra_label", "lane_note_scope_label",
+        # F6 your-turn banner
+        "yourturn_badge_running", "yourturn_badge_gate", "yourturn_badge_confirm",
+        "yourturn_running_headline", "yourturn_gate_headline", "yourturn_confirm_headline",
+        "yourturn_where_lane", "yourturn_item_halt", "yourturn_item_stalled",
+        "yourturn_item_workerless", "yourturn_item_missing_dep", "yourturn_item_confirm",
+        "yourturn_running_active",
+        # F9 rank-1 + F14 goal
+        "lane_needs_you_flag", "lane_goal_label",
+        # F13 honest heartbeat
+        "lane_meta_heartbeat_idle",
+        # F2 project rename
+        "project_edit_button", "project_edit_aria", "project_input_aria",
+        "project_save_button", "project_cancel_button", "project_msg_empty",
+        "project_msg_saving", "project_msg_success", "project_msg_server_error",
+        "project_msg_network_error",
+        # F4 health passthrough (git/hook badges)
+        "health_git_label", "health_git_note_true", "health_git_note_false",
+        "health_hook_label", "health_hook_note_true", "health_hook_note_false",
+        # F15 usage staleness + reset formats
+        "usage_resets_prefix", "usage_resets_today_prefix", "usage_asof_line",
+        "usage_asof_just_now", "usage_live_source_note",
+    ]
+    for k in required:
+        row = by_key.get(k)
+        if row is None:
+            _fail("Batch 2 i18n dictionary is missing required key {0!r}".format(k))
+        if not (row.get("en") or "").strip():
+            _fail("Batch 2 i18n key {0!r} has an empty 'en' value".format(k))
+        if not (row.get("zh") or "").strip():
+            _fail("Batch 2 i18n key {0!r} has an empty 'zh' value".format(k))
+
+
+def _check_f8_tier_markup(html_full: str, rows: list) -> None:
+    """Assert the F8 recommended-tier lane chip markup, wiring, and i18n.
+
+    Covers, on the SERVED HTML (before any JS runs):
+      * fillLaneCard reads lane.recommended_tier and renders a neutral chip;
+      * the three F8 i18n keys exist with non-empty en AND zh;
+      * NO concrete model name (gpt-*) appears ANYWHERE in the served page --
+        tiers stay abstract in the UI too.
+    """
+    if "lane.recommended_tier" not in html_full:
+        _fail("F8: fillLaneCard never reads lane.recommended_tier")
+    if "lane_meta_tier_label" not in html_full:
+        _fail("F8: served HTML is missing the lane_meta_tier_label chip binding")
+    by_key = {row.get("key"): row for row in rows}
+    for k in ("lane_meta_tier_label", "lane_tier_highest", "lane_tier_second_highest"):
+        row = by_key.get(k)
+        if row is None:
+            _fail("F8 i18n dictionary is missing required key {0!r}".format(k))
+        if not (row.get("en") or "").strip():
+            _fail("F8 i18n key {0!r} has an empty 'en' value".format(k))
+        if not (row.get("zh") or "").strip():
+            _fail("F8 i18n key {0!r} has an empty 'zh' value".format(k))
+    # Grep-proof: no gpt-* model name anywhere in the served dashboard.
+    if "gpt-" in html_full.lower():
+        _fail("F8: a concrete model name (gpt-*) leaked into the served HTML")
+
+
 def _strip_comments_and_docstrings(source: str) -> str:
     """Return ``source`` with all comments and docstrings blanked out.
 
@@ -950,6 +1156,18 @@ def main() -> int:
             # (v4) Layout: Lanes first, then the collapsible Usage & Limits
             # section (with its own localStorage key, live summary, refresh).
             _check_usage_limits_layout_markup(html_full)
+            # (Batch 2) Progress view / your-turn banner / blocked taxonomy /
+            # project rename / needs-you sort / in-place update / honest
+            # heartbeat / usage staleness -- structural markup + wiring hooks.
+            _check_batch2_markup(html_full)
+            # (Batch 2 i18n) every new key has a non-empty en AND zh.
+            _b2_blob = re.search(
+                r'<script type="application/json" id="i18n-strings">(.*?)</script>',
+                html_full, re.S)
+            _b2_rows = json.loads(_b2_blob.group(1).strip()).get("strings", [])
+            _check_batch2_i18n(_b2_rows)
+            # (F8) recommended-tier lane chip: markup, wiring, i18n, grep-proof.
+            _check_f8_tier_markup(html_full, _b2_rows)
 
             # (3) GET /api/state -> 200, valid JSON, has the expected keys.
             status, body = _http_get(base + "/api/state")
@@ -959,7 +1177,8 @@ def main() -> int:
                 state = json.loads(body.decode("utf-8"))
             except ValueError as exc:
                 _fail("GET /api/state did not return valid JSON: {0}".format(exc))
-            for key in ("lanes", "requests", "doctor", "policy", "usage"):
+            for key in ("lanes", "requests", "doctor", "policy", "usage",
+                        "tracker_progress", "project", "awaiting_objective"):
                 if key not in state:
                     _fail("GET /api/state JSON is missing key {0!r}".format(key))
             if not isinstance(state["lanes"], list):
@@ -977,6 +1196,21 @@ def main() -> int:
             for expected in ("product", "implementation", "review"):
                 if expected not in lane_names:
                     _fail("state is missing default lane {0!r}".format(expected))
+            # F8: every lane carries an advisory recommended_tier on the wire,
+            # with the policy assignment (coding lane -> highest; else
+            # second-highest) and an ABSTRACT value (never a model name).
+            by_lane = {row.get("lane"): row for row in state["lanes"]}
+            for row in state["lanes"]:
+                tier = (row.get("recommended_tier") or "").strip()
+                if tier not in ("highest", "second-highest"):
+                    _fail("lane {0!r} has a non-abstract/absent recommended_tier {1!r}".format(
+                        row.get("lane"), tier))
+                if "gpt" in tier.lower():
+                    _fail("recommended_tier must be abstract, never a model name; got {0!r}".format(tier))
+            if (by_lane.get("implementation") or {}).get("recommended_tier") != "highest":
+                _fail("coding lane 'implementation' should surface recommended_tier 'highest'")
+            if (by_lane.get("product") or {}).get("recommended_tier") != "second-highest":
+                _fail("default lane 'product' should surface recommended_tier 'second-highest'")
             # The doctor imported in-process and produced a real snapshot.
             if state["doctor"].get("available") is not True:
                 _fail(
@@ -1293,6 +1527,159 @@ def main() -> int:
             # The raw current.md is still carried for the "View raw" details.
             if SEED_REQUEST_ID not in (impl_lane.get("current") or ""):
                 _fail("lane.current (raw) should still contain the seeded request id")
+
+            # ============================================================
+            # (Batch 2) Runtime assertions against a seeded loop.
+            # ============================================================
+
+            # (B2-F14) TRACKER PROGRESS: seed tracker.md with a Checkpoints
+            # section (done/current/blocked/todo) plus a Done-When section that
+            # must be EXCLUDED from the milestone count. /api/state's
+            # tracker_progress must report the checkpoint-only counts and pick
+            # the [~] item as current.
+            tracker_seed = (
+                "# Tracker\n\n"
+                "## Checkpoints\n\n"
+                "- [x] First slice shipped and verified.\n"
+                "- [x] Second slice shipped and verified.\n"
+                "- [!] Third slice blocked on a missing dependency.\n"
+                "- [~] Fourth slice: build the frontend dashboard.\n"
+                "- [ ] Fifth slice not started.\n\n"
+                "## Done When\n\n"
+                "- [ ] Acceptance criterion that is NOT a milestone.\n"
+                "- [ ] Another acceptance criterion.\n"
+            )
+            (loop_dir / "tracker.md").write_text(tracker_seed, encoding="utf-8")
+            # Seed a real request so the loop is NOT "awaiting objective" (a real
+            # request means work has begun). One BLOCKED-by-scope row proves the
+            # F3 taxonomy source data is present without a genuine halt.
+            requests_seed = (
+                "# Requests\n\n"
+                "## Queue\n\n"
+                "| request_id | status | owner_lane | iteration | source_docs "
+                "| last_message | next_action | updated_at |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| REQ-20260706-204609-implementation | REQUESTED | implementation "
+                "| 1 | goal.md | msg | Build the first slice and report evidence. "
+                "| 2026-07-06T21:00:00Z |\n"
+            )
+            (loop_dir / "requests.md").write_text(requests_seed, encoding="utf-8")
+            status, body = _http_get(base + "/api/state")
+            state_tp = json.loads(body.decode("utf-8"))
+            tp = state_tp.get("tracker_progress") or {}
+            if tp.get("available") is not True:
+                _fail("F14: tracker_progress.available should be True after seeding")
+            if tp.get("total") != 5:
+                _fail("F14: tracker_progress.total should be 5 (Checkpoints only, "
+                      "Done-When excluded); got {0!r}".format(tp.get("total")))
+            if tp.get("done") != 2:
+                _fail("F14: tracker_progress.done should be 2; got {0!r}".format(tp.get("done")))
+            if tp.get("blocked") != 1:
+                _fail("F14: tracker_progress.blocked should be 1; got {0!r}".format(tp.get("blocked")))
+            cps = tp.get("checkpoints") or []
+            if len(cps) != 5:
+                _fail("F14: tracker_progress.checkpoints should have 5 items; got {0}".format(len(cps)))
+            ci = tp.get("current_index")
+            if ci is None or cps[ci].get("status") != "current":
+                _fail("F14: current_index must point at the [~] in-progress checkpoint")
+            if "frontend" not in (cps[ci].get("title") or "").lower():
+                _fail("F14: current checkpoint title should be the frontend one; got {0!r}".format(
+                    cps[ci].get("title")))
+            # Status values must be exactly the four buckets.
+            statuses = [c.get("status") for c in cps]
+            if statuses != ["done", "done", "blocked", "current", "todo"]:
+                _fail("F14: checkpoint statuses wrong; got {0!r}".format(statuses))
+
+            # (B2-F3) AWAITING-OBJECTIVE: with a real seeded tracker + a real
+            # request in the queue, the loop is NOT awaiting an objective.
+            if state_tp.get("awaiting_objective") is not False:
+                _fail("F3: awaiting_objective should be False once real work exists")
+            # A brand-new bootstrap (fresh temp loop) whose goal.md is still the
+            # placeholder and has no real request MUST be awaiting_objective.
+            fresh = Path(tmp) / "fresh_loop"
+            _bootstrap(fresh)
+            fresh_state = loop_dashboard.build_state(fresh)
+            if fresh_state.get("awaiting_objective") is not True:
+                _fail("F3: a fresh placeholder loop must report awaiting_objective True")
+
+            # (B2-F2) PROJECT NAME: default derives from the loop-dir root; POST
+            # /api/project persists it atomically; junk input is rejected; and
+            # there is NO fourth write endpoint.
+            proj = state_tp.get("project") or {}
+            if not proj.get("name"):
+                _fail("F2: project.name must be non-empty (default from loop-dir root)")
+            if proj.get("is_default") is not True:
+                _fail("F2: project.is_default should be True before any rename")
+            project_path = loop_dir / "project.md"
+            # Happy path.
+            status, result = _http_post_json(base + "/api/project", {"name": "My Expense App"})
+            if status != 200 or not isinstance(result, dict) or result.get("ok") is not True:
+                _fail("F2: POST /api/project happy path should be ok; got {0} {1!r}".format(status, result))
+            if result.get("name") != "My Expense App":
+                _fail("F2: POST /api/project returned wrong name: {0!r}".format(result.get("name")))
+            # Persistence: file written + state reflects it + no longer default.
+            if not project_path.exists():
+                _fail("F2: project.md was not created by the write")
+            if "My Expense App" not in project_path.read_text(encoding="utf-8"):
+                _fail("F2: project.md does not contain the saved name")
+            status, body = _http_get(base + "/api/state")
+            proj2 = json.loads(body.decode("utf-8")).get("project") or {}
+            if proj2.get("name") != "My Expense App" or proj2.get("is_default") is not False:
+                _fail("F2: state should reflect the renamed project; got {0!r}".format(proj2))
+            # Atomicity pattern: no leftover temp file after the write.
+            leftovers = list(loop_dir.glob("project.md.tmp*"))
+            if leftovers:
+                _fail("F2: atomic write left a temp file behind: {0}".format(leftovers))
+            # Junk input rejected without changing project.md.
+            project_bytes_before = project_path.read_bytes()
+            for bad in ({"name": ""}, {"name": "  "}, {"name": "a\nb"}, {"name": 123}, {}):
+                status, result = _http_post_json(base + "/api/project", bad)
+                if status != 400 or not isinstance(result, dict) or result.get("ok") is not False:
+                    _fail("F2: POST /api/project {0!r} should be 400 ok:false; got {1} {2!r}".format(
+                        bad, status, result))
+                if project_path.read_bytes() != project_bytes_before:
+                    _fail("F2: an invalid /api/project {0!r} changed project.md".format(bad))
+            # HARD INVARIANT: exactly three write endpoints; a fourth is 404.
+            status, _ = _http_post_json(base + "/api/does-not-exist", {"x": 1})
+            if status != 404:
+                _fail("F2: a fourth POST path must be 404 (writes are exactly three); got {0}".format(status))
+            # And the handler routes ONLY the three known write paths.
+            src_dash = (Path(loop_dashboard.__file__).resolve()).read_text(encoding="utf-8")
+            do_post = src_dash[src_dash.find("def do_POST"):]
+            do_post = do_post[:do_post.find("def do_PUT")]
+            for endpoint in ('"/api/lanes"', '"/api/policy"', '"/api/project"'):
+                if endpoint not in do_post:
+                    _fail("F2: do_POST must route {0}".format(endpoint))
+            # No stray fourth /api/<x> write path in do_POST beyond the three.
+            post_paths = set(re.findall(r'"(/api/[a-z]+)"', do_post))
+            if post_paths != {"/api/lanes", "/api/policy", "/api/project"}:
+                _fail("F2: do_POST routes an unexpected set of write paths: {0}".format(
+                    sorted(post_paths)))
+
+            # (B2-F9) NEEDS-YOU ORDERING STABILITY: two consecutive /api/state
+            # reads return the SAME lane order (the server sort is stable; the
+            # client re-sorts deterministically on top). We assert server order
+            # is identical across polls so the client's stable re-sort cannot
+            # thrash.
+            order_a = [l.get("lane") for l in
+                       json.loads(_http_get(base + "/api/state")[1].decode("utf-8")).get("lanes", [])]
+            order_b = [l.get("lane") for l in
+                       json.loads(_http_get(base + "/api/state")[1].decode("utf-8")).get("lanes", [])]
+            if order_a != order_b:
+                _fail("F9: server lane order must be identical across two polls; "
+                      "got {0!r} then {1!r}".format(order_a, order_b))
+
+            # (B2-F13) HONEST HEARTBEAT: the doctor's heartbeat_gap_owners field
+            # (which gates the client's "overdue" label) is present in the
+            # passed-through doctor snapshot.
+            doc_snap = state_tp.get("doctor") or {}
+            if "heartbeat_gap_owners" not in doc_snap:
+                _fail("F13: doctor snapshot must pass through heartbeat_gap_owners")
+            for f in ("workerless_dependencies", "stalled_handoffs",
+                      "missing_dependency_blockers", "git_present", "hook_installed",
+                      "non_terminal_requests"):
+                if f not in doc_snap:
+                    _fail("doctor snapshot must pass through the Batch 1 field {0!r}".format(f))
 
             # (8) POLICY: default value, valid update, invalid rejections.
             status, body = _http_get(base + "/api/state")

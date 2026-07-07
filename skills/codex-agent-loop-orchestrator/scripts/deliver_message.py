@@ -175,6 +175,158 @@ def atomic_write(target: Path, body: str) -> None:
     fsync_dir(target.parent)
 
 
+def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
+    """Refresh ``lane``'s heartbeat when it sends a message (F7).
+
+    Updates two mirrors of the same value, both write-if-present (never creates
+    a file, never adds a lane):
+
+    - the ``heartbeat`` column of ``lane``'s row in ``agent-lanes.md``;
+    - the ``heartbeat:`` and ``last_updated:`` lines in
+      ``lanes/<lane>/current.md`` if that file exists.
+
+    A sender that delivers a message is demonstrably alive, so delivery is a
+    natural heartbeat. Returns the list of files it rewrote (for reporting).
+    Best-effort and defensive: any per-file failure is swallowed so a heartbeat
+    write never blocks the actual delivery.
+    """
+    if not lane:
+        return []
+    touched: list[str] = []
+
+    registry = loop_dir / "agent-lanes.md"
+    if _update_registry_heartbeat(registry, lane, when):
+        touched.append(posix_path(str(registry)))
+
+    current = loop_dir / "lanes" / lane / "current.md"
+    if _update_current_heartbeat(current, when):
+        touched.append(posix_path(str(current)))
+
+    return touched
+
+
+def _rewrite_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a tmp file + os.replace (atomic swap)."""
+    fd, tmp_name = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _update_registry_heartbeat(registry: Path, lane: str, when: str) -> bool:
+    """Set the ``heartbeat`` cell of ``lane``'s row in agent-lanes.md.
+
+    Locates the header row to find the heartbeat column index, then rewrites
+    only the matching lane's data row. Returns True if a row was updated.
+    """
+    if not registry.exists():
+        return False
+    try:
+        original = registry.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    lines = original.splitlines(keepends=True)
+    header_cols: Optional[list[str]] = None
+    hb_index: Optional[int] = None
+    lane_index = 0
+    changed = False
+    out: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            out.append(line)
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        # Separator row (all dashes/colons): pass through untouched.
+        if cells and all(set(c) <= {"-", ":", " "} for c in cells):
+            out.append(line)
+            continue
+        if header_cols is None:
+            header_cols = [c.lower() for c in cells]
+            if "heartbeat" in header_cols:
+                hb_index = header_cols.index("heartbeat")
+            if "lane" in header_cols:
+                lane_index = header_cols.index("lane")
+            out.append(line)
+            continue
+        # Data row.
+        if hb_index is None or lane_index >= len(cells):
+            out.append(line)
+            continue
+        if cells[lane_index] == lane:
+            while len(cells) <= hb_index:
+                cells.append("-")
+            if cells[hb_index] != when:
+                cells[hb_index] = when
+                changed = True
+            newline_suffix = "\n" if line.endswith("\n") else ""
+            out.append("| " + " | ".join(cells) + " |" + newline_suffix)
+        else:
+            out.append(line)
+
+    if not changed:
+        return False
+    try:
+        _rewrite_atomic(registry, "".join(out))
+    except OSError:
+        return False
+    return True
+
+
+def _update_current_heartbeat(current: Path, when: str) -> bool:
+    """Set ``heartbeat:`` and ``last_updated:`` lines in a lane current.md.
+
+    Only rewrites lines that already exist; never adds fields. Returns True if
+    anything changed.
+    """
+    if not current.exists():
+        return False
+    try:
+        original = current.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    changed = False
+    out_lines: list[str] = []
+    for line in original.splitlines(keepends=True):
+        newline_suffix = "\n" if line.endswith("\n") else ""
+        body = line[: -len(newline_suffix)] if newline_suffix else line
+        low = body.strip().lower()
+        if low.startswith("heartbeat:"):
+            replacement = "heartbeat: " + when
+            if body != replacement:
+                changed = True
+            out_lines.append(replacement + newline_suffix)
+        elif low.startswith("last_updated:"):
+            replacement = "last_updated: " + when
+            if body != replacement:
+                changed = True
+            out_lines.append(replacement + newline_suffix)
+        else:
+            out_lines.append(line)
+
+    if not changed:
+        return False
+    try:
+        _rewrite_atomic(current, "".join(out_lines))
+    except OSError:
+        return False
+    return True
+
+
 def append_index_row(
     inbox_dir: Path,
     title: str,
@@ -230,6 +382,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Re-deliver even if a message with the same id already exists in new/cur.",
     )
+    parser.add_argument(
+        "--no-heartbeat",
+        action="store_true",
+        help="Do not stamp the --from-lane heartbeat on delivery (default: stamp it).",
+    )
     args = parser.parse_args(argv)
 
     lane = args.to_lane.strip()
@@ -263,6 +420,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 posix_path(str(inbox_dir / already / (message_id + ".md"))), already
             )
         )
+        # A re-run still proves the sender is alive; refresh its heartbeat (F7)
+        # unless opted out.
+        if args.from_lane and not args.no_heartbeat:
+            for path in stamp_lane_heartbeat(loop_dir, args.from_lane.strip(), utc_now()):
+                print("heartbeat {0}".format(path))
         return 0
 
     target = inbox_dir / "new" / (message_id + ".md")
@@ -282,6 +444,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("delivered {0}".format(posix_path(str(target))))
     print("indexed {0}".format(posix_path(str(inbox_dir / "index.md"))))
     print("reader should process inbox/new then move to inbox/cur")
+
+    # F7: delivering a message is proof the sender lane is alive, so stamp its
+    # heartbeat (agent-lanes.md heartbeat column + lanes/<lane>/current.md
+    # last_updated/heartbeat if present). Best-effort; never blocks delivery.
+    if args.from_lane and not args.no_heartbeat:
+        for path in stamp_lane_heartbeat(loop_dir, args.from_lane.strip(), delivered_at):
+            print("heartbeat {0}".format(path))
+
     return 0
 
 

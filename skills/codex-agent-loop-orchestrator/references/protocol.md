@@ -224,6 +224,15 @@ The body may also be piped on stdin (omit `--message-file` or pass `-`). This
 is the same envelope you save under `docs/loop/messages/<request_id>/`; deliver
 the saved copy so the durable message store and the inbox stay consistent.
 
+When `--from-lane` is given, `deliver_message.py` also **stamps the sender
+lane's heartbeat** (F7): it sets the `heartbeat` cell of that lane's row in
+`agent-lanes.md` and the `heartbeat:`/`last_updated:` lines in
+`lanes/<lane>/current.md` when that file exists. Delivering a message is proof
+the sender is live, so a lane that sends its handoff can never look orphaned for
+lack of a heartbeat. It is write-if-present (it never adds a lane or creates a
+`current.md`) and best-effort (a heartbeat write never blocks the delivery).
+Pass `--no-heartbeat` to suppress it.
+
 ### Migration from the flat inbox.md fallback
 
 The original fallback appended a one-line summary row to a single
@@ -258,6 +267,19 @@ Rules:
 - `timestamp` is UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`); `iteration` is the request's current fix iteration; `lane` is the lane that made the transition; `note` is a short reason or evidence pointer.
 - Append the row in the same step that updates `requests.md`, so the log and the queue never diverge.
 - Count FIX_REQUESTED <-> IMPLEMENTING transitions for the same `request_id` from this log when applying the Anti-Thrash rule.
+
+### In-turn report-back (the run-log row is step 3 of 4)
+
+A Codex thread runs one turn and stops, so appending this row is not a
+follow-up chore - it is part of closing your turn. **Your turn is not finished
+until, in the same turn, you have (1) sent the reply message
+(`send_message_to_thread` / `codex_app.*`, or the `deliver_message.py`
+file-inbox fallback), (2) advanced the request in `requests.md`, (3) appended
+this run-log row, and (4) refreshed your heartbeat** (the `heartbeat` column in
+`agent-lanes.md` and the `last_updated`/`heartbeat` mirror in lane
+`current.md`). Finishing the work - even reaching `SHIP_CHECK_OK` - and ending
+the turn there leaves the requester waiting forever; the doctor reports that
+done-but-unadvanced state as `stalled_handoff`, naming the lane to nudge.
 
 ## Decision Log
 
@@ -470,6 +492,43 @@ needed_from_human:
 expected_reply:
 - Product updates scope, provides input, or marks request blocked.
 ```
+
+### Missing-Dependency Blocker (a blocker with a built-in exit ramp)
+
+A `BLOCKED` caused by a missing tool or package is not a dead end. It is a
+distinct, machine-classifiable blocker type that carries its own exit ramp:
+record exactly what is missing and the exact install command, ask the human for
+a one-line approval, and on approval install, re-run the failed verification,
+record fresh evidence, and unblock the **same** `request_id` (increment
+`iteration`, do not mint a new request).
+
+Mark it in the `BLOCKED` message with this greppable, flat format so the doctor
+and dashboard can classify it (rather than painting a generic red dead-end):
+
+```md
+blocker: missing_dependency
+dependency: pip | pytesseract | pip install pytesseract
+dependency: system | tesseract | choco install tesseract
+```
+
+- The single `blocker: missing_dependency` line is the marker the doctor greps.
+- Each `dependency:` line is `kind | name | install-command`, pipe-separated.
+- `kind` is exactly `pip` (a pip-installable Python package) or `system` (a
+  system binary that needs an installer/choco). Distinguish them: `pip`
+  packages are cheap and reversible; `system` binaries mutate the machine and
+  always need explicit human approval.
+
+Behavior is governed by `dependency_install` in `loop-policy.md`:
+
+- `ask` (default) - always ask the human before installing anything.
+- `auto-pip-only` - a lane may auto-install a `pip` dependency and re-run the
+  verify, but must still ask before any `system` binary.
+- `never` - never install; stay `BLOCKED` for a human to resolve out of band.
+
+On the retry after an approved install, reuse the same `request_id`, increment
+`iteration`, re-run the exact verify command, and record a fresh evidence file -
+the completion gate then accepts the request on real re-verified evidence, never
+on the assumption that the install fixed it.
 
 ## LOOP_STATUS
 
