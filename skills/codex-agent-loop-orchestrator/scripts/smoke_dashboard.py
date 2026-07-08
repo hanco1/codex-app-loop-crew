@@ -812,6 +812,281 @@ def _check_g18_progress_collapse(html_full: str, rows: list) -> None:
         _fail("G18: progress_toggle_aria has an empty 'zh' value")
 
 
+def _check_g21_doctor_notices(html_full: str, rows: list) -> None:
+    """G21: the doctor's warnings/issues surface as HUMANIZED notices.
+
+    The copy-humanization sweep adds a code->human-string map so the doctor's
+    findings read as plain sentences (with the raw doctor text kept as
+    expandable detail). An UNKNOWN code renders a GENERIC human line as the
+    primary text with the raw message demoted to the same expandable detail --
+    raw protocol text is never the primary line (round-2 verifier finding 5).
+
+    Verifies, on the SERVED HTML (before any JS runs):
+      * the #doctor-notices container exists INSIDE the #health-body collapsible
+        wrapper, AFTER the #badges tiles (so it folds with the section and never
+        hides the at-a-glance verdict badge in the head);
+      * renderBadges calls renderDoctorNotices, and that renderer reads BOTH
+        doc.issues and doc.warnings, threads a code->i18n-key map
+        (DOCTOR_NOTE_KEYS), skips codes already surfaced elsewhere
+        (DOCTOR_NOTE_SKIP), keeps the raw doctor message as an expandable detail
+        (.dn-raw), and renders the generic doctor_note_unknown line (raw message
+        in the detail) for an unknown code;
+      * every doctor-notice i18n key (the heading, the detail toggle, and each
+        mapped code) exists with a non-empty en AND zh -- the completeness scan
+        covering the new keys.
+    """
+    # The container lives inside the health-body collapsible wrapper, after the
+    # badges tiles (reuse the same body regex the collapse check uses).
+    body_m = re.search(
+        r'<div class="collapsible-body" id="health-body">(.*?)</div>\s*</section>',
+        html_full, re.S)
+    if not body_m:
+        _fail("G21: #health-body collapsible wrapper not found")
+    body_inner = body_m.group(1)
+    if 'id="doctor-notices"' not in body_inner:
+        _fail("G21: #doctor-notices container must live inside the #health-body fold")
+    if body_inner.find('id="badges"') > body_inner.find('id="doctor-notices"'):
+        _fail("G21: #doctor-notices must come AFTER the #badges tiles")
+
+    # The renderer + its wiring.
+    if "renderDoctorNotices" not in html_full:
+        _fail("G21: script is missing the renderDoctorNotices renderer")
+    rb_start = html_full.find("function renderBadges(")
+    rb_body = html_full[rb_start: rb_start + 2500] if rb_start >= 0 else ""
+    if "renderDoctorNotices(" not in rb_body:
+        _fail("G21: renderBadges must call renderDoctorNotices so notices repaint each poll")
+    for needle in ("DOCTOR_NOTE_KEYS", "DOCTOR_NOTE_SKIP",
+                   "doc.issues", "doc.warnings", "dn-raw"):
+        if needle not in html_full:
+            _fail("G21: renderDoctorNotices is missing {0!r}".format(needle))
+    # Unknown-code fallback (round 2): the PRIMARY text is the generic human
+    # line, never the raw protocol message; the raw text is demoted to the same
+    # expandable dn-detail/dn-raw block a known code uses.
+    if 't("doctor_note_unknown")' not in html_full:
+        _fail("G21: an unknown doctor code must render the generic "
+              "doctor_note_unknown line as its primary text")
+    unk_i = html_full.find('t("doctor_note_unknown")')
+    unk_after = html_full[unk_i: unk_i + 600]
+    if "dn-detail" not in unk_after or "dn-raw" not in unk_after:
+        _fail("G21: the unknown-code branch must demote the raw doctor message "
+              "to the expandable dn-detail/dn-raw block")
+    # The raw message must no longer be a primary dn-text anywhere.
+    if 'el("span", "dn-text", r.w.message' in html_full:
+        _fail("G21: raw doctor text must never be the primary dn-text line")
+
+    # Every doctor-notice i18n key exists with a non-empty en AND zh.
+    by_key = {row.get("key"): row for row in rows}
+    required = [
+        "doctor_notices_heading", "doctor_notice_detail_label",
+        "doctor_note_missing_file", "doctor_note_missing_lane_file",
+        "doctor_note_unknown_request_owner", "doctor_note_stale_marker",
+        "doctor_note_blocked_tracker_items", "doctor_note_fix_cycle_thrash",
+        "doctor_note_budget_exhausted", "doctor_note_missing_evidence",
+        "doctor_note_orphan_evidence", "doctor_note_evidence_naming",
+        "doctor_note_uncommitted_work", "doctor_note_handoff_sensitive_content",
+        "doctor_note_unknown",
+    ]
+    for k in required:
+        row = by_key.get(k)
+        if row is None:
+            _fail("G21: i18n dictionary is missing the doctor-notice key {0!r}".format(k))
+        if not (row.get("en") or "").strip():
+            _fail("G21: doctor-notice key {0!r} has an empty 'en' value".format(k))
+        if not (row.get("zh") or "").strip():
+            _fail("G21: doctor-notice key {0!r} has an empty 'zh' value".format(k))
+    # The mapped-code keys must all be present in the JS map (so a code the doctor
+    # can emit never renders its bare code when a human string exists).
+    for code_key in (
+        '"doctor_note_missing_file"', '"doctor_note_orphan_evidence"',
+        '"doctor_note_uncommitted_work"', '"doctor_note_fix_cycle_thrash"',
+    ):
+        if code_key not in html_full:
+            _fail("G21: DOCTOR_NOTE_KEYS is missing a mapped key {0}".format(code_key))
+
+
+def _check_g21_round2(html_full: str, rows: list) -> None:
+    """G21 round 2: the six sustained copy-verifier findings stay fixed.
+
+    Static contracts on the SERVED HTML + i18n blob (finding numbers from the
+    adjudicated verify pass):
+
+    (6) the WHOLE git/hook health-tile family speaks human (round-3 residue):
+        health_git_note_false is ACTIONABLE (names the verbatim ``git init``
+        command); the hook's note_false names ``install_precommit.py``; and NO
+        string value anywhere in the dictionary uses the toolmaker jargon
+        "scope guard" / "armed" / "honor system" (nor their ZH renderings).
+    (7) missing-dependency item: the action sentence is self-contained (no
+        trailing colon splicing the command mid-flow); the conversation link
+        and the command render as their own lines after it.
+    (8) tier-mismatch note: names the situation (model) and an action, not the
+        bare "(differs from recommended)".
+    (9a) the KNOWN bootstrap default role sentences render localized: the JS
+        carries an exact-match map (DEFAULT_ROLE_KEYS) + laneRoleText, wired in
+        fillLaneCard; every mapped i18n key exists with the en EXACTLY equal to
+        the bootstrap role string (so the exact-match lookup can never miss)
+        and a non-empty zh; the parameterized fallback role is matched by shape.
+    (9b) None-leak: placeholder blocker cells ("None.", "N/A", "-") are
+        filtered before any sentence is composed (isPlaceholderBlocker inside
+        classifyLaneNote), so a null-ish value never renders inside a
+        localized line -- the classifier falls back to its clean localized text.
+    (9c) agent-authored machine text (the halt's decision ask) is a set-off
+        .yt-quote block, never spliced into the localized sentence: the halt
+        string carries no Y placeholder and the old .replace("Y", ...) splice
+        is gone.
+    (10) usage naturalness: the folded 5h summary label is the natural ZH hour
+        word (u"5\\u5c0f\\u65f6") and the weekly reset date flows through the
+        locale pattern usage_date_md (ZH month-day-ri form).
+    """
+    by_key = {row.get("key"): row for row in rows}
+
+    # (6) actionable git note.
+    git_en = (by_key.get("health_git_note_false") or {}).get("en") or ""
+    if "git init" not in git_en:
+        _fail("G21r2: health_git_note_false must name the verbatim 'git init' "
+              "action; got {0!r}".format(git_en))
+    # (6, round 3) the hook's absent-state note is equally actionable.
+    hook_false_en = (by_key.get("health_hook_note_false") or {}).get("en") or ""
+    if "install_precommit.py" not in hook_false_en:
+        _fail("G21r2: health_hook_note_false must name the verbatim "
+              "install_precommit.py action; got {0!r}".format(hook_false_en))
+    # (6, round 3) the git subtitle explains what Git means for the human.
+    git_sub_en = (by_key.get("health_git_label") or {}).get("subtitle_en") or ""
+    if "git" not in git_sub_en.lower():
+        _fail("G21r2: health_git_label subtitle must mention Git; got {0!r}".format(
+            git_sub_en))
+    # (6, round 3) NO string value anywhere may use the toolmaker jargon the
+    # verifier flagged: "scope guard"/"scope-guard", whole-word "armed",
+    # "honor system"/"honor-system" -- nor the ZH renderings (fan-wei-bao-hu
+    # u8303u56f4u4fddu62a4, xie-fan-wei-shou-wei u5199u8303u56f4u5b88u536b,
+    # rong-yu u8363u8a89). Scans EVERY value + subtitle of EVERY key.
+    banned_en = [re.compile(r"scope[ -]guard", re.I),
+                 re.compile(r"\barmed\b", re.I),
+                 re.compile(r"honor[ -]system", re.I)]
+    banned_zh = ["\u8303\u56f4\u4fdd\u62a4",      # fan wei bao hu
+                 "\u5199\u8303\u56f4\u5b88\u536b",  # xie fan wei shou wei
+                 "\u8363\u8a89"]                    # rong yu
+    for row in rows:
+        for field in ("en", "zh", "subtitle_en", "subtitle_zh"):
+            val = row.get(field) or ""
+            for pat in banned_en:
+                if pat.search(val):
+                    _fail("G21r2: banned jargon {0!r} in i18n value {1!r}/{2}".format(
+                        pat.pattern, row.get("key"), field))
+            for tok in banned_zh:
+                if tok in val:
+                    _fail("G21r2: banned ZH jargon (escape {0!r}) in i18n value "
+                          "{1!r}/{2}".format(tok.encode("unicode_escape").decode("ascii"),
+                                             row.get("key"), field))
+
+    # (7) missing-dep three-part structure: self-contained action sentence.
+    dep = by_key.get("yourturn_item_missing_dep") or {}
+    dep_en = (dep.get("en") or "").strip()
+    dep_zh = (dep.get("zh") or "").strip()
+    if dep_en.endswith(":"):
+        _fail("G21r2: yourturn_item_missing_dep en must not end with a colon "
+              "(the where-line renders between it and the command)")
+    # u+FF1A is the fullwidth ZH colon (escape form: this file stays ASCII).
+    if dep_zh.endswith(":") or dep_zh.endswith("\uff1a"):
+        _fail("G21r2: yourturn_item_missing_dep zh must not end with a colon")
+    # The renderer keeps the three parts in order: sentence, where, command.
+    gate_i = html_full.find('li.appendChild(document.createTextNode(it.text));')
+    gate_seg = html_full[gate_i: gate_i + 800] if gate_i >= 0 else ""
+    i_where = gate_seg.find('"yt-where"')
+    i_cmd = gate_seg.find('"yt-cmd"')
+    if not (0 <= i_where < i_cmd):
+        _fail("G21r2: the your-turn item must render sentence -> where -> command")
+
+    # (8) tier-mismatch note names the situation + an action.
+    tm_en = ((by_key.get("lane_tier_mismatch_note") or {}).get("en") or "").lower()
+    if "model" not in tm_en:
+        _fail("G21r2: lane_tier_mismatch_note must say it is about the model; "
+              "got {0!r}".format(tm_en))
+    if "switch" not in tm_en and "update" not in tm_en:
+        _fail("G21r2: lane_tier_mismatch_note must name an action (switch/update)")
+
+    # (9a) localized default roles: JS map + exact-match EN + non-empty ZH.
+    for hook in ("DEFAULT_ROLE_KEYS", "laneRoleText", "GENERIC_ROLE_RE"):
+        if hook not in html_full:
+            _fail("G21r2: script is missing the role-localization hook {0!r}".format(hook))
+    if "laneRoleText(lane.role)" not in html_full:
+        _fail("G21r2: fillLaneCard must render roles through laneRoleText")
+    role_keys = {
+        "product": "lane_role_default_product",
+        "implementation": "lane_role_default_implementation",
+        "review": "lane_role_default_review",
+        "research": "lane_role_default_research",
+        "visual": "lane_role_default_visual",
+        "security": "lane_role_default_security",
+        "data": "lane_role_default_data",
+        "docs": "lane_role_default_docs",
+        "release": "lane_role_default_release",
+        "media": "lane_role_default_media",
+    }
+    bootstrap_roles = {}
+    bootstrap_roles.update(
+        {k: v["role"] for k, v in bootstrap_agent_loop.DEFAULT_LANES.items()})
+    bootstrap_roles.update(
+        {k: v["role"] for k, v in bootstrap_agent_loop.LANE_PRESETS.items()})
+    for lane_name, key in role_keys.items():
+        row = by_key.get(key)
+        if row is None:
+            _fail("G21r2: i18n dictionary is missing the role key {0!r}".format(key))
+        if not (row.get("zh") or "").strip():
+            _fail("G21r2: role key {0!r} has an empty 'zh' value".format(key))
+        expected = bootstrap_roles.get(lane_name)
+        if expected and (row.get("en") or "") != expected:
+            _fail("G21r2: role key {0!r} en must EXACTLY equal the bootstrap "
+                  "default {1!r} (exact-match lookup); got {2!r}".format(
+                      key, expected, row.get("en")))
+        # And the exact EN string must appear as a DEFAULT_ROLE_KEYS map key.
+        if expected and json.dumps(expected) not in html_full:
+            _fail("G21r2: DEFAULT_ROLE_KEYS is missing the exact bootstrap role "
+                  "string for {0!r}".format(lane_name))
+    if by_key.get("lane_role_default_generic") is None:
+        _fail("G21r2: i18n dictionary is missing lane_role_default_generic")
+
+    # (9b) None-leak: the placeholder filter exists and classifyLaneNote uses it.
+    if "isPlaceholderBlocker" not in html_full:
+        _fail("G21r2: script is missing the isPlaceholderBlocker filter")
+    re_i = html_full.find("PLACEHOLDER_BLOCKER_RE")
+    re_line = html_full[re_i: re_i + 120] if re_i >= 0 else ""
+    if "none" not in re_line.lower():
+        _fail("G21r2: PLACEHOLDER_BLOCKER_RE must match the 'None.' placeholder")
+    cl_start = html_full.find("function classifyLaneNote(")
+    cl_end = html_full.find("\n      function ", cl_start + 1)
+    cl_body = html_full[cl_start: cl_end if cl_end > 0 else cl_start + 6000]
+    if "isPlaceholderBlocker" not in cl_body:
+        _fail("G21r2: classifyLaneNote must filter placeholder blockers "
+              "(the ZH intake-note 'None.' leak)")
+
+    # (9c) the halt decision text is a set-off quote, never spliced.
+    halt_en = ((by_key.get("yourturn_item_halt") or {}).get("en") or "")
+    if re.search(r"\bY\b", halt_en):
+        _fail("G21r2: yourturn_item_halt must no longer carry the Y splice "
+              "placeholder; got {0!r}".format(halt_en))
+    if '.replace("Y"' in html_full:
+        _fail("G21r2: the old .replace(\"Y\", ...) mid-sentence splice is back")
+    if "yt-quote" not in html_full:
+        _fail("G21r2: the .yt-quote set-off block for agent-authored text is missing")
+    if "it.quote" not in html_full:
+        _fail("G21r2: renderYourTurn never renders the item's quote block")
+
+    # (10) usage naturalness: ZH 5-hour label + locale date pattern.
+    s5_zh = ((by_key.get("usage_summary_5h") or {}).get("zh") or "")
+    if s5_zh != "5\u5c0f\u65f6":
+        _fail("G21r2: usage_summary_5h zh must be '5\u5c0f\u65f6'; got {0!r}".format(s5_zh))
+    md = by_key.get("usage_date_md")
+    if md is None:
+        _fail("G21r2: i18n dictionary is missing usage_date_md")
+    if "MON" not in (md.get("en") or "") or "DD" not in (md.get("en") or ""):
+        _fail("G21r2: usage_date_md en must carry the MON and DD tokens")
+    if not (md.get("zh") or "").endswith("\u65e5"):
+        _fail("G21r2: usage_date_md zh must end with '\u65e5' (M\u6708D\u65e5)")
+    if 't("usage_date_md")' not in html_full:
+        _fail("G21r2: localReset must compose the weekly reset date through "
+              "usage_date_md")
+
+
 def _check_batch2_markup(html_full: str) -> None:
     """Assert the Batch 2 (dashboard humanization) markup + wiring exist.
 
@@ -1214,8 +1489,8 @@ def _check_g20_stall_honesty(html_full: str, rows: list) -> None:
       * a distinct ``yourturn_item_stalled_review`` key exists with a non-empty
         en AND zh (the general integrity check enforces non-empty; this pins it);
       * that REVIEWING-case string is HONEST -- its en never claims the review
-        "finished", and it names what the files actually prove (the gate + the
-        missing verdict);
+        "finished", and it names what the files actually prove (the automated
+        check passed + the review decision is still missing);
       * the original ``yourturn_item_stalled`` (the work_done_unreported case,
         where "finished" is accurate) still exists;
       * renderYourTurn BRANCHES on the machine reason: it references the new
@@ -1235,11 +1510,16 @@ def _check_g20_stall_honesty(html_full: str, rows: list) -> None:
         _fail("G20: yourturn_item_stalled_review has an empty 'zh' value")
     if "finish" in en.lower():
         _fail("G20: the REVIEWING stall string must NOT claim the review 'finished'; got {0!r}".format(en))
-    # It must say what the files prove: the gate passed + no verdict returned.
+    # It must say what the files prove: the automated check passed + the review
+    # decision has not come back yet (humanized wording of "gate green, no
+    # verdict" -- G21 dropped the raw gate/verdict jargon from the user text).
     low = en.lower()
-    if "gate" not in low or "verdict" not in low:
-        _fail("G20: the honest REVIEWING stall string must name the gate + the missing verdict; "
+    if "check" not in low:
+        _fail("G20: the honest REVIEWING stall string must name the passed automated check; "
               "got {0!r}".format(en))
+    if "decision" not in low and "review" not in low:
+        _fail("G20: the honest REVIEWING stall string must name the still-missing review "
+              "decision; got {0!r}".format(en))
     # The original (work_done_unreported) key must remain -- "finished" is honest there.
     if by_key.get("yourturn_item_stalled") is None:
         _fail("G20: the original yourturn_item_stalled key must remain for the work_done_unreported case")
@@ -1671,6 +1951,16 @@ def main() -> int:
             # / Usage & Limits but default OPEN; the fold survives the poll
             # (renderProgress never re-folds); the new label key has en + zh.
             _check_g18_progress_collapse(html_full, _b2_rows)
+            # (G21) the doctor's warnings/issues surface as humanized notices
+            # (code->human-string map, raw doctor text as expandable detail /
+            # unknown-code fallback), inside the System Checks fold.
+            _check_g21_doctor_notices(html_full, _b2_rows)
+            # (G21 round 2) the six sustained copy-verifier findings stay
+            # fixed: unknown-code generic fallback, actionable git note,
+            # missing-dep sentence structure, actionable tier-mismatch note,
+            # localized default roles + None-leak + quoted machine text, and
+            # natural ZH usage labels/date pattern.
+            _check_g21_round2(html_full, _b2_rows)
 
             # (3) GET /api/state -> 200, valid JSON, has the expected keys.
             status, body = _http_get(base + "/api/state")
