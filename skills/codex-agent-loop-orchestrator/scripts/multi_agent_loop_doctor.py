@@ -1391,6 +1391,29 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # misreport that legitimate hold as a lane to nudge.
     held_for_human_qa = requests_held_for_human_qa(loop_dir)
 
+    # G20: an honest ``reason`` on each stall record + a grace window for the
+    # REVIEWING case. The three cases and what the files actually PROVE:
+    #  * REQUESTED / IMPLEMENTING flagged by the request's OWN green gate
+    #    evidence, or ANY state with an archived REVIEW_DONE message: the owner
+    #    lane demonstrably finished ITS OWN work (gate green on its deliverable),
+    #    or the review provably finished (REVIEW_DONE exists), yet never reported
+    #    back. IMMEDIATE stall, reason ``work_done_unreported``.
+    #  * REVIEWING flagged ONLY by done_by_gate (no REVIEW_DONE yet): the green
+    #    evidence proves the IMPLEMENTATION finished, NOT that the review did.
+    #    Implementation evidence turns green BEFORE the request is routed to
+    #    review, so this signal is true for the ENTIRE healthy review; firing
+    #    immediately would be a standing false alarm that trains the human to
+    #    ignore the banner. We therefore only flag it once the owner lane (the
+    #    reviewer) looks IDLE -- its heartbeat is stale or missing, the SAME
+    #    source as orphan_suspect / stale_heartbeat_active_owner (the owner sits
+    #    in heartbeat_gap_owners). Chosen grace rule (robust + minimal): reuse
+    #    that existing per-owner gap set rather than tracking a separate
+    #    time-in-state clock; a missing heartbeat for a lane that owns a REVIEWING
+    #    request is itself the "owner idle" signal (that same lane already trips
+    #    stale_heartbeat_active_owner), so no new timestamp plumbing is needed.
+    #    Reason ``implementation_evidence_green_no_verdict``; the wording never
+    #    claims the review "finished".
+    gap_owner_lanes = {gap["lane"] for gap in heartbeat_gap_owners}
     stalled_handoff_requests: list[dict[str, str]] = []
     pre_acceptance_states = {"REQUESTED", "IMPLEMENTING", "REVIEWING"}
     for request in non_terminal_requests:
@@ -1403,15 +1426,33 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             continue
         done_by_gate = request_id in gate_passing_requests
         done_by_review = _has_archived_review_done(loop_dir, request_id)
-        if done_by_gate or done_by_review:
-            stalled_handoff_requests.append(
-                {
-                    "request_id": request_id,
-                    "lane": (request.get("owner_lane") or "").strip() or "(unassigned)",
-                    "status": status,
-                    "evidence": "SHIP_CHECK_OK" if done_by_gate else "archived REVIEW_DONE",
-                }
-            )
+        if not (done_by_gate or done_by_review):
+            continue
+        owner = (request.get("owner_lane") or "").strip() or "(unassigned)"
+        if status == "REVIEWING" and done_by_gate and not done_by_review:
+            if owner not in gap_owner_lanes:
+                # G20 grace window: the reviewer's heartbeat is fresh, so review
+                # is healthily in progress. Green implementation evidence is
+                # EXPECTED at this point -- not a stall. Do not nudge.
+                continue
+            reason = "implementation_evidence_green_no_verdict"
+            evidence = "SHIP_CHECK_OK"
+        else:
+            reason = "work_done_unreported"
+            # An archived REVIEW_DONE is the stronger proof (review provably
+            # finished), so cite it whenever present -- including the REVIEWING
+            # case where gate-green evidence AND a REVIEW_DONE both exist (the
+            # REVIEW_DONE overrides the grace window and is the honest evidence).
+            evidence = "archived REVIEW_DONE" if done_by_review else "SHIP_CHECK_OK"
+        stalled_handoff_requests.append(
+            {
+                "request_id": request_id,
+                "lane": owner,
+                "status": status,
+                "evidence": evidence,
+                "reason": reason,
+            }
+        )
 
     # F11 workerless_lane_dependency: a lane with NO verified thread (status
     # needs-thread / unverified) that nonetheless has work waiting on it -- it
@@ -1547,18 +1588,36 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             }
         )
     for stalled in stalled_handoff_requests:
+        if stalled.get("reason") == "implementation_evidence_green_no_verdict":
+            # G20 honest wording: the gate proves IMPLEMENTATION passed, not that
+            # review finished. Say exactly what the files show and never "finished".
+            message = (
+                "request {req} has sat in REVIEWING without a verdict: the "
+                "implementation evidence already passed the gate ({evidence}) but "
+                "review has not returned one, and lane {lane} looks idle "
+                "(stale/missing heartbeat) -- go to the {lane} thread and push it "
+                "to close the turn"
+            ).format(
+                req=stalled["request_id"],
+                evidence=stalled["evidence"],
+                lane=stalled["lane"],
+            )
+        else:
+            message = (
+                "request {req} is still {status} but its work is done "
+                "({evidence}); nudge lane {lane} to send the reply, advance "
+                "requests.md, and append the run-log row"
+            ).format(
+                req=stalled["request_id"],
+                status=stalled["status"],
+                evidence=stalled["evidence"],
+                lane=stalled["lane"],
+            )
         warnings.append(
             {
                 "severity": "warning",
                 "code": "stalled_handoff",
-                "message": "request {req} is still {status} but its work is done "
-                "({evidence}); nudge lane {lane} to send the reply, advance "
-                "requests.md, and append the run-log row".format(
-                    req=stalled["request_id"],
-                    status=stalled["status"],
-                    evidence=stalled["evidence"],
-                    lane=stalled["lane"],
-                ),
+                "message": message,
             }
         )
     for dep in workerless_dependencies:

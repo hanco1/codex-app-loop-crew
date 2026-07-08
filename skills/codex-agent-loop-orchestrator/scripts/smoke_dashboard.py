@@ -722,6 +722,96 @@ def _check_usage_limits_layout_markup(html_full: str) -> None:
         _fail("script never calls the /api/state?refresh=1 refresh variant")
 
 
+def _check_g18_progress_collapse(html_full: str, rows: list) -> None:
+    """G18: the Progress section is foldable (same mechanism as System Checks /
+    Usage & Limits) but DEFAULT OPEN, and the fold state survives the 2s poll.
+
+    Verifies, on the SERVED HTML (before any JS runs):
+      * #progress-head is a 'section-head collapsible' toggle carrying the hooks
+        (role=button, aria-controls="progress-body", the localized
+        data-i18n-aria binding) and starts OPEN (aria-expanded="true") -- unlike
+        the two collapse-by-default sections;
+      * #progress-body is a 'collapsible-body' wrapping the folding content
+        (#progress-fill + #milestones); the live "done / total" head count
+        (#progress-head-count) lives in the HEAD, OUTSIDE the body, so folding
+        never hides the headline number;
+      * the script carries a DISTINCT progress-specific localStorage key
+        (separate from language / health / usage), the toggle/paint/wire hooks,
+        and defaults progressUserExpanded to true (OPEN);
+      * renderProgress never touches the fold classes (no is-collapsed, no
+        paintProgressCollapse call) -- so the open/closed choice survives every
+        poll (F12's in-place guarantee applied to the fold);
+      * the progress_toggle_aria i18n key exists with a non-empty en AND zh.
+    """
+    head_m = re.search(r'<div class="section-head collapsible"[^>]*id="progress-head"[^>]*>',
+                       html_full)
+    if not head_m:
+        _fail("G18: #progress-head is not a 'section-head collapsible' toggle div")
+    head_tag = head_m.group(0)
+    for needle in ('role="button"', 'aria-controls="progress-body"',
+                   'data-i18n-aria="progress_toggle_aria"'):
+        if needle not in head_tag:
+            _fail("G18: #progress-head is missing its toggle hook {0!r}".format(needle))
+    # DEFAULT OPEN: the served markup declares aria-expanded="true".
+    if 'aria-expanded="true"' not in head_tag:
+        _fail("G18: #progress-head must start OPEN (aria-expanded=\"true\")")
+
+    # The collapsible body wrapper must exist and wrap the folding content.
+    body_m = re.search(r'<div class="collapsible-body" id="progress-body">(.*?)</div>\s*</section>',
+                       html_full, re.S)
+    if not body_m:
+        _fail("G18: served HTML has no #progress-body collapsible wrapper")
+    body_inner = body_m.group(1)
+    for needle in ('id="progress-fill"', 'id="milestones"'):
+        if needle not in body_inner:
+            _fail("G18: #progress-body must wrap the folding content {0!r}".format(needle))
+
+    # The live head count must live in the HEAD, OUTSIDE the collapsible body --
+    # so the headline number stays visible when the section is folded.
+    head_region = head_m.string[head_m.start():body_m.start()]
+    if 'id="progress-head-count"' not in head_region:
+        _fail("G18: the live #progress-head-count must be in the head, before #progress-body")
+    if 'id="progress-head-count"' in body_inner:
+        _fail("G18: #progress-head-count must NOT be inside the collapsible body (it would hide when folded)")
+
+    # Persistence + wiring: a progress-specific localStorage key DISTINCT from
+    # the language, health, and usage keys, plus the toggle/paint/wire hooks.
+    if "loop_dashboard_progress_expanded" not in html_full:
+        _fail("G18: script is missing the progress-collapse localStorage key")
+    for other in ("loop_dashboard_health_expanded", "loop_dashboard_usage_expanded"):
+        if other not in html_full:
+            _fail("G18: expected the {0} key to remain present (distinct keys)".format(other))
+    for hook in ("toggleProgressCollapse", "paintProgressCollapse", "wireProgressToggle"):
+        if hook not in html_full:
+            _fail("G18: script is missing the progress collapse hook {0!r}".format(hook))
+    # Default OPEN in the source state.
+    if "progressUserExpanded = true" not in html_full:
+        _fail("G18: progressUserExpanded must default to true (Progress OPEN by default)")
+
+    # The fold survives the poll: renderProgress must not re-fold. Bound the scan
+    # to the renderProgress body and assert it never touches the fold classes or
+    # re-paints the collapse, so a poll cannot stomp the user's open/closed choice.
+    rp_start = html_full.find("function renderProgress(")
+    if rp_start < 0:
+        _fail("G18: renderProgress not found")
+    rp_end = html_full.find("\n      function ", rp_start + 1)
+    rp_body = html_full[rp_start: rp_end if rp_end > 0 else rp_start + 4000]
+    if "is-collapsed" in rp_body:
+        _fail("G18: renderProgress must not touch the fold classes (a poll would stomp the fold)")
+    if "paintProgressCollapse" in rp_body:
+        _fail("G18: renderProgress must not re-paint the collapse (the fold survives the poll on its own)")
+
+    # The new i18n key exists with a non-empty en AND zh.
+    by_key = {row.get("key"): row for row in rows}
+    row = by_key.get("progress_toggle_aria")
+    if row is None:
+        _fail("G18: i18n dictionary is missing the progress_toggle_aria key")
+    if not (row.get("en") or "").strip():
+        _fail("G18: progress_toggle_aria has an empty 'en' value")
+    if not (row.get("zh") or "").strip():
+        _fail("G18: progress_toggle_aria has an empty 'zh' value")
+
+
 def _check_batch2_markup(html_full: str) -> None:
     """Assert the Batch 2 (dashboard humanization) markup + wiring exist.
 
@@ -901,6 +991,9 @@ def _check_batch2_i18n(rows: list) -> None:
         "yourturn_badge_running", "yourturn_badge_gate", "yourturn_badge_confirm",
         "yourturn_running_headline", "yourturn_gate_headline", "yourturn_confirm_headline",
         "yourturn_where_lane", "yourturn_item_halt", "yourturn_item_stalled",
+        # G20: the honest REVIEWING-stall variant (implementation evidence green,
+        # no verdict) -- distinct from the "finished" work_done_unreported key.
+        "yourturn_item_stalled_review",
         "yourturn_item_workerless", "yourturn_item_missing_dep", "yourturn_item_confirm",
         "yourturn_running_active",
         # G13 recommended-answer label.
@@ -1057,17 +1150,20 @@ def _check_g11_dashboard(tmp: Path) -> None:
 def _check_g14_dashboard(tmp: Path) -> None:
     """G14(c): the dashboard state carries recommended + observed tier per lane.
 
-    Bootstraps with adoption-time observed-model stamping so implementation
-    MATCHES its recommended tier and product MISMATCHES, then asserts the
-    ``build_state`` lane objects carry ``observed_model`` (the DATA value),
-    ``observed_tier`` (the abstract tag), and ``tier_mismatch`` (True only for
-    product). The chip renders these; the amber styling keys off tier_mismatch.
-    A lane with no observed model reports tier_mismatch False (not-yet-observed).
+    Under G16 every lane's registry tier defaults to highest, so a mismatch now
+    comes from a lane OBSERVED running a LOWER tier than recorded. Bootstraps
+    with adoption-time observed-model stamping so implementation MATCHES its
+    recommended tier (both highest) and product MISMATCHES (observed
+    second-highest vs recommended highest), then asserts the ``build_state`` lane
+    objects carry ``observed_model`` (the DATA value), ``observed_tier`` (the
+    abstract tag), and ``tier_mismatch`` (True only for product). The chip
+    renders these; the amber styling keys off tier_mismatch. A lane with no
+    observed model reports tier_mismatch False (not-yet-observed).
     """
     loop = tmp / "g14_dash_loop"
     _bootstrap(loop, extra_argv=[
         "--observed-model", "implementation=gpt-5.5 xhigh (highest)",
-        "--observed-model", "product=gpt-5.5 xhigh (highest)",
+        "--observed-model", "product=gpt-5.4 xhigh (second-highest)",
     ])
     state = loop_dashboard.build_state(loop)
     by_lane = {l.get("lane"): l for l in state.get("lanes", [])}
@@ -1082,14 +1178,146 @@ def _check_g14_dashboard(tmp: Path) -> None:
     if impl.get("tier_mismatch") is not False:
         _fail("G14: implementation (observed matches recommended) must not be a tier_mismatch")
     if prod.get("tier_mismatch") is not True:
-        _fail("G14: product (observed highest vs recommended second-highest) must be tier_mismatch True")
-    if prod.get("observed_tier") != "highest":
-        _fail("G14: product observed_tier should be 'highest'")
+        _fail("G14: product (observed second-highest vs recommended highest) must be tier_mismatch True")
+    if prod.get("observed_tier") != "second-highest":
+        _fail("G14: product observed_tier should be 'second-highest'")
     # A not-yet-observed lane: no observed model, no mismatch.
     if rev.get("observed_model"):
         _fail("G14: review lane should have no observed_model (not stamped)")
     if rev.get("tier_mismatch") is not False:
         _fail("G14: a not-yet-observed lane must report tier_mismatch False")
+
+
+def _check_g17_markup(html_full: str) -> None:
+    """G17: the 'all running' banner attributes each 'working on this request'
+    line ONLY to the request's owner_lane.
+
+    Static contract on the SERVED HTML (the runtime attribution proof lives in
+    ``_check_g17_banner_attribution`` against build_state): renderYourTurn's
+    running branch must read the server-computed ``cr.is_owner`` flag, SKIP a
+    non-owning lane, and dedup by request_id so one request never yields two
+    'working on' items. Guards against a regression that re-lists every
+    recently-active lane carrying the owner's next_action (the run-3 duplicate).
+    """
+    if "is_owner" not in html_full:
+        _fail("G17: renderYourTurn must read cr.is_owner to attribute the running item to the owner")
+    if "cr.is_owner !== true" not in html_full:
+        _fail("G17: the running banner must skip a non-owning lane (cr.is_owner !== true)")
+    if "seenRunReqIds" not in html_full:
+        _fail("G17: the running banner must dedup by request_id (one item per request)")
+
+
+def _check_g20_stall_honesty(html_full: str, rows: list) -> None:
+    """G20: the your-turn stall item follows the honest reason split.
+
+    Static contract on the SERVED HTML + i18n blob:
+      * a distinct ``yourturn_item_stalled_review`` key exists with a non-empty
+        en AND zh (the general integrity check enforces non-empty; this pins it);
+      * that REVIEWING-case string is HONEST -- its en never claims the review
+        "finished", and it names what the files actually prove (the gate + the
+        missing verdict);
+      * the original ``yourturn_item_stalled`` (the work_done_unreported case,
+        where "finished" is accurate) still exists;
+      * renderYourTurn BRANCHES on the machine reason: it references the new
+        key AND the doctor reason token ``implementation_evidence_green_no_verdict``
+        so a REVIEWING gate-green stall renders the honest string, not the
+        "finished" one.
+    """
+    by_key = {row.get("key"): row for row in rows}
+    review = by_key.get("yourturn_item_stalled_review")
+    if review is None:
+        _fail("G20: i18n dictionary is missing the yourturn_item_stalled_review key")
+    en = (review.get("en") or "").strip()
+    zh = (review.get("zh") or "").strip()
+    if not en:
+        _fail("G20: yourturn_item_stalled_review has an empty 'en' value")
+    if not zh:
+        _fail("G20: yourturn_item_stalled_review has an empty 'zh' value")
+    if "finish" in en.lower():
+        _fail("G20: the REVIEWING stall string must NOT claim the review 'finished'; got {0!r}".format(en))
+    # It must say what the files prove: the gate passed + no verdict returned.
+    low = en.lower()
+    if "gate" not in low or "verdict" not in low:
+        _fail("G20: the honest REVIEWING stall string must name the gate + the missing verdict; "
+              "got {0!r}".format(en))
+    # The original (work_done_unreported) key must remain -- "finished" is honest there.
+    if by_key.get("yourturn_item_stalled") is None:
+        _fail("G20: the original yourturn_item_stalled key must remain for the work_done_unreported case")
+    # The client must BRANCH on the doctor reason to pick the honest string.
+    if "yourturn_item_stalled_review" not in html_full:
+        _fail("G20: renderYourTurn never references yourturn_item_stalled_review (no honest branch)")
+    if "implementation_evidence_green_no_verdict" not in html_full:
+        _fail("G20: renderYourTurn must branch on the reason token "
+              "implementation_evidence_green_no_verdict to select the honest string")
+
+
+def _check_g17_banner_attribution(tmp: Path) -> None:
+    """G17: exactly ONE 'working on this request' item, attributed to the owner.
+
+    Reproduces the run-3 shape: one IMPLEMENTING request owned by data-eng, with
+    product carrying a FRESH heartbeat whose current.md still points at data-eng's
+    request. ``build_state`` must flag data-eng's current_request.is_owner True and
+    product's is_owner False, so the client's running banner emits exactly one
+    'working on' item -- attributed to data-eng -- never a second one carrying
+    data-eng's next_action for product.
+    """
+    loop = tmp / "g17_loop"
+    _bootstrap(loop)
+    # Register a data-eng lane (the request's owner).
+    res = loop_dashboard.add_lane(loop, "data-eng", "Own the data pipeline")
+    if not (isinstance(res, dict) and res.get("ok")):
+        _fail("G17: could not add the data-eng lane: {0!r}".format(res))
+    rid = "REQ-20260708-090000-data-eng"
+    # One IMPLEMENTING request owned by data-eng.
+    (loop / "requests.md").write_text(
+        "# Requests\n\n## Queue\n\n"
+        "| request_id | status | owner_lane | iteration | source_docs "
+        "| last_message | next_action | updated_at |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "| {rid} | IMPLEMENTING | data-eng | 2 | goal.md | building "
+        "| Wire the parser into build_state | 2026-07-08T09:00:00Z |\n".format(rid=rid),
+        encoding="utf-8",
+    )
+    ts = "2026-07-08T09:05:00Z"
+    # data-eng: the OWNER, current.md points at the request.
+    (loop / "lanes" / "data-eng" / "current.md").write_text(
+        "# Data Eng Current State\n\n"
+        "current_request_id: {rid}\nstatus: implementing\niteration: 2\n"
+        "last_updated: {ts}\nheartbeat: {ts}\n".format(rid=rid, ts=ts),
+        encoding="utf-8",
+    )
+    # product: a NON-owner whose current.md still points at data-eng's request,
+    # with a fresh heartbeat (the exact run-3 shape that produced the duplicate).
+    (loop / "lanes" / "product" / "current.md").write_text(
+        "# Product Current State\n\n"
+        "current_request_id: {rid}\nstatus: monitoring\niteration: 2\n"
+        "last_updated: {ts}\nheartbeat: {ts}\n".format(rid=rid, ts=ts),
+        encoding="utf-8",
+    )
+    state = loop_dashboard.build_state(loop)
+    by_lane = {l.get("lane"): l for l in state.get("lanes", [])}
+    de_cr = (by_lane.get("data-eng") or {}).get("current_request") or {}
+    pr_cr = (by_lane.get("product") or {}).get("current_request") or {}
+    # The run-3 shape: BOTH lanes resolve current_request to data-eng's request.
+    if de_cr.get("request_id") != rid or pr_cr.get("request_id") != rid:
+        _fail("G17: both data-eng and product must resolve current_request to {0}; "
+              "got {1!r} / {2!r}".format(rid, de_cr.get("request_id"), pr_cr.get("request_id")))
+    # Only the owner (data-eng) is is_owner; the non-owning product is not.
+    if de_cr.get("is_owner") is not True:
+        _fail("G17: data-eng (owner_lane==data-eng) must be current_request.is_owner True; "
+              "got {0!r}".format(de_cr.get("is_owner")))
+    if pr_cr.get("is_owner") is not False:
+        _fail("G17: product (non-owner pointing at data-eng's request) must be is_owner "
+              "False; got {0!r}".format(pr_cr.get("is_owner")))
+    # Exactly ONE owner-attributed 'working on' item for this request: the client
+    # emits one item per advancing current_request whose is_owner is True, so the
+    # attributed-lane set for rid must be exactly ['data-eng'].
+    attributed = [l.get("lane") for l in state.get("lanes", [])
+                  if (l.get("current_request") or {}).get("request_id") == rid
+                  and (l.get("current_request") or {}).get("is_owner") is True]
+    if attributed != ["data-eng"]:
+        _fail("G17: exactly one owner-attributed running item expected for {0}; "
+              "got {1!r}".format(rid, attributed))
 
 
 def _check_g13_recommended(tmp: Path) -> None:
@@ -1432,6 +1660,17 @@ def main() -> int:
             _check_batch2_i18n(_b2_rows)
             # (F8) recommended-tier lane chip: markup, wiring, i18n, grep-proof.
             _check_f8_tier_markup(html_full, _b2_rows)
+            # (G17) running banner attributes each "working on" line to the
+            # request owner only (static contract; runtime proof below).
+            _check_g17_markup(html_full)
+            # (G20) the your-turn stall item splits by the doctor reason: the
+            # REVIEWING gate-green stall renders an HONEST string (never
+            # "finished"); the work_done_unreported case keeps its wording.
+            _check_g20_stall_honesty(html_full, _b2_rows)
+            # (G18) foldable Progress: same collapse mechanism as System Checks
+            # / Usage & Limits but default OPEN; the fold survives the poll
+            # (renderProgress never re-folds); the new label key has en + zh.
+            _check_g18_progress_collapse(html_full, _b2_rows)
 
             # (3) GET /api/state -> 200, valid JSON, has the expected keys.
             status, body = _http_get(base + "/api/state")
@@ -1460,9 +1699,10 @@ def main() -> int:
             for expected in ("product", "implementation", "review"):
                 if expected not in lane_names:
                     _fail("state is missing default lane {0!r}".format(expected))
-            # F8: every lane carries an advisory recommended_tier on the wire,
-            # with the policy assignment (coding lane -> highest; else
-            # second-highest) and an ABSTRACT value (never a model name).
+            # G16: every lane carries an advisory recommended_tier on the wire,
+            # defaulting to 'highest' for EVERY lane (the F8 coding/non-coding
+            # split is gone; a lower value only appears after a manual opt-down),
+            # and the value is ABSTRACT (never a model name).
             by_lane = {row.get("lane"): row for row in state["lanes"]}
             for row in state["lanes"]:
                 tier = (row.get("recommended_tier") or "").strip()
@@ -1471,10 +1711,11 @@ def main() -> int:
                         row.get("lane"), tier))
                 if "gpt" in tier.lower():
                     _fail("recommended_tier must be abstract, never a model name; got {0!r}".format(tier))
-            if (by_lane.get("implementation") or {}).get("recommended_tier") != "highest":
-                _fail("coding lane 'implementation' should surface recommended_tier 'highest'")
-            if (by_lane.get("product") or {}).get("recommended_tier") != "second-highest":
-                _fail("default lane 'product' should surface recommended_tier 'second-highest'")
+            # A freshly bootstrapped loop has no opt-down, so EVERY default lane
+            # surfaces 'highest'.
+            for lane in ("implementation", "product", "review"):
+                if (by_lane.get(lane) or {}).get("recommended_tier") != "highest":
+                    _fail("G16: default lane {0!r} should surface recommended_tier 'highest'".format(lane))
             # The doctor imported in-process and produced a real snapshot.
             if state["doctor"].get("available") is not True:
                 _fail(
@@ -1967,6 +2208,11 @@ def main() -> int:
             # / observed_tier / tier_mismatch per lane (chip renders them; amber
             # on mismatch).
             _check_g14_dashboard(Path(tmp))
+
+            # (G17) Banner attribution: a synthetic loop with one IMPLEMENTING
+            # request owned by data-eng and a fresh-heartbeat product yields
+            # exactly ONE owner-attributed "working on this request" item.
+            _check_g17_banner_attribution(Path(tmp))
 
             # (8) POLICY: default value, valid update, invalid rejections.
             status, body = _http_get(base + "/api/state")

@@ -1044,12 +1044,21 @@ def build_state(
         req_row = requests_by_id.get(rid) if rid else None
         current_request: dict[str, Any] = {}
         if req_row is not None:
+            req_owner = (req_row.get("owner_lane", "") or req_row.get("owner", "") or "").strip()
             current_request = {
                 "request_id": rid,
                 "status": (req_row.get("status", "") or "").strip(),
-                "owner_lane": (req_row.get("owner_lane", "") or req_row.get("owner", "") or "").strip(),
+                "owner_lane": req_owner,
                 "goal": (req_row.get("next_action", "") or "").strip(),
                 "iteration": (req_row.get("iteration", "") or req_row.get("iter", "") or "").strip(),
+                # G17: this lane is the request's OWNER (or the request records no
+                # owner_lane at all -> legacy fallback). The your-turn "all
+                # running" banner attributes the single "X is working on this
+                # request" line to the owner only, so a non-owning lane whose
+                # current.md still points at another lane's request (a fresh
+                # heartbeat, a tracking reference) is never double-counted with
+                # the owner's next_action -- the run-3 data-eng/product duplicate.
+                "is_owner": (not req_owner) or (req_owner == lane),
             }
         # G14(a/c): the lane's OBSERVED model+effort and its abstract tier tag,
         # from current.md's model_observed line. observed_model is the DATA value

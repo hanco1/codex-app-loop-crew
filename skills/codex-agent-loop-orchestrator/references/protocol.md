@@ -639,6 +639,16 @@ answering *"can a caller/input reach a wrong-but-accepted outcome the criteria
 did not forbid? Name the path or state none found."* See
 `references/loop-state.md` "Review checklist" and "Ease-of-misuse question".
 
+The `scope_creep` comparison exempts **protocol-mandated ritual writes**: the
+close-the-turn ritual requires them on every slice, so they are never creep -
+the lane's own heartbeat cell in `agent-lanes.md`, the request's row in
+`requests.md`, appended `loop-run-log.md` rows, the lane's own `lanes/<lane>/**`
+files, `messages/<request_id>/**` envelopes for the request, and `evidence/**`
+records for the request. Writes to OTHER lanes' rows or directories remain
+creep. Canonical non-creep example (run 3): a review blocked data-eng for
+stamping its own `agent-lanes.md` heartbeat cell - the exact write the "Close
+the turn" heartbeat step mandates.
+
 ## FIX_REQUEST
 
 ```md

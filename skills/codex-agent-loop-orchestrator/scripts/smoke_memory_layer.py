@@ -50,13 +50,20 @@ G1/G2/G3 criteria-and-gate checks (doc wording + a synthetic doctor loop):
     a ``human_qa_requested`` run-log row and no confirmation) is NORMAL WAITING,
     so the doctor suppresses ``stalled_handoff`` for it; the same request with
     no marker (or after ``human_qa: confirmed``) still stalls.
+  - G20: a REVIEWING request whose OWN implementation evidence is gate-green
+    only stalls once the reviewer (owner) heartbeat is stale/missing (the grace
+    window; a fresh heartbeat = healthy review = no stall), with an HONEST
+    reason (``implementation_evidence_green_no_verdict``) and wording that never
+    claims the review "finished"; an archived REVIEW_DONE stalls IMMEDIATELY
+    regardless of heartbeat (reason ``work_done_unreported``).
 
-F8/F11 registry checks (tier loop):
+G16/F11 registry checks (tier loop):
 
   - the agent-lanes.md registry ends with an advisory ``tier`` column whose
-    abstract values follow the policy (coding lanes highest, others
-    second-highest) and survive template reruns, registration, and
-    --set-thread adoption without clobbering a human opt-down;
+    abstract values follow the G16 policy (EVERY lane -- default or custom --
+    defaults to highest; downgrading is a manual human action) and survive
+    template reruns, registration, and --set-thread adoption without clobbering
+    a human opt-down;
   - --set-thread fills an EXISTING custom-lane row even in a separate,
     flagless invocation (status registered, thread id set, tier preserved, no
     duplicate row), and fails non-zero with a readable error -- registry left
@@ -70,6 +77,7 @@ from __future__ import annotations
 import re
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
@@ -260,6 +268,27 @@ def _blank_heartbeat(registry: Path, lane: str) -> None:
     registry.write_text("".join(out), encoding="utf-8")
 
 
+def _set_heartbeat(registry: Path, lane: str, value: str) -> None:
+    """Write ``value`` into ``lane``'s heartbeat cell in agent-lanes.md.
+
+    Targets the heartbeat column by header index (the registry carries a trailing
+    F8 ``tier`` column, so writing the last cell would clobber the wrong column).
+    """
+    idx = _registry_col_index(registry, "heartbeat")
+    lines = registry.read_text(encoding="utf-8").splitlines(keepends=True)
+    out = []
+    for line in lines:
+        if line.strip().startswith("|") and "| {0} |".format(lane) in line:
+            suffix = "\n" if line.endswith("\n") else ""
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if idx < len(cells):
+                cells[idx] = value
+            out.append("| " + " | ".join(cells) + " |" + suffix)
+        else:
+            out.append(line)
+    registry.write_text("".join(out), encoding="utf-8")
+
+
 def _make_terminal_request(requests_path: Path, request_id: str, owner_lane: str) -> None:
     """Append a request row already in a terminal (ACCEPTED) state."""
     _append_request_row(requests_path, request_id, owner_lane, "accepted")
@@ -429,11 +458,14 @@ def _check_g14(tmp_path: Path) -> None:
     issue; the concrete model id is DATA (allowed in the observed value).
     """
     loop = tmp_path / "g14_loop"
-    # (a) adoption-time stamping: implementation MATCHES (highest), product
-    # MISMATCHES (registry second-highest, observed highest), review left blank.
+    # (a) adoption-time stamping. Under G16 every lane's registry tier defaults
+    # to highest, so a mismatch now comes from a lane OBSERVED running LOWER than
+    # the recorded tier: implementation MATCHES (both highest); product MISMATCHES
+    # (registry highest, observed second-highest -- i.e. the thread was opened on
+    # a lower model than policy records); review is left blank (not-yet-observed).
     _bootstrap(loop, extra_argv=[
         "--observed-model", "implementation=gpt-5.5 xhigh (highest)",
-        "--observed-model", "product=gpt-5.5 xhigh (highest)",
+        "--observed-model", "product=gpt-5.4 xhigh (second-highest)",
     ])
     # The template carries a (blank) model_observed field for every lane.
     review_cur = (loop / "lanes" / "review" / "current.md").read_text(encoding="utf-8")
@@ -452,7 +484,7 @@ def _check_g14(tmp_path: Path) -> None:
     res = _doctor(loop)
     tms = [w for w in res["warnings"] if w["code"] == "tier_mismatch"]
     if not tms:
-        _fail("G14(b): the doctor must warn tier_mismatch for product (observed highest vs recommended second-highest)")
+        _fail("G14(b): the doctor must warn tier_mismatch for product (observed second-highest vs recommended highest)")
     if not any("product" in w["message"] for w in tms):
         _fail("G14(b): tier_mismatch must name the mismatched lane 'product'")
     if not any("highest" in w["message"] and "second-highest" in w["message"] for w in tms):
@@ -467,14 +499,17 @@ def _check_g14(tmp_path: Path) -> None:
         _fail("G14(b): tier_mismatch must be a warning, never an issue")
     # Machine-readable passthrough.
     tm_list = res.get("tier_mismatches") or []
-    if not any(t["lane"] == "product" and t["observed"] == "highest"
-               and t["recommended"] == "second-highest" for t in tm_list):
+    if not any(t["lane"] == "product" and t["observed"] == "second-highest"
+               and t["recommended"] == "highest" for t in tm_list):
         _fail("G14(b): doctor result must expose the tier_mismatches list with both tiers")
     # A tier_mismatch must NOT block handoff (WARNING-only contract).
     if res.get("handoff_ready") is not True:
         _fail("G14(b): a tier_mismatch warning must not flip handoff_ready to False")
 
-    # NEGATIVE: fix the registry (human raises product to highest) -> no mismatch.
+    # NEGATIVE: the human opts product DOWN in the registry to second-highest,
+    # matching what the thread is observed running -> the mismatch clears (the
+    # recorded tier is now the honest tier; a downgrade is a deliberate human
+    # edit, not a silent drift).
     reg = loop / "agent-lanes.md"
     idx = _registry_col_index(reg, "tier")
     lines = reg.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -484,7 +519,7 @@ def _check_g14(tmp_path: Path) -> None:
             suffix = "\n" if line.endswith("\n") else ""
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
             if idx < len(cells):
-                cells[idx] = "highest"
+                cells[idx] = "second-highest"
             out.append("| " + " | ".join(cells) + " |" + suffix)
         else:
             out.append(line)
@@ -492,7 +527,7 @@ def _check_g14(tmp_path: Path) -> None:
     res2 = _doctor(loop)
     if any(w["code"] == "tier_mismatch" and "product" in w["message"]
            for w in res2["warnings"]):
-        _fail("G14(e): raising the registry tier to match the observed tier must clear the mismatch")
+        _fail("G14(e): opting the registry tier down to match the observed tier must clear the mismatch")
 
 
 def _check_g12(tmp_path: Path) -> None:
@@ -727,6 +762,125 @@ def _check_g3_doctor(tmp_path: Path) -> None:
     conf_stalls = [w for w in confirmed["warnings"] if w["code"] == "stalled_handoff" and uf_request in w["message"]]
     if not conf_stalls:
         _fail("after human_qa: confirmed, a still-parked REVIEWING request must stall again (hold released)")
+
+
+def _check_g20_doctor(tmp_path: Path) -> None:
+    """G20: honest, grace-gated stall detection for REVIEWING.
+
+    The synthetic loop reproduces the run-3 shape: a REVIEWING request OWNED by
+    the ``review`` lane whose OWN implementation evidence is gate-green
+    (SHIP_CHECK_OK) -- green BEFORE routing to review, exactly the standing
+    false-alarm condition. Three acceptance probes, all with a fixed ``now`` so
+    heartbeat ages are deterministic:
+
+      (i)   FRESH reviewer heartbeat -> NO stalled_handoff. The grace window: a
+            healthy in-progress review must not fire on the green implementation
+            evidence (that would be a standing red banner from the moment
+            REVIEWING begins).
+      (ii)  STALE reviewer heartbeat (and, separately, MISSING) -> a
+            stalled_handoff whose record carries
+            reason=implementation_evidence_green_no_verdict, and whose message is
+            HONEST: it never claims the review "finished" and names the
+            implementation evidence + the idle reviewer to push.
+      (iii) An archived REVIEW_DONE (review provably finished) with no forward
+            transition -> IMMEDIATE stalled_handoff even with a FRESH heartbeat,
+            reason=work_done_unreported, citing archived REVIEW_DONE.
+    """
+    now = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
+    fresh_hb = (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_hb = (now - timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    loop = tmp_path / "loop_g20"
+    _bootstrap(loop, ["--set-thread", "review=codex:20202020-2020-2020-2020-202020202020"])
+    requests_path = loop / "requests.md"
+    registry = loop / "agent-lanes.md"
+    evidence_dir = loop / "evidence"
+    rid = "REQ-20260708-120000-review"
+    _append_request_row(requests_path, rid, "review", "impl evidence green; awaiting verdict")
+    _set_request_status(requests_path, rid, "REVIEWING")
+    # The request's OWN implementation evidence is gate-green (the run-3 case:
+    # green BEFORE the request is routed to review).
+    _write_evidence(evidence_dir, rid, 1, "pytest", 0)
+
+    def _probe():
+        return doctor.summarize(
+            loop, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS, now=now
+        )
+
+    def _records(result):
+        return [s for s in result.get("stalled_handoffs", []) if s["request_id"] == rid]
+
+    def _msgs(result):
+        return [
+            w for w in result["warnings"]
+            if w["code"] == "stalled_handoff" and rid in w["message"]
+        ]
+
+    # ---- (i) FRESH reviewer heartbeat -> grace window -> NO stall ------------
+    _set_heartbeat(registry, "review", fresh_hb)
+    fresh = _probe()
+    if _msgs(fresh):
+        _fail("G20 (i): a REVIEWING request with green implementation evidence and a FRESH "
+              "reviewer heartbeat must NOT stall (grace window); got {0!r}".format(_msgs(fresh)))
+    if _records(fresh):
+        _fail("G20 (i): the request must be absent from stalled_handoffs while the review is healthy")
+    # Sanity: the stall is suppressed by the grace window, not because the request
+    # vanished. It must still be a live non-terminal request (probe (ii) then
+    # flips ONLY the heartbeat and shows the SAME request stalling -- proving the
+    # grace window, not a vacuous pass).
+    if rid not in [r["request_id"] for r in (fresh.get("requests") or {}).get("non_terminal", [])]:
+        _fail("G20 (i): the probe request must remain a live non-terminal request")
+
+    # ---- (ii) STALE reviewer heartbeat -> honest stall ----------------------
+    _set_heartbeat(registry, "review", stale_hb)
+    stale = _probe()
+    stale_recs = _records(stale)
+    if not stale_recs:
+        _fail("G20 (ii): a REVIEWING request with green evidence and a STALE reviewer heartbeat must stall")
+    if stale_recs[0].get("reason") != "implementation_evidence_green_no_verdict":
+        _fail("G20 (ii): the REVIEWING stall reason must be implementation_evidence_green_no_verdict; "
+              "got {0!r}".format(stale_recs[0].get("reason")))
+    if stale_recs[0].get("evidence") != "SHIP_CHECK_OK":
+        _fail("G20 (ii): the REVIEWING stall must cite the SHIP_CHECK_OK implementation evidence")
+    stale_msgs = _msgs(stale)
+    if not stale_msgs:
+        _fail("G20 (ii): expected a stalled_handoff warning naming the request")
+    msg = stale_msgs[0]["message"].lower()
+    if "finish" in msg:
+        _fail("G20 (ii): the REVIEWING stall wording must NOT claim the review 'finished'; got {0!r}".format(
+            stale_msgs[0]["message"]))
+    for needle in ("implementation evidence", "reviewing", "verdict", "idle"):
+        if needle not in msg:
+            _fail("G20 (ii): the honest REVIEWING stall wording is missing {0!r}; got {1!r}".format(
+                needle, stale_msgs[0]["message"]))
+
+    # ---- (ii-b) MISSING reviewer heartbeat -> same honest stall -------------
+    _blank_heartbeat(registry, "review")
+    missing = _probe()
+    miss_recs = _records(missing)
+    if not miss_recs or miss_recs[0].get("reason") != "implementation_evidence_green_no_verdict":
+        _fail("G20 (ii-b): a REVIEWING request with green evidence and a MISSING (never-checked-in) "
+              "reviewer heartbeat must stall with reason implementation_evidence_green_no_verdict; "
+              "got {0!r}".format(miss_recs))
+
+    # ---- (iii) Archived REVIEW_DONE -> immediate stall regardless of HB -----
+    # Restore a FRESH heartbeat to prove the grace window does NOT suppress the
+    # REVIEW_DONE path (review provably finished).
+    _set_heartbeat(registry, "review", fresh_hb)
+    rd_dir = loop / "messages" / rid
+    rd_dir.mkdir(parents=True, exist_ok=True)
+    (rd_dir / "REVIEW_DONE-iter-1.md").write_text("# REVIEW_DONE\n\npass\n", encoding="utf-8")
+    reviewed = _probe()
+    rd_recs = _records(reviewed)
+    if not rd_recs:
+        _fail("G20 (iii): an archived REVIEW_DONE with no transition must stall IMMEDIATELY even with a "
+              "fresh reviewer heartbeat")
+    if rd_recs[0].get("reason") != "work_done_unreported":
+        _fail("G20 (iii): a REVIEW_DONE-based stall must carry reason work_done_unreported; got {0!r}".format(
+            rd_recs[0].get("reason")))
+    rd_msgs = _msgs(reviewed)
+    if not rd_msgs or "REVIEW_DONE" not in rd_msgs[0]["message"]:
+        _fail("G20 (iii): the REVIEW_DONE-based stall should cite archived REVIEW_DONE as its evidence")
 
 
 def main() -> int:
@@ -1214,14 +1368,14 @@ def main() -> int:
         _shutil_f16.rmtree(dep_msg_dir, ignore_errors=True)
         _shutil_f16.rmtree(plain_dir, ignore_errors=True)
 
-        # ---- F8: per-lane advisory model-tier column ------------------------
+        # ---- G16: per-lane advisory model-tier column -----------------------
         # The registry must carry a ``tier`` column whose values are the ABSTRACT
-        # tier words (never a model name), assigned by policy: coding lanes
-        # (implementation/backend/data-eng/frontend) -> highest; everyone else
-        # (product/review/security/research) -> second-highest. And the tier must
-        # survive every bootstrap round-trip: the template rerun, a lane
-        # registration via --extra-lane, and a --set-thread adoption -- none may
-        # clobber a human opt-down.
+        # tier words (never a model name), assigned by the G16 policy: EVERY lane
+        # -- default or custom-named -- defaults to the HIGHEST tier (this
+        # supersedes the old F8 coding/non-coding split; downgrading is now a
+        # manual human action). And the tier must survive every bootstrap
+        # round-trip: the template rerun, a lane registration via --extra-lane,
+        # and a --set-thread adoption -- none may clobber a human opt-down.
         loop_t = tmp_path / "loop_t"
         _bootstrap(loop_t)
         registry_t = loop_t / "agent-lanes.md"
@@ -1240,34 +1394,31 @@ def main() -> int:
         if header_cells is None or header_cells[-1] != "tier":
             _fail("agent-lanes.md header must end with a 'tier' column; got {0}".format(header_cells))
 
-        # (b) Policy assignment for the default lanes.
-        if _tier_of("implementation") != bootstrap_agent_loop.HIGHEST_TIER:
-            _fail("coding lane 'implementation' should default to the highest tier")
-        if _tier_of("product") != bootstrap_agent_loop.SECOND_HIGHEST_TIER:
-            _fail("default lane 'product' should default to the second-highest tier")
-        if _tier_of("review") != bootstrap_agent_loop.SECOND_HIGHEST_TIER:
-            _fail("default lane 'review' should default to the second-highest tier")
+        # (b) Policy assignment for the default lanes: G16 -> every lane highest.
+        for lane in ("implementation", "product", "review"):
+            if _tier_of(lane) != bootstrap_agent_loop.HIGHEST_TIER:
+                _fail("G16: default lane {0!r} should default to the highest tier".format(lane))
         # And the tier words are abstract -- never a concrete model name.
         for word in (bootstrap_agent_loop.HIGHEST_TIER, bootstrap_agent_loop.SECOND_HIGHEST_TIER):
             if "gpt" in word.lower():
                 _fail("tier words must be abstract, never a model name; got {0!r}".format(word))
 
-        # (c) recommended_tier_for classifies representative coding/default names.
-        for coding in ("data-engineering", "backend", "frontend", "data-eng", "implementation"):
-            if bootstrap_agent_loop.recommended_tier_for(coding) != bootstrap_agent_loop.HIGHEST_TIER:
-                _fail("recommended_tier_for({0!r}) should be the highest tier".format(coding))
-        for default in ("product", "review", "security-privacy", "research", "docs"):
-            if bootstrap_agent_loop.recommended_tier_for(default) != bootstrap_agent_loop.SECOND_HIGHEST_TIER:
-                _fail("recommended_tier_for({0!r}) should be the second-highest tier".format(default))
+        # (c) recommended_tier_for returns highest for EVERY name -- former coding
+        # names and former non-coding names alike (G16 removed the split).
+        for lane in ("data-engineering", "backend", "frontend", "data-eng",
+                     "implementation", "product", "review", "security-privacy",
+                     "research", "docs"):
+            if bootstrap_agent_loop.recommended_tier_for(lane) != bootstrap_agent_loop.HIGHEST_TIER:
+                _fail("G16: recommended_tier_for({0!r}) should be the highest tier".format(lane))
 
-        # (d) A new coding lane via --extra-lane gets the highest tier; a new
-        # non-coding custom lane gets the second-highest.
+        # (d) A new custom lane via --extra-lane also registers at the highest
+        # tier, whatever its name -- there is no per-lane classification.
         _bootstrap(loop_t, ["--extra-lane", "data-engineering|Own backend|src/core/**"])
         _bootstrap(loop_t, ["--extra-lane", "security-privacy|Own privacy|docs/security/**"])
         if _tier_of("data-engineering") != bootstrap_agent_loop.HIGHEST_TIER:
-            _fail("new coding lane 'data-engineering' should register at the highest tier")
-        if _tier_of("security-privacy") != bootstrap_agent_loop.SECOND_HIGHEST_TIER:
-            _fail("new non-coding lane 'security-privacy' should register at the second-highest tier")
+            _fail("G16: new custom lane 'data-engineering' should register at the highest tier")
+        if _tier_of("security-privacy") != bootstrap_agent_loop.HIGHEST_TIER:
+            _fail("G16: new custom lane 'security-privacy' should register at the highest tier")
 
         # (e) OPT-DOWN survives a template rerun. Manually opt data-engineering
         # DOWN to second-highest, rerun bootstrap's template, and confirm the
@@ -1648,6 +1799,64 @@ def main() -> int:
         if "only a blocker forces a fix cycle" not in skill_lower:
             _fail("SKILL.md must state only a blocker forces a fix cycle and increments iteration")
 
+        # ---- G19: ritual-write carve-out from the scope-creep check ---------
+        # Run 3: review blocked data-eng for stamping its own agent-lanes.md
+        # heartbeat cell -- a write the close-the-turn ritual REQUIRES, so G8's
+        # scope-creep rule as worded condemned every correctly-closed turn. The
+        # comparison must exempt a STANDING LIST of protocol-mandated ritual
+        # writes in BOTH gate docs (loop-state.md review gate + protocol.md),
+        # keep writes to OTHER lanes' rows/dirs as creep, and cite the run-3
+        # heartbeat stamp as the canonical non-creep example. SKILL.md's review
+        # wording carries the one-sentence mirror.
+        for g19_doc_name, g19_doc_lower in (
+            ("loop-state.md", loop_state_lower),
+            ("protocol.md", protocol_lower),
+        ):
+            g19_collapsed = " ".join(g19_doc_lower.split())
+            if "protocol-mandated ritual writes" not in g19_collapsed:
+                _fail("{0} must name the protocol-mandated ritual writes "
+                      "exemption".format(g19_doc_name))
+            if "exempt" not in g19_collapsed:
+                _fail("{0} must say the ritual writes are EXEMPT from the "
+                      "scope-creep comparison".format(g19_doc_name))
+            # The standing exemption list: all six protocol-mandated writes.
+            for g19_needle in (
+                "own heartbeat cell in `agent-lanes.md`",
+                "request's row in `requests.md`",
+                "`loop-run-log.md` rows",
+                "lanes/<lane>/**",
+                "messages/<request_id>/**",
+                "evidence/**",
+            ):
+                if g19_needle not in g19_collapsed:
+                    _fail("{0} ritual-write exemption list is missing: "
+                          "{1}".format(g19_doc_name, g19_needle))
+            # Writes to OTHER lanes' rows/dirs remain creep.
+            if "other lanes'" not in g19_collapsed:
+                _fail("{0} must keep writes to OTHER lanes' rows/dirs as "
+                      "creep".format(g19_doc_name))
+            if "remain creep" not in g19_collapsed:
+                _fail("{0} must state other-lane writes REMAIN creep".format(g19_doc_name))
+            # The canonical run-3 non-creep example: data-eng's heartbeat stamp.
+            if "data-eng" not in g19_collapsed:
+                _fail("{0} must cite the run-3 data-eng heartbeat stamp as the "
+                      "canonical non-creep example".format(g19_doc_name))
+            if "non-creep example" not in g19_collapsed:
+                _fail("{0} must label the run-3 heartbeat stamp a non-creep "
+                      "example".format(g19_doc_name))
+        # SKILL.md: the one-sentence exemption mirror in the review wording.
+        skill_collapsed_g19 = " ".join(skill_lower.split())
+        if ("ritual writes are exempt from the scope-creep comparison"
+                not in skill_collapsed_g19):
+            _fail("SKILL.md review wording must carry the one-sentence "
+                  "ritual-write exemption")
+        if "never creep" not in skill_collapsed_g19:
+            _fail("SKILL.md exemption sentence must say the ritual writes are "
+                  "never creep")
+        if "other lanes'" not in skill_collapsed_g19:
+            _fail("SKILL.md exemption sentence must keep OTHER lanes' "
+                  "rows/dirs as creep")
+
         # ---- G9: grilling intake --------------------------------------------
         # SKILL.md Intake becomes an interview: one question at a time with a
         # recommended answer attached, facts looked up not asked, a stop rule,
@@ -1722,11 +1931,17 @@ def main() -> int:
             _fail("SKILL.md (G14d) must state the recorded tier policy IS the user's explicit request")
         if "create_thread" not in skill_md:
             _fail("SKILL.md (G14d) must reference create_thread's 'no model unless asked' guidance")
-        # (e) The human may set ANY lane's tier up OR down; never silently deviates.
-        if "up or down" not in skill_lower:
-            _fail("SKILL.md (G14e) must state the human may set any lane's tier up OR down")
+        # (e) G16 policy wording: EVERY lane defaults to the highest tier, and
+        # downgrading is a MANUAL human action (any lane DOWN to any lower tier);
+        # the skill never silently deviates from the recorded tier.
+        if "highest available tier" not in skill_lower:
+            _fail("SKILL.md must state every lane defaults to the highest available tier")
+        if "manual human action" not in skill_lower:
+            _fail("SKILL.md must state downgrading is a manual human action")
+        if "any lower tier" not in skill_lower:
+            _fail("SKILL.md must state the human may set any lane DOWN to any lower tier")
         if "never silently deviate" not in skill_lower and "never silently deviates" not in skill_lower:
-            _fail("SKILL.md (G14e) must state the skill never silently deviates from the recorded tier")
+            _fail("SKILL.md must state the skill never silently deviates from the recorded tier")
 
         # (G14 boundary) No concrete model-name literal may appear anywhere in
         # SKILL.md or protocol.md: policy docs may only speak in the abstract
@@ -1819,6 +2034,9 @@ def main() -> int:
 
         # ---- G3: doctor stalled_handoff exclusion (synthetic loop) ----------
         _check_g3_doctor(tmp_path)
+
+        # ---- G20: honest, grace-gated stall detection for REVIEWING ---------
+        _check_g20_doctor(tmp_path)
 
         # ---- G7: doctor lineage/hygiene WARNING checks ----------------------
         _check_g7_doctor(tmp_path)

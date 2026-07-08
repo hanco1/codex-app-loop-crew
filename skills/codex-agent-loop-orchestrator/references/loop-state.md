@@ -240,6 +240,25 @@ per-criterion pass/fail:
    any changed file that no `scope` glob covers (or that a `non_goals` line
    forbids) is scope creep. Run 2's out-of-scope pie chart and direct-ask
    restyle were both this category, and review never named it.
+
+   **Protocol-mandated ritual writes are exempt.** The close-the-turn ritual
+   REQUIRES certain loop-file writes on every slice, so the comparison is
+   `changed_files` vs the request's `scope` globs PLUS this standing exemption
+   list - these writes are never scope creep:
+
+   - the lane's OWN heartbeat cell in `agent-lanes.md`;
+   - the request's row in `requests.md`;
+   - appended `loop-run-log.md` rows;
+   - the lane's own `lanes/<lane>/**` files (current.md, worklog.md, workspace);
+   - `messages/<request_id>/**` envelopes for the request under review;
+   - `evidence/**` records for the request under review.
+
+   Writes to OTHER lanes' rows or directories remain creep - one lane editing
+   another lane's registry row, `current.md`, or messages is exactly what this
+   check exists to catch. Canonical non-creep example (run 3): review blocked
+   data-eng for stamping its own `agent-lanes.md` heartbeat cell - a write the
+   close-the-turn ritual REQUIRES. A correctly-closed turn must never be
+   condemned for its own ritual writes.
 3. **Looks-done-but-wrong** - criteria that appear satisfied but produce a
    wrong result (the tautological-evidence class: green command, garbage output).
 

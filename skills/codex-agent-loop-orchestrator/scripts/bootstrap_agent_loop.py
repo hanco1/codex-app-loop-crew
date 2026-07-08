@@ -499,52 +499,38 @@ deliverables exist.
 """
 
 
-# Columns of the agent-lanes.md registry table, in order. ``tier`` is the F8
+# Columns of the agent-lanes.md registry table, in order. ``tier`` is the
 # advisory model-tier column (last, so header-driven readers and any code that
 # treats ``heartbeat`` as a fixed position keep working). Its values are the
 # ABSTRACT tier words below, never a concrete model name.
 REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "status", "heartbeat", "tier"]
 
-# F8 per-lane model-tier policy (advisory; the actual tiers are host-specific and
+# Per-lane model-tier policy (advisory; the actual tiers are host-specific and
 # resolved at runtime from the create_thread tool's own model-parameter
 # description). Tiers are expressed ABSTRACTLY here and NEVER as model names:
 #   HIGHEST_TIER        -> the highest tier the calling host offers.
-#   SECOND_HIGHEST_TIER -> the next tier down.
-# Policy: coding lanes (they build code) recommend the highest tier; every other
-# lane recommends the second-highest. The human may opt a lane DOWN in the
-# registry; the skill never silently opts a lane UP past this policy.
+#   SECOND_HIGHEST_TIER -> the next tier down (a valid MANUAL downgrade target).
+# Policy (G16, supersedes the F8 coding/non-coding split): EVERY lane defaults
+# to the highest tier. Run-2/run-3 showed the criteria-authoring and review
+# lanes are the quality leverage points, so no lane is auto-downgraded.
+# Downgrading is a manual human action: a person may set any lane DOWN to any
+# lower tier in the registry ``tier`` cell, and the skill honors that recorded
+# tier exactly -- it never silently deviates from it.
 HIGHEST_TIER = "highest"
 SECOND_HIGHEST_TIER = "second-highest"
 
-# Name tokens that mark a lane as a CODING lane (builds code -> highest tier).
-# Matched as case-insensitive substrings so custom team names still classify
-# (e.g. "data-engineering" -> data-eng, "ui-frontend" -> frontend). Kept as
-# tokens, not exact names, because real teams rename lanes.
-CODING_LANE_TOKENS = (
-    "implementation",
-    "backend",
-    "data-eng",
-    "dataeng",
-    "frontend",
-    "fullstack",
-    "full-stack",
-    "infra",
-    "platform",
-)
-
 
 def recommended_tier_for(lane: str) -> str:
-    """Return the advisory tier word for ``lane`` per the F8 policy.
+    """Return the advisory tier word for ``lane`` per the G16 policy.
 
-    Coding lanes (name contains a CODING_LANE_TOKENS token) recommend the
-    highest tier; every other lane recommends the second-highest. Abstract tier
-    words only -- never a model name.
+    EVERY lane -- default or custom-named -- defaults to the highest available
+    tier (G16 supersedes the old F8 coding/non-coding split, so there is no
+    per-lane classification any more). Downgrading is a manual human edit to the
+    registry ``tier`` cell, never an automatic decision here. Abstract tier
+    words only -- never a model name. The ``lane`` argument is kept for API
+    stability (callers pass the lane name).
     """
-    low = (lane or "").strip().lower()
-    for token in CODING_LANE_TOKENS:
-        if token in low:
-            return HIGHEST_TIER
-    return SECOND_HIGHEST_TIER
+    return HIGHEST_TIER
 
 
 def render_registry(rows: dict[str, dict[str, str]]) -> str:
