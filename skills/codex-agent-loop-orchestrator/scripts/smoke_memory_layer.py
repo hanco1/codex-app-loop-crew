@@ -883,6 +883,135 @@ def _check_g20_doctor(tmp_path: Path) -> None:
         _fail("G20 (iii): the REVIEW_DONE-based stall should cite archived REVIEW_DONE as its evidence")
 
 
+def _check_g22(tmp_path: Path) -> None:
+    """G22: disjoint write-scope rules -- doctor checks, bootstrap advisory, SKILL wording.
+
+    Six probes match the spec:
+      (i)   src/** vs src/ui/** -> write_scope_overlap fires naming both lanes;
+      (ii)  src/core/** vs src/ui/** -> silent (disjoint subtrees);
+      (iii) product scope docs/product/** only -> product_scope_gap fires;
+      (iv)  product scope docs/loop/**; docs/product/** -> silent;
+      (v)   SKILL.md wording (disjoint mandate, product-ledger rule, own-lane-dir
+            rule, the worked example);
+      (vi)  bootstrap prints an advisory on a colliding --extra-lane (stdout capture).
+    Both new codes are WARNING-only and never flip handoff_ready.
+    """
+    import contextlib
+    import io
+
+    # ---- (i) src/** vs src/ui/** -> write_scope_overlap naming both lanes ----
+    loop_i = tmp_path / "g22_overlap"
+    _bootstrap(loop_i, [
+        "--no-default-lanes",
+        "--extra-lane", "data-eng|Own core|src/**",
+        "--extra-lane", "frontend|Own UI|src/ui/**",
+    ])
+    res_i = _doctor(loop_i)
+    over_i = [w for w in res_i["warnings"] if w["code"] == "write_scope_overlap"]
+    if not over_i:
+        _fail("G22 (i): src/** vs src/ui/** must warn write_scope_overlap")
+    if not any("data-eng" in w["message"] and "frontend" in w["message"] for w in over_i):
+        _fail("G22 (i): write_scope_overlap must name BOTH lanes")
+    if not any("src/**" in w["message"] and "src/ui/**" in w["message"] for w in over_i):
+        _fail("G22 (i): write_scope_overlap must name the offending globs")
+    if any(i["code"] == "write_scope_overlap" for i in res_i["issues"]):
+        _fail("G22 (i): write_scope_overlap must be a WARNING, never an issue")
+    mo = res_i.get("write_scope_overlap") or []
+    if not any({o["lane_a"], o["lane_b"]} == {"data-eng", "frontend"} for o in mo):
+        _fail("G22 (i): doctor result must expose write_scope_overlap naming both lanes")
+    if res_i.get("handoff_ready") is not True:
+        _fail("G22 (i): write_scope_overlap must not flip handoff_ready to False")
+
+    # ---- (ii) src/core/** vs src/ui/** -> silent (disjoint) -----------------
+    loop_ii = tmp_path / "g22_disjoint"
+    _bootstrap(loop_ii, [
+        "--no-default-lanes",
+        "--extra-lane", "data-eng|Own core|src/core/**",
+        "--extra-lane", "frontend|Own UI|src/ui/**",
+    ])
+    res_ii = _doctor(loop_ii)
+    if any(w["code"] == "write_scope_overlap" for w in res_ii["warnings"]):
+        _fail("G22 (ii): src/core/** vs src/ui/** are disjoint and must NOT warn overlap")
+
+    # ---- (iii) product scope docs/product/** only -> product_scope_gap ------
+    loop_iii = tmp_path / "g22_gap"
+    _bootstrap(loop_iii, [
+        "--no-default-lanes",
+        "--extra-lane", "product|Own product|docs/product/**",
+    ])
+    res_iii = _doctor(loop_iii)
+    gaps = [w for w in res_iii["warnings"] if w["code"] == "product_scope_gap"]
+    if not gaps:
+        _fail("G22 (iii): a product lane not covering docs/loop/** must warn product_scope_gap")
+    if not any("docs/loop" in w["message"] for w in gaps):
+        _fail("G22 (iii): product_scope_gap message must name docs/loop/**")
+    if any(i["code"] == "product_scope_gap" for i in res_iii["issues"]):
+        _fail("G22 (iii): product_scope_gap must be a WARNING, never an issue")
+    if not res_iii.get("product_scope_gap"):
+        _fail("G22 (iii): doctor result must expose the product_scope_gap finding")
+    if res_iii.get("handoff_ready") is not True:
+        _fail("G22 (iii): product_scope_gap must not flip handoff_ready to False")
+
+    # ---- (iv) product scope docs/loop/**; docs/product/** -> silent ---------
+    loop_iv = tmp_path / "g22_gap_ok"
+    _bootstrap(loop_iv, [
+        "--no-default-lanes",
+        "--extra-lane", "product|Own product|docs/loop/**; docs/product/**",
+    ])
+    res_iv = _doctor(loop_iv)
+    if any(w["code"] == "product_scope_gap" for w in res_iv["warnings"]):
+        _fail("G22 (iv): product covering docs/loop/** must NOT warn product_scope_gap")
+
+    # A default-bootstrapped loop (product owns docs/loop/**, disjoint defaults)
+    # must be clean on BOTH new codes -- the default team models the rule.
+    loop_def = tmp_path / "g22_default"
+    _bootstrap(loop_def)
+    res_def = _doctor(loop_def)
+    if any(w["code"] in ("write_scope_overlap", "product_scope_gap") for w in res_def["warnings"]):
+        _fail("G22: a default-bootstrapped loop must be clean on write_scope_overlap/product_scope_gap")
+
+    # ---- (v) SKILL.md wording ------------------------------------------------
+    skill_md = _read_doc(_SKILL_MD)
+    skill_low = skill_md.lower()
+    if "pairwise disjoint" not in skill_low:
+        _fail("G22 (v): SKILL.md must mandate pairwise-disjoint write scopes")
+    if "docs/loop/**" not in skill_md:
+        _fail("G22 (v): SKILL.md must state product's scope MUST include docs/loop/**")
+    if ".gitignore" not in skill_md:
+        _fail("G22 (v): SKILL.md product-ledger rule must include .gitignore")
+    if "docs/loop/lanes/<lane>/**" not in skill_md:
+        _fail("G22 (v): SKILL.md must require each lane own its docs/loop/lanes/<lane>/** dir")
+    if "src/core/**" not in skill_md or "src/ui/**" not in skill_md:
+        _fail("G22 (v): SKILL.md must carry a worked example of a disjoint cut (src/core vs src/ui)")
+    if "write_scope_overlap" not in skill_md:
+        _fail("G22 (v): SKILL.md must name the write_scope_overlap doctor warning")
+    if "product_scope_gap" not in skill_md:
+        _fail("G22 (v): SKILL.md must name the product_scope_gap doctor warning")
+
+    # ---- (vi) bootstrap advisory on a colliding --extra-lane (stdout) --------
+    loop_vi = tmp_path / "g22_advisory"
+    _bootstrap(loop_vi)  # default lanes: implementation owns src/**.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _bootstrap(loop_vi, ["--extra-lane", "collide|Own core|src/**"])
+    printed = buf.getvalue()
+    printed_low = printed.lower()
+    if "advisory" not in printed_low or "overlap" not in printed_low:
+        _fail("G22 (vi): a colliding --extra-lane must print an advisory overlap line; got {0!r}".format(printed))
+    if "collide" not in printed_low or "implementation" not in printed_low:
+        _fail("G22 (vi): the advisory must name both the new lane and the colliding existing lane")
+    if "src/**" not in printed:
+        _fail("G22 (vi): the advisory must name the offending glob src/**")
+    # NEGATIVE: a disjoint --extra-lane prints no overlap advisory (and a
+    # pre-existing overlap is not re-announced for a lane that is not new).
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        _bootstrap(loop_vi, ["--extra-lane", "docs-writer|Own docs|docs/writer/**"])
+    out2 = buf2.getvalue().lower()
+    if "advisory" in out2 and "overlap" in out2:
+        _fail("G22 (vi): a disjoint --extra-lane must NOT print an overlap advisory; got {0!r}".format(buf2.getvalue()))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -2049,6 +2178,9 @@ def main() -> int:
 
         # ---- G14: tier observability (model_observed + tier_mismatch) -------
         _check_g14(tmp_path)
+
+        # ---- G22: disjoint write-scope rules (doctor + bootstrap + wording) -
+        _check_g22(tmp_path)
 
     print("SMOKE_OK")
     return 0

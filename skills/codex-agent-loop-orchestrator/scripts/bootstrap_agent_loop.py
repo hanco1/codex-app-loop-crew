@@ -17,14 +17,18 @@ import argparse
 from pathlib import Path
 
 
+# Default lane write scopes obey the G22 "Proposing Lanes" rules: pairwise
+# disjoint, product owns the whole docs/loop/** ledger (plus .gitignore) so its
+# close-the-turn commits never fail the guard, and every lane also owns its own
+# docs/loop/lanes/<lane>/** dir (product's docs/loop/** already covers its own).
 DEFAULT_LANES = {
     "product": {
         "role": "Plan goals, specs, milestones, acceptance criteria, and product judgment.",
-        "write_scope": "docs/loop/tracker.md; docs/loop/handoff.md; docs/product/**",
+        "write_scope": "docs/loop/**; docs/product/**; .gitignore",
     },
     "implementation": {
         "role": "Implement scoped requests, run verification, and report evidence.",
-        "write_scope": "src/**; tests/**; implementation notes named by request",
+        "write_scope": "src/**; tests/**; docs/loop/lanes/implementation/**",
     },
     "review": {
         "role": "Review against acceptance criteria and request precise fixes.",
@@ -742,6 +746,124 @@ def posix_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+# --- G22 write-scope overlap advisory (registration-time, advisory only) ------
+# These mirror the authoritative normalization in multi_agent_loop_doctor.py
+# (``_normalize_scope_entry`` / ``_scope_entries_overlap`` /
+# ``_substantive_scope_entries``). They are re-implemented here so bootstrap
+# stays self-contained (stdlib-only, no cross-script import); the smoke exercises
+# both sides so a divergence would be caught. A lane's OWN
+# docs/loop/lanes/<lane>/** dir is exempt (the by-design nesting under product's
+# docs/loop/** ledger). This is ADVISORY: it only prints; registration proceeds.
+_LEDGER_LANE_PREFIX = "docs/loop/lanes/"
+
+
+def _scope_posix(value: str) -> str:
+    return value.replace("\\", "/").strip()
+
+
+def _looks_like_glob(token: str) -> bool:
+    if any(ch in token for ch in "*?[]"):
+        return True
+    if "/" in token:
+        return True
+    if "." in token and " " not in token:
+        return True
+    return False
+
+
+def _split_scope_globs(write_scope: str) -> list:
+    globs = []
+    for raw in (write_scope or "").split(";"):
+        token = _scope_posix(raw)
+        if token and _looks_like_glob(token):
+            globs.append(token)
+    return globs
+
+
+def _normalize_scope_entry(glob: str):
+    token = _scope_posix(glob)
+    if not token:
+        return None
+    if token in ("**", "*"):
+        return ("prefix", "")
+    if token.endswith("/**"):
+        return ("prefix", token[:-2])
+    if token.endswith("/*"):
+        return ("prefix", token[:-1])
+    if token.endswith("/"):
+        return ("prefix", token)
+    if any(ch in token for ch in "*?["):
+        first = min(token.find(ch) for ch in "*?[" if ch in token)
+        head = token[:first]
+        slash = head.rfind("/")
+        return ("prefix", head[: slash + 1] if slash >= 0 else "")
+    return ("file", token)
+
+
+def _scope_entries_overlap(e1, e2) -> bool:
+    k1, v1 = e1
+    k2, v2 = e2
+    if k1 == "prefix" and k2 == "prefix":
+        return v1 == v2 or v1.startswith(v2) or v2.startswith(v1)
+    if k1 == "prefix":
+        return v2 == v1.rstrip("/") or v2.startswith(v1)
+    if k2 == "prefix":
+        return v1 == v2.rstrip("/") or v1.startswith(v2)
+    return v1 == v2
+
+
+def _substantive_scope_entries(lane: str, write_scope: str) -> list:
+    own_prefix = _LEDGER_LANE_PREFIX + (lane or "").strip() + "/"
+    entries = []
+    for original in _split_scope_globs(write_scope):
+        norm = _normalize_scope_entry(original)
+        if norm is None:
+            continue
+        _, value = norm
+        if value == own_prefix or value.startswith(own_prefix):
+            continue
+        entries.append((original, norm))
+    return entries
+
+
+def scope_overlap_advisories(rows: dict, new_lanes: list) -> list:
+    """Advisory strings for NEW lanes whose scopes collide with an existing row.
+
+    Only compares each newly registered lane against the other rows (a
+    pre-existing overlap between two old rows is not re-announced). Deterministic
+    order; each colliding pair reported once.
+    """
+    entries_by_lane = {
+        lane: _substantive_scope_entries(lane, (row.get("write_scope", "") or ""))
+        for lane, row in rows.items()
+    }
+    advisories = []
+    seen = set()
+    for new_lane in new_lanes:
+        if new_lane not in entries_by_lane:
+            continue
+        for other in sorted(entries_by_lane):
+            if other == new_lane:
+                continue
+            for glob_a, norm_a in entries_by_lane[new_lane]:
+                for glob_b, norm_b in entries_by_lane[other]:
+                    if not _scope_entries_overlap(norm_a, norm_b):
+                        continue
+                    pair = tuple(sorted((new_lane, other)))
+                    key = (pair, tuple(sorted((glob_a, glob_b))))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    advisories.append(
+                        "advisory: lane {a!r} write_scope overlaps lane {b!r}: "
+                        "{ga} vs {gb} -- the precommit scope guard cannot arbitrate "
+                        "between them; cut them into disjoint subtrees".format(
+                            a=new_lane, b=other, ga=glob_a, gb=glob_b
+                        )
+                    )
+    return advisories
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop-dir", default="docs/loop")
@@ -880,6 +1002,10 @@ def main() -> int:
             wrote.append(path)
 
     rows = existing_rows(registry)
+    # G22: which lanes are NEW this run (absent from the on-disk registry). Only
+    # these get an overlap advisory below; a pre-existing overlap is not
+    # re-announced on every flagless rerun.
+    preexisting_lanes = set(rows)
     for lane, defaults in lane_defaults.items():
         worklog = f"{posix_path(args.loop_dir)}/lanes/{lane}/worklog.md"
         rows.setdefault(
@@ -949,6 +1075,14 @@ def main() -> int:
     print(f"ensured {memory_dir}")
     for lane in stamped_observed:
         print(f"stamped model_observed for {lane}")
+    # G22: advisory overlap warning at registration time. If a newly registered
+    # lane's write_scope collides with an existing row's scope, print an advisory
+    # line (no behavior change -- registration already succeeded above). The doctor
+    # is the authoritative, always-on check; this print catches the collision the
+    # moment a human runs --extra-lane, before a colliding team is even proposed.
+    new_lanes = [lane for lane in lane_defaults if lane not in preexisting_lanes]
+    for advisory in scope_overlap_advisories(rows, new_lanes):
+        print(advisory)
     if thread_mapping:
         # Thread-title guidance (F1): title each Codex thread with the BARE lane
         # name only. Do not prefix a project name or a "loop lane:" boilerplate

@@ -111,6 +111,25 @@ When you propose the initial team, **default to development disciplines**, not p
 
 Propose only the lanes the goal actually needs (three is the common floor: product, one build lane, review), and add specialists per the Lane Expansion Gate. Do not name a lane after a product feature ("dedupe agent", "merchant agent") - that is a feature cut wearing a lane costume; fold those into the discipline that owns them.
 
+**Write-scope rules (hard, mechanically checked).** A lane team is only well-formed when the write scopes obey all three. The run-4 coordinator broke the first two - it proposed data-eng AND frontend both owning `src/**, tests/**` (overlapping, so the precommit guard could not tell whose commit was legal) and product owning only `tracker.md, handoff.md` (too narrow to commit its own ledger). Do not repeat that:
+
+1. **Pairwise disjoint.** No lane's scope glob may equal or contain another lane's. Two lanes sharing `src/**`, or one owning `src/**` while another owns `src/ui/**`, leaves the precommit scope guard unable to arbitrate between them. Cut the shared tree into disjoint subtrees instead (see the worked example). The doctor flags a violation as `write_scope_overlap`, naming both lanes and the offending globs.
+2. **Product owns the ledger.** Product's scope MUST include `docs/loop/**` - it commits the ledger (requests.md, loop-run-log.md, agent-lanes.md, goal.md, tracker.md, handoff.md) - plus `.gitignore`. A product scope narrowed to just tracker.md + handoff.md makes product's own close-the-turn commits fail the hook. The doctor flags a product lane that does not cover `docs/loop/**` as `product_scope_gap`.
+3. **Each lane owns its own lane dir.** Every lane's scope includes its own `docs/loop/lanes/<lane>/**` (its worklog/current/inbox/outbox). These per-lane dirs nest under product's `docs/loop/**` by design and are the ONE expected nesting: the disjointness check exempts a lane's own lane dir, exactly as the G19 review carve-out exempts the same ritual writes. (Product's `docs/loop/**` already covers its own `docs/loop/lanes/product/**`, so product needs no separate entry.)
+
+Both `write_scope_overlap` and `product_scope_gap` are WARNING-only; they never block handoff, but a proposed team that trips either is not yet well-formed - fix the cut before dispatching.
+
+**Worked example (a correct disjoint cut).** `src/**` + `tests/**` split into disjoint core-vs-ui subtrees:
+
+| lane | write_scope |
+| --- | --- |
+| product | `docs/loop/**; docs/product/**; .gitignore` |
+| data-eng | `src/core/**; tests/core/**; docs/data/**; docs/loop/lanes/data-eng/**` |
+| frontend | `src/ui/**; app/**; tests/ui/**; docs/design/**; docs/loop/lanes/frontend/**` |
+| review | `docs/loop/lanes/review/**` |
+
+No two scopes overlap (`src/core/**` vs `src/ui/**`, `tests/core/**` vs `tests/ui/**`, `docs/data/**` vs `docs/design/**` vs `docs/product/**` are all disjoint); product holds the whole ledger; each lane also owns its own `docs/loop/lanes/<lane>/**`.
+
 ## Health Check
 
 Before deciding whether to hand off, recover a request, add a lane, or auto-chain, run the read-only doctor:
@@ -236,7 +255,7 @@ Use stable lane names. Record thread IDs only after they are verified with `read
 
 Title each Codex thread with the **bare lane name** and nothing else - `set_thread_title(<thread_id>, "review")`, not `"<project> loop lane: review"`. Drop the project name and the "loop lane:" boilerplate; the loop refers to a lane by its bare name, so the title must match it exactly. Project context, when a human needs it to tell dashboards apart, comes from the dashboard project name, never the thread title.
 
-Keep write scopes disjoint where possible. Product may update loop planning files; implementation may update code; review may write review notes. Avoid letting multiple lanes casually edit the same loop file.
+Keep write scopes **pairwise disjoint** - this is a hard rule, not a preference (see "Proposing Lanes" -> "Write-scope rules" for the mandate, the product-ledger rule, and the worked example; the doctor enforces it with `write_scope_overlap` / `product_scope_gap`). Product owns the `docs/loop/**` ledger; each build lane owns its own code subtree; every lane owns its own `docs/loop/lanes/<lane>/**`. Never let two lanes claim the same file.
 
 ## Model Tier Policy
 

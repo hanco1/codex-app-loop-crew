@@ -52,6 +52,13 @@ It also enforces the hardened loop engineering invariants:
   ``git status --porcelain``; that call is isolated, timed out, and fails
   silent-safe (any failure -> no warning). It is skipped entirely when git is
   absent.
+- G22 write-scope discipline, both WARNING-only (never touch handoff/auto-chain):
+  ``write_scope_overlap`` (two lanes whose normalized write_scope globs overlap --
+  one equals or prefix-contains another -- naming both lanes and the offending
+  globs; a lane's OWN ``docs/loop/lanes/<lane>/**`` dir is exempt, being the
+  by-design nesting under product's ``docs/loop/**`` ledger, mirroring the G19
+  ritual-write carve-out) and ``product_scope_gap`` (a lane named ``product``
+  whose scope does not cover ``docs/loop/**``, the ledger it must commit).
 """
 
 from __future__ import annotations
@@ -664,6 +671,162 @@ def _glob_matches(path: str, pattern: str) -> bool:
 
 def _path_matches_any(path: str, globs: list[str]) -> bool:
     return any(_glob_matches(path, pattern) for pattern in globs)
+
+
+# G22 disjoint write-scope discipline. A lane's OWN per-lane ledger dir is
+# exempt from the overlap check: every lane is REQUIRED to own its own
+# ``docs/loop/lanes/<lane>/**`` (SKILL.md "Proposing Lanes" rule 3) and they all
+# nest by design under product's mandated ``docs/loop/**`` ledger root, so
+# flagging them would condemn every correct cut (the same lesson as the G19
+# review carve-out). ``PRODUCT_LEDGER_PREFIX`` is the ledger root the product
+# lane must cover.
+LEDGER_LANE_PREFIX = "docs/loop/lanes/"
+PRODUCT_LEDGER_PREFIX = "docs/loop/"
+
+
+def _normalize_scope_entry(glob: str) -> Optional[tuple[str, str]]:
+    """Normalize one write_scope glob to a comparable ``(kind, value)``.
+
+    ``('prefix', 'a/')`` covers ``a/`` and everything under it; ``('file',
+    'a/b.md')`` is an exact path. Prefix values always end in ``/`` (except the
+    universal ``''``), so a startswith comparison never confuses ``src/`` with
+    ``srcfoo/``. The two rules the spec names -- ``a/** -> prefix a/`` and a bare
+    file path -> itself -- are implemented directly; a trailing ``/`` is treated
+    as a prefix, and a single-level ``a/*`` is treated as covering the whole
+    ``a/`` subtree because the precommit guard's own ``fnmatch`` semantics let
+    ``*`` cross ``/`` (so ``a/*`` can reach ``a/b/c`` there too). An interior
+    wildcard (rare) reduces to the literal directory prefix before it. Returns
+    ``None`` for an empty token.
+    """
+    token = _posix(glob)
+    if not token:
+        return None
+    if token in ("**", "*"):
+        return ("prefix", "")
+    if token.endswith("/**"):
+        return ("prefix", token[:-2])  # strip '**', keep the trailing '/'
+    if token.endswith("/*"):
+        return ("prefix", token[:-1])  # strip '*', keep the trailing '/'
+    if token.endswith("/"):
+        return ("prefix", token)
+    if any(ch in token for ch in "*?["):
+        first = min(token.find(ch) for ch in "*?[" if ch in token)
+        head = token[:first]
+        slash = head.rfind("/")
+        return ("prefix", head[: slash + 1] if slash >= 0 else "")
+    return ("file", token)
+
+
+def _scope_entries_overlap(e1: tuple[str, str], e2: tuple[str, str]) -> bool:
+    """True when two normalized scope entries cover any common path.
+
+    prefix/prefix overlap when one is a prefix of (or equal to) the other;
+    prefix/file overlap when the file sits under (or equals) the prefix; two
+    files overlap only when identical.
+    """
+    k1, v1 = e1
+    k2, v2 = e2
+    if k1 == "prefix" and k2 == "prefix":
+        return v1 == v2 or v1.startswith(v2) or v2.startswith(v1)
+    if k1 == "prefix":  # e2 is a file
+        return v2 == v1.rstrip("/") or v2.startswith(v1)
+    if k2 == "prefix":  # e1 is a file
+        return v1 == v2.rstrip("/") or v1.startswith(v2)
+    return v1 == v2
+
+
+def _substantive_scope_entries(lane: str, write_scope: str) -> list[tuple[str, tuple[str, str]]]:
+    """Return ``(original_glob, normalized)`` scope entries for ``lane``.
+
+    Drops free-text tokens (via ``_split_scope_globs``) and exempts this lane's
+    OWN ``docs/loop/lanes/<lane>/**`` ledger dir (and anything nested in it): the
+    required, by-design nesting under product's ``docs/loop/**`` ledger root, so
+    it never counts as an overlap. Product's ``docs/loop/**`` root itself is NOT
+    exempt (two lanes both grabbing the whole ledger IS a real conflict); only
+    the per-lane ``<lane>`` subtrees are.
+    """
+    own_prefix = LEDGER_LANE_PREFIX + (lane or "").strip() + "/"
+    entries: list[tuple[str, tuple[str, str]]] = []
+    for original in _split_scope_globs(write_scope):
+        norm = _normalize_scope_entry(original)
+        if norm is None:
+            continue
+        _, value = norm
+        if value == own_prefix or value.startswith(own_prefix):
+            continue  # this lane's own ledger dir: the by-design nesting
+        entries.append((original, norm))
+    return entries
+
+
+def check_write_scope_overlap(lanes: list[dict[str, str]]) -> list[dict[str, str]]:
+    """G22: pairwise write_scope overlap across lanes (WARNING-only).
+
+    Each lane's ``write_scope`` cell is split into globs (the same split the
+    precommit guard uses), normalized (``a/** -> prefix a/``; a bare file ->
+    itself), and compared pairwise across lanes. Any entry of lane A that equals
+    or prefix-contains an entry of lane B (or vice versa) is an overlap the
+    precommit guard cannot arbitrate between -- the run-4 failure this check
+    surfaces. A lane's OWN per-lane ledger dir is exempt (see
+    ``_substantive_scope_entries``). Returns a deterministic list of
+    ``{lane_a, glob_a, lane_b, glob_b}`` findings; never touches handoff_ready.
+    """
+    lane_entries: list[tuple[str, list[tuple[str, tuple[str, str]]]]] = []
+    for row in lanes:
+        lane = (row.get("lane", "") or "").strip()
+        if not lane:
+            continue
+        lane_entries.append((lane, _substantive_scope_entries(lane, row.get("write_scope", ""))))
+
+    findings: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for i in range(len(lane_entries)):
+        lane_a, entries_a = lane_entries[i]
+        for j in range(i + 1, len(lane_entries)):
+            lane_b, entries_b = lane_entries[j]
+            for glob_a, norm_a in entries_a:
+                for glob_b, norm_b in entries_b:
+                    if not _scope_entries_overlap(norm_a, norm_b):
+                        continue
+                    key = (lane_a, glob_a, lane_b, glob_b)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(
+                        {
+                            "lane_a": lane_a,
+                            "glob_a": glob_a,
+                            "lane_b": lane_b,
+                            "glob_b": glob_b,
+                        }
+                    )
+    return findings
+
+
+def check_product_scope_gap(lanes: list[dict[str, str]]) -> Optional[dict[str, str]]:
+    """G22: the product lane's scope must cover ``docs/loop/**`` (WARNING-only).
+
+    Product commits the ledger (requests.md, loop-run-log.md, agent-lanes.md,
+    goal.md, tracker.md, handoff.md), so at least one product scope glob must be
+    a prefix at or above ``docs/loop/`` (``docs/loop/**``, ``docs/**``, or the
+    universal ``**``). Returns a ``{lane, scope}`` finding when a lane named
+    ``product`` is present but its scope does not cover the ledger, else None
+    (no product lane -> nothing to check).
+    """
+    product_row = None
+    for row in lanes:
+        if (row.get("lane", "") or "").strip() == "product":
+            product_row = row
+            break
+    if product_row is None:
+        return None
+    for original in _split_scope_globs(product_row.get("write_scope", "")):
+        norm = _normalize_scope_entry(original)
+        if norm is None:
+            continue
+        kind, value = norm
+        if kind == "prefix" and (value == "" or PRODUCT_LEDGER_PREFIX.startswith(value)):
+            return None  # a prefix at or above docs/loop/ covers the ledger
+    return {"lane": "product", "scope": (product_row.get("write_scope", "") or "").strip()}
 
 
 def check_evidence_lineage(loop_dir: Path, request_ids: set[str]) -> dict[str, Any]:
@@ -1295,6 +1458,15 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # a constraint-marked sensitive dir). WARNING-only; never a gate.
     handoff_sensitive = check_handoff_sensitive_content(loop_dir)
 
+    # G22 write-scope discipline (both WARNING-only, never a gate): lane write
+    # scopes must be pairwise disjoint (an overlap leaves the precommit guard
+    # unable to arbitrate between two claimants -- the run-4 failure), and the
+    # product lane must own docs/loop/** (the ledger it commits). A lane's OWN
+    # docs/loop/lanes/<lane>/** dir is exempt from the overlap check (the
+    # by-design nesting under product's docs/loop/** ledger).
+    write_scope_overlap = check_write_scope_overlap(lanes)
+    product_scope_gap = check_product_scope_gap(lanes)
+
     # F7 mandatory heartbeats: a lane that OWNS an active (non-terminal) request
     # must report a heartbeat. This is distinct from orphan_suspect (which fires
     # for any registered lane whose heartbeat is stale regardless of whether it
@@ -1735,6 +1907,38 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 ),
             }
         )
+    # G22 write_scope_overlap: two lanes' write scopes overlap so the precommit
+    # scope guard cannot arbitrate between them. WARNING-only; names both lanes
+    # and the offending globs.
+    for item in write_scope_overlap:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "write_scope_overlap",
+                "message": "lanes {la} and {lb} have overlapping write scopes: "
+                "{ga} (in {la}) vs {gb} (in {lb}) -- the precommit scope guard "
+                "cannot arbitrate between them; cut them into disjoint subtrees".format(
+                    la=item["lane_a"], lb=item["lane_b"],
+                    ga=item["glob_a"], gb=item["glob_b"],
+                ),
+            }
+        )
+    # G22 product_scope_gap: the product lane cannot commit the ledger it owns.
+    # WARNING-only.
+    if product_scope_gap is not None:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "product_scope_gap",
+                "message": "the product lane's write_scope ({scope}) does not cover "
+                "docs/loop/** -- product commits the ledger (requests.md, "
+                "loop-run-log.md, agent-lanes.md, goal.md, tracker.md, handoff.md), "
+                "so widen it to include docs/loop/** or its own close-the-turn "
+                "commits will fail the scope guard".format(
+                    scope=product_scope_gap["scope"] or "(empty)"
+                ),
+            }
+        )
     if not gate_available:
         warnings.append(
             {
@@ -1840,6 +2044,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "orphan_evidence": orphan_evidence,
         "evidence_naming": evidence_naming,
         "uncommitted_work": uncommitted_work,
+        "write_scope_overlap": write_scope_overlap,
+        "product_scope_gap": product_scope_gap,
         "handoff_sensitive_content": handoff_sensitive,
         "tier_mismatches": tier_mismatches,
         "evidence_recorded_ok": evidence_recorded_ok,
