@@ -2155,6 +2155,55 @@ def main() -> int:
         if "never silently deviate" not in skill_lower and "never silently deviates" not in skill_lower:
             _fail("SKILL.md must state the skill never silently deviates from the recorded tier")
 
+        # ---- G25: tier-resolution hardening (frontier label, xhigh ceiling,
+        # explicit-id gap window) --------------------------------------------
+        # (a) FRONTIER LABEL primary; list POSITION is only the fallback. The
+        # resolution must key on the model's frontier/most-capable description in
+        # the create_thread list, not on top-of-list position, so a host
+        # reordering the list cannot silently change what "highest" means.
+        if "frontier label" not in skill_lower:
+            _fail("SKILL.md (G25a) must resolve 'highest available' by the FRONTIER LABEL")
+        if "frontier or most-capable" not in skill_lower:
+            _fail("SKILL.md (G25a) must identify the frontier/most-capable model in the create_thread list")
+        if "position is only the fallback" not in skill_lower:
+            _fail("SKILL.md (G25a) must keep list POSITION only as the fallback when no frontier label exists")
+        # (b) EFFORT CEILING: default thinking is xhigh (or the highest standard
+        # effort the model supports, never above xhigh); ultra/max are NEVER
+        # auto-selected -- reserved for long-horizon tasks, human-explicit only,
+        # and recorded like any human tier choice (G14e mechanics).
+        if "xhigh" not in skill_lower:
+            _fail("SKILL.md (G25b) must set the default thinking effort to xhigh")
+        if "never above `xhigh`" not in skill_lower:
+            _fail("SKILL.md (G25b) must cap the effort ceiling at xhigh (never above)")
+        if "never auto-selected" not in skill_lower:
+            _fail("SKILL.md (G25b) must state ultra/max are NEVER auto-selected")
+        if "`ultra` and `max`" not in skill_md:
+            _fail("SKILL.md (G25b) must name `ultra` and `max` as the reserved (never auto-selected) efforts")
+        if "long-horizon" not in skill_lower:
+            _fail("SKILL.md (G25b) must reserve ultra/max for long-horizon tasks")
+        if "explicitly requests" not in skill_lower:
+            _fail("SKILL.md (G25b) must require ultra/max only on an explicit human request")
+        if "record that request" not in skill_lower:
+            _fail("SKILL.md (G25b) must record the explicit ultra/max request like any human tier choice")
+        if "g14e" not in skill_lower:
+            _fail("SKILL.md (G25b) must tie the recorded-request rule to the G14e human-choice mechanics")
+        # (c) GAP WINDOW: when the host's interactive picker offers a newer model
+        # than the create_thread list names, pass the explicit model id; the host
+        # validates at call time; on rejection fall back per the degradation rule
+        # (never fail the dispatch) and tell the human.
+        if "gap window" not in skill_lower:
+            _fail("SKILL.md (G25c) must define the gap-window case (host offers a newer model than the list names)")
+        if "interactive picker" not in skill_lower:
+            _fail("SKILL.md (G25c) must anchor the gap window on the host's interactive picker")
+        if "explicit model id" not in skill_lower:
+            _fail("SKILL.md (G25c) must instruct passing the explicit model id in the gap window")
+        if "validates the id at call time" not in skill_lower:
+            _fail("SKILL.md (G25c) must state the host validates the id at call time")
+        if "never fail the dispatch" not in skill_lower:
+            _fail("SKILL.md (G25c) must fall back per the degradation rule and never fail the dispatch")
+        if "tell the human which tier the lane ran on" not in skill_lower:
+            _fail("SKILL.md (G25c) must, on rejection, tell the human which tier the lane ran on")
+
         # (G14 boundary) No concrete model-name literal may appear anywhere in
         # SKILL.md or protocol.md: policy docs may only speak in the abstract
         # tier words; a concrete model id belongs solely in runtime observed
