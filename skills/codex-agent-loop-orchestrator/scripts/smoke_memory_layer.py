@@ -2023,6 +2023,89 @@ def main() -> int:
         if "placeholder blocked" not in loop_state_lower and "no goal yet" not in loop_state_lower:
             _fail("loop-state.md intake section must preserve the F3 no-placeholder-BLOCKED semantic")
 
+        # ---- G23: hybrid intake (serial cap + on-demand batch) --------------
+        # SKILL.md Intake + loop-state.md intake section add the hybrid rules ON
+        # TOP of G9's one-at-a-time grilling: one-at-a-time stays the default
+        # only for FORK-SHAPED decisions; after at most three serial questions
+        # the coordinator MUST offer questionnaire mode; the human may say "list
+        # them all" at any time and it switches immediately; only INDEPENDENT
+        # items go in the batch (a decision that would change another is held
+        # back and asked serially). G9's own rules are unchanged (asserted below).
+        for g23_name, g23_lower in (("SKILL.md", skill_lower), ("loop-state.md", loop_state_lower)):
+            if "fork-shaped" not in g23_lower:
+                _fail("{0} must keep one-at-a-time only for FORK-SHAPED decisions (G23)".format(g23_name))
+            if "at most three" not in g23_lower:
+                _fail("{0} must cap serial intake at 'at most three' questions (G23)".format(g23_name))
+            if "questionnaire mode" not in g23_lower:
+                _fail("{0} must OFFER questionnaire mode after the cap (G23)".format(g23_name))
+            if "list them all" not in g23_lower:
+                _fail("{0} must let the human switch with 'list them all' at any time (G23)".format(g23_name))
+            if "held back" not in g23_lower:
+                _fail("{0} must hold a dependent decision BACK from the batch (G23)".format(g23_name))
+            if "independent" not in g23_lower:
+                _fail("{0} must batch only INDEPENDENT decisions (G23)".format(g23_name))
+
+        # NEGATIVE: the G23 hybrid rules were ADDED, not swapped in -- every G9
+        # grilling-intake anchor must still be present UNCHANGED in both docs.
+        for g9_anchor in ("one question at a time", "recommended answer", "stop rule", "over-interview"):
+            if g9_anchor not in skill_lower:
+                _fail("G23 regressed a G9 SKILL.md intake anchor: {0!r}".format(g9_anchor))
+            if g9_anchor not in loop_state_lower:
+                _fail("G23 regressed a G9 loop-state.md intake anchor: {0!r}".format(g9_anchor))
+        if "walk me through how you'll actually operate this" not in skill_lower:
+            _fail("G23 regressed the G9 mandatory operate-it question in SKILL.md")
+        if "which fork" not in skill_lower or "which cut" not in skill_lower:
+            _fail("G23 regressed the G9 two-forks intake wording in SKILL.md")
+
+        # ---- G24: invariants-first intake -----------------------------------
+        # (a) SKILL.md Intake + loop-state.md: for a data / multi-step goal, right
+        # after the objective is confirmed, intake asks for domain INVARIANTS and
+        # DRAFTS a recommended set; the example class list is present; invariants
+        # live in goal.md under a CANONICAL "## Invariants" section; the run-4
+        # expense app is the worked example.
+        if "invariants-first" not in skill_lower:
+            _fail("SKILL.md must add an invariants-first intake step (G24)")
+        for g24_name, g24_md, g24_lower in (
+            ("SKILL.md", skill_md, skill_lower),
+            ("loop-state.md", loop_state_md, loop_state_lower),
+        ):
+            if "## Invariants" not in g24_md:
+                _fail("{0} must name goal.md's canonical '## Invariants' section (G24)".format(g24_name))
+            if "canonical" not in g24_lower:
+                _fail("{0} must state '## Invariants' is the canonical location (G24)".format(g24_name))
+            # The example class list (substance; adapted wording tolerated).
+            for g24_needle in ("no silent drops", "outrank", "add-only", "run_id"):
+                if g24_needle not in g24_lower:
+                    _fail("{0} invariant example-class list is missing: {1!r} (G24)".format(g24_name, g24_needle))
+            if "displayed number" not in g24_lower:
+                _fail("{0} must include the 'every displayed number traces to its source' invariant (G24)".format(g24_name))
+            # The run-4 expense-app worked example.
+            if "expense app" not in g24_lower:
+                _fail("{0} must cite the run-4 expense app as the worked invariants example (G24)".format(g24_name))
+
+        # (b) protocol.md IMPLEMENTATION_REQUEST template: every request lists
+        # WHICH invariants apply (or none apply and why), and the G1 red-capable
+        # rule extends so each APPLICABLE invariant names a command that can FAIL.
+        if "invariants:" not in protocol_md:
+            _fail("protocol.md IMPLEMENTATION_REQUEST template must carry an invariants: line (G24)")
+        if "applicable invariant" not in protocol_lower:
+            _fail("protocol.md must extend the red-capable rule to each APPLICABLE invariant (G24)")
+        if "none apply" not in protocol_lower:
+            _fail("protocol.md must allow a request to state 'none apply and why' (G24)")
+        if "red-capable" not in protocol_lower:
+            _fail("protocol.md must tie applicable invariants to the red-capable rule (G24)")
+
+        # (c) loop-state.md review gate: reviewers check changed behavior against
+        # goal.md's ## Invariants section, and an invariant violation is ALWAYS a
+        # blocker-severity finding (feeds G8's severity tiers).
+        loop_state_collapsed_g24 = " ".join(loop_state_lower.split())
+        if "invariant check" not in loop_state_lower:
+            _fail("loop-state.md review gate must carry an 'Invariant check' subsection (G24)")
+        if "invariant violation is always a blocker" not in loop_state_collapsed_g24:
+            _fail("loop-state.md must state an invariant violation is ALWAYS a blocker (G24)")
+        if "## invariants" not in loop_state_lower:
+            _fail("loop-state.md review gate must check behavior against goal.md's ## Invariants section (G24)")
+
         # ---- G12: handoff redaction wording ---------------------------------
         # SKILL.md and protocol.md must both instruct: reference sensitive
         # material, never quote it into a handoff/auto-chain seed; and name the

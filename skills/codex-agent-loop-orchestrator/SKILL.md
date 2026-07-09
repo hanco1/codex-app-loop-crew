@@ -94,6 +94,26 @@ The questions to cover, one at a time (each with your recommended answer):
 
 **One MANDATORY question for user-facing goals.** If the deliverable is something a human operates (a UI, a dashboard, an interactive tool), you MUST ask: *"walk me through how you'll actually operate this - input method, file selection, what you look at first."* This is the question run 2 never asked: the loop shipped a path textbox while the user wanted a file picker, and nobody found out until after the pause. Answer it and the file-picker-vs-path-textbox gap dies at intake.
 
+**Hybrid intake: cap the serial questions, then batch the rest.** One-at-a-time is the default ONLY for **fork-shaped** decisions - a decision whose answer changes which later questions you ask (the build-vs-operations fork rewrites everything downstream; the redacted-sample questions only exist if the goal names real data). Decisions that are **independent** - their answer changes no other question - do not need the serial drip, and dripping them one message at a time is needless friction. So:
+
+- **Cap at three.** After at most three serial questions you MUST offer questionnaire mode: one message listing every remaining INDEPENDENT decision, each with your own recommended answer, and the human replies once. Phrase it as an offer - *"here are the rest as one list, each with my recommendation; reply once and change anything you want."*
+- **Switch on request, at any time.** The human may ask for the whole list at any point - "list them all" (in any language) - and you switch to questionnaire mode immediately, even before the third question.
+- **Batch independent items only.** A decision whose answer would change another item is held back, NOT put in the batch: ask it serially AFTER the batch resolves, because its answer may rewrite the questions that follow. The batch carries only the decisions that stand alone.
+
+Questionnaire mode changes the DELIVERY (one message instead of many), never the substance: every batched item still carries your recommended answer, and the stop rule still governs - when the objective is checkable, stop asking and write `goal.md`, whether you got there serially or by batch.
+
+**Invariants-first intake.** For any goal that **handles data or does multi-step processing** (an importer, a pipeline, a dashboard over a store - anything where records flow through steps), RIGHT AFTER the objective is confirmed and before the first request, ask the human for the domain **invariants** - the rules that must never break. Features say what to build; invariants say what must never break, and they become standing acceptance material for every later request. Do not ask cold: DRAFT a recommended set from the goal and have the human edit it, the same grilling style as every other intake question.
+
+Draft from this class of invariant, adapted to the goal:
+
+- **No silent drops** - every parsed record lands in the raw store even if it is unclassifiable or duplicate-suspected; mark it, never let it vanish.
+- **Human edits outrank machine re-runs** - a re-import must not overwrite a human correction.
+- **Machine ingest is add-only** - never a silent delete or overwrite; dedupe marks or merges, it never deletes.
+- **External-effect operations carry a `run_id` and recoverable state** - an import can be inspected and undone as a unit.
+- **Every displayed number traces to its source** - each figure ties back to a file, row, or rule.
+
+Write the agreed invariants into `goal.md` under a dedicated **`## Invariants`** section - that is their ONE canonical home; the request template and the review gate both read them there. **Worked example (run-4 expense app):** transactions are never silently dropped; a human's category or duplicate correction survives a re-import; ingest is add-only; each import carries a `run_id` and can be undone as a unit; every dashboard number is traceable to its source row. A data goal's invariants usually rhyme with that set.
+
 Only after the human answers step 1 do you create the first request and append the first run-log row. The intake conversation itself is not a request.
 
 **Redacted-sample ritual (when the goal names human-provided real data).** If any Done-When condition depends on the human's real data (a real bank statement, export, or invoice), get the redacted-sample approval ONCE at intake: ask the human to approve a sanitized excerpt (a few rows with identifying detail scrubbed) or a field-shape spec (which column is the ISO date, which is merchant text, which is the signed amount, and a realistic row count). Later slices assert **field-level correctness** against that approved derivative - row count > 0, valid calendar dates, merchant non-empty and non-numeric, sign convention - and record only counts/booleans as evidence, never a raw row. "Parses without error" alone is never sufficient real-data evidence (run 2 parsed cleanly and still produced `merchant="9"` and 0 imported rows). See `references/protocol.md` "Real-input correctness".

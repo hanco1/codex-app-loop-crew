@@ -32,6 +32,10 @@ When `goal.md`/`Done When` still hold bootstrap placeholders, there is **no obje
 
 **Intake is a grilling interview, not a questionnaire.** Ask ONE question at a time and wait for the answer before the next (a bulk list loses the dependency order between answers); attach the coordinator's OWN recommended answer to every question so the human edits a proposal instead of authoring cold; look up any fact the repo or host can answer (stack, test runner, existing UI surface, whether a tool is installed) rather than asking - reserve questions for genuine decisions. **Stop rule:** when the objective is checkable (a concrete Done-When is in hand), stop asking and write `goal.md` - do not over-interview. For a **user-facing goal**, one question is MANDATORY: *"walk me through how you'll actually operate this - input method, file selection, what you look at first"* (the file-picker-vs-path-textbox gap dies here). This preserves the F3/F5 intake semantics (no placeholder BLOCKED, the task-size gate, and the two forks) and only sharpens HOW the questions are asked.
 
+**Hybrid intake: cap the serial questions, batch the independent rest.** One-at-a-time is the default ONLY for **fork-shaped** decisions (an answer that changes which later questions you ask). After at most three serial questions the coordinator MUST offer questionnaire mode - one message listing every remaining INDEPENDENT decision, each with its recommended answer, answered in one reply - and the human may ask for the whole list at any time ("list them all", in any language), switching immediately, even before the third question. Only independent items go in the batch: a decision whose answer would change another item is held back and asked serially AFTER the batch resolves. Questionnaire mode changes only the delivery; G9's recommended-answer rule and the stop rule are unchanged.
+
+**Invariants-first intake.** For any goal that handles data or multi-step processing, right after the objective is confirmed the coordinator asks the human for the domain **invariants** (the rules that must never break) and DRAFTS a recommended set from the goal for the human to edit - no silent drops (every parsed record lands in the raw store even if unclassifiable or duplicate-suspected), human edits outrank machine re-runs, add-only ingest (dedupe marks/merges, never deletes), external-effect operations carry a `run_id` and recoverable state, every displayed number traces to its source file/row/rule. The agreed invariants live in `goal.md` under a dedicated `## Invariants` section (the canonical location); the request template lists which apply per slice and the review gate checks changed behavior against them. Worked example: the run-4 expense app (transactions never silently dropped; human category/duplicate corrections survive re-import; add-only ingest; per-import `run_id` + undo; every dashboard number traceable).
+
 ## Checkpoint Close Gate
 
 A checkpoint is closed enough to hand off only when:
@@ -203,6 +207,11 @@ Send `IMPLEMENTATION_REQUEST` only after product has:
   human approved once at intake, and evidence records only counts/booleans (see
   `references/protocol.md` "Real-input correctness" and its redacted-sample
   ritual);
+- **listed which invariants apply** to this slice (by number/name from
+  `goal.md`'s `## Invariants` section) or stated that none apply and why; each
+  applicable invariant, like each criterion, names a red-capable verify command
+  that FAILS on its violation (see `references/protocol.md` "Applicable
+  invariants per request");
 - confirmed the implementation write scope does not conflict with another active lane;
 - created or updated the request row in `requests.md`.
 
@@ -293,6 +302,21 @@ Each `FIX_REQUEST` finding carries a `severity`: `blocker`, `should-fix`, or
 
 When review finds only `should-fix`/`nit` items (no blocker), it may send
 `REVIEW_DONE` with the notes attached rather than `FIX_REQUEST`.
+
+### Invariant check (a violation is always a blocker)
+
+Beyond the three categories above, every review checks the slice's CHANGED
+behavior against `goal.md`'s `## Invariants` section - the domain rules the
+human approved at intake (see `SKILL.md` "Invariants-first intake"). For each
+invariant the request marked applicable, confirm the change does not break it;
+for a data or multi-step-processing slice, also watch for a newly reachable
+violation the request did not list.
+
+An invariant violation is always a blocker. It feeds the severity tiers above -
+a dropped record, a re-import that clobbers a human correction, a silent delete,
+an un-undoable external effect, or a displayed number that traces to nothing is
+never a should-fix or a nit. Send `FIX_REQUEST` with `severity: blocker`, keep
+the same `request_id`, and increment `iteration`.
 
 ### Tautological-evidence guard (reject evidence that cannot go red)
 

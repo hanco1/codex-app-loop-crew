@@ -460,6 +460,8 @@ scope:
 non_goals:
 - Do not redesign the UI shell.
 - Do not add authentication.
+invariants:
+- none apply: this color-match slice persists no data and has no external effect; see goal.md ## Invariants.
 acceptance_criteria:
 - User can choose foundation and lipstick shades. VERIFY `python -m unittest tests.ui.test_shade_picker` (fails if either selector is missing).
 - App returns three compatible color recommendations. VERIFY `python -m unittest tests.core.test_recommend` asserts exactly three results and undertone compatibility (fails on zero, four, or an incompatible pick).
@@ -547,6 +549,37 @@ logs, or evidence records. So the correctness check runs against a
 This keeps the never-upload constraint intact while still making the field-level
 criterion red-capable: the assertion runs on approved shape, the record carries
 only the pass/fail counts.
+
+### Applicable invariants per request (each applicable one is red-capable)
+
+`goal.md`'s `## Invariants` section (the domain rules the human approved at
+intake - see `SKILL.md` "Invariants-first intake") is standing acceptance
+material, so every `IMPLEMENTATION_REQUEST` carries an `invariants:` line that
+either names **which invariants apply** to this slice (by number or name) or
+**states that none apply and why**. Silence is not allowed: an unstated
+`invariants:` line is an incomplete request, the same way an empty `non_goals`
+is not ready to send.
+
+The red-capable rule extends to invariants: **each APPLICABLE invariant names a
+verify command that can FAIL on its violation**, exactly like an acceptance
+criterion. "INV-1 no silent drops" is a vibe until a command asserts every
+parsed row reached the raw store and goes RED when one is dropped; an applicable
+invariant with no red-capable check is the same defect as a criterion with no
+red-capable command - sharpen it or the request is not ready. Name the command
+inline, the same `VERIFY <command>` suffix the criteria use:
+
+```md
+invariants:
+- INV-1 no silent drops: VERIFY `python -m unittest tests.core.test_no_drops`
+  (fails if any parsed row is missing from the raw store).
+- INV-4 per-import run_id + undo: VERIFY `python -m unittest tests.core.test_undo`
+  (fails if an import cannot be inspected and undone as a unit).
+- none of the display-tracing invariants apply: this slice renders nothing.
+```
+
+The review gate checks the changed behavior against the same `## Invariants`
+section, and an invariant violation is ALWAYS a blocker-severity finding (see
+`references/loop-state.md` "Invariant check").
 
 ## IMPLEMENTATION_DONE
 
