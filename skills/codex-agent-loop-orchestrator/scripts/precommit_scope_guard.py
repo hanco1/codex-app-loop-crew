@@ -82,6 +82,36 @@ def parse_table(path: Path) -> List[Dict[str, str]]:
     return rows
 
 
+def parse_table_with_error(path: Path) -> tuple[List[Dict[str, str]], Optional[str]]:
+    """Parse a table while preserving a leases-file read failure for the guard."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], "cannot read {0}: {1}: {2}".format(
+            posix_path(str(path)), type(exc).__name__, exc
+        )
+
+    headers: Optional[List[str]] = None
+    rows: List[Dict[str, str]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = split_md_row(line)
+        if not cells:
+            continue
+        if is_separator_row(cells):
+            continue
+        if headers is None:
+            headers = [cell.strip().lower() for cell in cells]
+            continue
+        if len(cells) < len(headers):
+            cells += [""] * (len(headers) - len(cells))
+        row = dict(zip(headers, cells[: len(headers)]))
+        row["__line__"] = str(line_number)
+        rows.append(row)
+    return rows, None
+
+
 def split_scope_globs(write_scope: str) -> List[str]:
     """Split a ``write_scope`` cell into individual glob patterns.
 
@@ -169,6 +199,33 @@ def lane_write_globs(lanes: List[Dict[str, str]], lane: str) -> Optional[List[st
     return None
 
 
+def other_lane_scope_matches(
+    lanes: List[Dict[str, str]], lane: str, path: str
+) -> List[tuple[str, str]]:
+    """Return other static lane scopes that cover ``path``."""
+    matches: List[tuple[str, str]] = []
+    for row in lanes:
+        other_lane = row.get("lane", "").strip()
+        if not other_lane or other_lane == lane:
+            continue
+        for glob in split_scope_globs(row.get("write_scope", "")):
+            if glob_matches(path, glob):
+                if expected_ledger_lane_overlap(lane, other_lane, path):
+                    continue
+                matches.append((other_lane, glob))
+    return matches
+
+
+def expected_ledger_lane_overlap(lane: str, other_lane: str, path: str) -> bool:
+    """Keep the one intentional product-ledger/lane-directory nesting."""
+    candidate = posix_path(path)
+    if lane == "product":
+        return candidate.startswith("docs/loop/lanes/{0}/".format(other_lane))
+    if other_lane == "product":
+        return candidate.startswith("docs/loop/lanes/{0}/".format(lane))
+    return False
+
+
 def other_lane_leases(leases: List[Dict[str, str]], lane: str) -> List[Dict[str, str]]:
     """Return active lease rows held by lanes other than ``lane``."""
     active: List[Dict[str, str]] = []
@@ -176,10 +233,8 @@ def other_lane_leases(leases: List[Dict[str, str]], lane: str) -> List[Dict[str,
         status = row.get("status", "").strip().upper()
         if status in INACTIVE_LEASE_STATUSES:
             continue
-        if status and status not in ACTIVE_LEASE_STATUSES:
-            # Unknown status: treat as active (fail closed) but only if it
-            # names a real glob and another lane.
-            pass
+        # Every remaining status is either known-active or an unknown non-blank
+        # value. Both use the same fail-closed enforcement below.
         holder = row.get("lane", "").strip()
         if not holder or holder == lane:
             continue
@@ -188,6 +243,37 @@ def other_lane_leases(leases: List[Dict[str, str]], lane: str) -> List[Dict[str,
             continue
         active.append(row)
     return active
+
+
+def malformed_active_lease_findings(
+    leases: List[Dict[str, str]], lane: str, leases_file: Path
+) -> tuple[List[str], List[str]]:
+    """Report ACTIVE-like lease rows whose blank glob would protect no path."""
+    violations: List[str] = []
+    notes: List[str] = []
+    for row in leases:
+        status = row.get("status", "").strip().upper()
+        if status in INACTIVE_LEASE_STATUSES:
+            continue
+        if posix_path(row.get("file_glob", "")):
+            continue
+        holder = row.get("lane", "").strip()
+        request_id = row.get("request_id", "").strip() or "?"
+        message = (
+            "{path} line {line}: {status} lease for lane {holder!r}, request {request}, "
+            "has a blank file_glob"
+        ).format(
+            path=posix_path(str(leases_file)),
+            line=row.get("__line__", "?") or "?",
+            status=status or "ACTIVE-like",
+            holder=holder or "?",
+            request=request_id,
+        )
+        if holder and holder != lane:
+            violations.append(message + "; commit rejected until the lease row is fixed")
+        else:
+            notes.append(message)
+    return violations, notes
 
 
 def evaluate(
@@ -200,10 +286,12 @@ def evaluate(
     leases_file = loop_dir / "leases.md"
 
     lanes = parse_table(registry)
-    leases = parse_table(leases_file)
+    leases, leases_read_error = parse_table_with_error(leases_file)
 
     violations: List[str] = []
     notes: List[str] = []
+    if leases_read_error:
+        notes.append(leases_read_error)
 
     known_lanes = {row.get("lane", "").strip() for row in lanes if row.get("lane", "").strip()}
     globs = lane_write_globs(lanes, lane)
@@ -231,6 +319,11 @@ def evaluate(
         )
         return {"ok": False, "violations": violations, "notes": notes}
 
+    malformed_violations, malformed_notes = malformed_active_lease_findings(
+        leases, lane, leases_file
+    )
+    violations.extend(malformed_violations)
+    notes.extend(malformed_notes)
     held = other_lane_leases(leases, lane)
 
     for path in paths:
@@ -238,6 +331,39 @@ def evaluate(
             violations.append(
                 "{path} is outside write_scope for lane {lane!r} ({scope})".format(
                     path=path, lane=lane, scope="; ".join(globs)
+                )
+            )
+            continue
+        if leases_read_error:
+            static_matches = other_lane_scope_matches(lanes, lane, path)
+            if static_matches:
+                violations.append(
+                    "{path} cannot be safely checked against dynamic leases because {error}; "
+                    "it is also inside other lane static scope(s): {scopes}".format(
+                        path=path,
+                        error=leases_read_error,
+                        scopes=", ".join(
+                            "{0!r} ({1})".format(other_lane, glob)
+                            for other_lane, glob in static_matches
+                        ),
+                    )
+                )
+            continue
+        static_matches = other_lane_scope_matches(lanes, lane, path)
+        if static_matches:
+            own_matches = [glob for glob in globs if glob_matches(path, glob)]
+            violations.append(
+                "{path} is inside overlapping write_scope entries for lane {lane!r} "
+                "({own}) and {others}. Fix the scopes in {registry} before committing "
+                "this shared region.".format(
+                    path=path,
+                    lane=lane,
+                    own="; ".join(own_matches),
+                    others=", ".join(
+                        "lane {0!r} ({1})".format(other_lane, glob)
+                        for other_lane, glob in static_matches
+                    ),
+                    registry=posix_path(str(registry)),
                 )
             )
             continue
@@ -305,6 +431,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     result = evaluate(loop_dir, lane, paths, args.allow_unscoped)
+    for note in result["notes"]:
+        sys.stderr.write("precommit_scope_guard: warning: {0}\n".format(note))
     if result["ok"]:
         print(
             "precommit_scope_guard: OK ({n} staged file(s) within lane {lane!r} scope).".format(

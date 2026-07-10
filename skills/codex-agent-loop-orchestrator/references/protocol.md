@@ -97,10 +97,18 @@ runs, under `docs/loop/evidence/`. Each file is a JSON object:
 }
 ```
 
-All five fields are required. Record the real process exit code; do not
-normalize a non-zero exit to `0`. Use one file per command (for example
+All five fields are required. `request_id`, `checkpoint`, `command`, and
+`ran_at` must be non-empty strings, and `ran_at` must be a valid timezone-aware
+ISO-8601 timestamp. Record the real process exit code; do not normalize a
+non-zero exit to `0`. Use one file per command (for example
 `evidence/REQ-20260623-101500-implementation-iter-1-npm-test.json`) so each
 checkpoint command is independently auditable and files never collide.
+
+The archived `messages/<request_id>/IMPLEMENTATION_REQUEST*.md` files are the
+request's expected VERIFY-command manifest. The doctor compares every
+backticked `VERIFY` command in that manifest with the request's evidence-record
+`command` values. A missing archive, an empty VERIFY manifest, or any uncovered
+command emits `evidence_manifest_gap`; a message path never counts as evidence.
 
 Keep every evidence file as a flat, non-nested `.json` directly under
 `docs/loop/evidence/`: the gate collects records with a non-recursive
@@ -109,7 +117,8 @@ invisible to it and does not count.
 
 ### Running The Gate
 
-Before product or review marks a request `ACCEPTED`, run the gate:
+Before review issues a pass verdict or product marks a request `ACCEPTED`, run
+the gate:
 
 ```bash
 python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop --request-id REQ-20260623-101500-implementation
@@ -132,6 +141,11 @@ fails if any single request fails. Add `--json` for a structured report
 ```text
 ACCEPTED and auto-chain require: completion_gate.py prints SHIP_CHECK_OK <request_id> and exits 0.
 ```
+
+For auto-chain, the doctor's in-process view must also report
+`gate_available: true`, `completion_gate_ok: true`, and no
+`evidence_manifest_gap`. A green subset of the declared VERIFY manifest is not
+complete enough to seed a continuation session.
 
 When the gate prints `SHIP_CHECK_FAIL`, treat the request as not done:
 
@@ -313,6 +327,16 @@ Rules:
 - `timestamp` is UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`); `iteration` is the request's current fix iteration; `lane` is the lane that made the transition; `note` is a short reason or evidence pointer.
 - Append the row in the same step that updates `requests.md`, so the log and the queue never diverge.
 - Count FIX_REQUESTED <-> IMPLEMENTING transitions for the same `request_id` from this log when applying the Anti-Thrash rule.
+
+### Open the turn (single source of truth)
+
+This section is the ONE authoritative definition of the turn-start ritual.
+`SKILL.md` and `references/loop-state.md` point here by the leading token
+**"open the turn"** and do not restate the rule.
+
+**A lane's turn STARTS by re-reading `agent-lanes.md`, `requests.md`, `goal.md`
+(including `## Invariants`), `constraints.md`, and `loop-policy.md` before
+acting; anything added since your last turn is binding.**
 
 ### Close the turn (the in-turn report-back ritual - single source of truth)
 
@@ -647,11 +671,11 @@ parent_request_id:
 iteration: 1
 from_lane: review
 to_lane: product
-status: ACCEPTED
+status: REVIEWING
 created_at: 2026-06-23T11:30:00Z
 source_docs:
 - docs/loop/tracker.md
-review_result: pass
+verdict: PASS
 criteria_results:
 - Criterion 1: pass, verified by tests/recommend.test.ts
 - Criterion 2: pass, verified by manual code review
@@ -662,10 +686,15 @@ evidence:
 remaining_risks:
 - None known. (any should-fix/nit findings accepted-with-notes go here)
 expected_reply:
-- Product marks the tracker checkpoint complete or sends ACCEPTANCE_DECISION.
+- Product performs the ACCEPTED transition when all gates allow, or records the
+  next action; user-facing requests first hold for the Human-QA Gate.
 ```
 
-`REVIEW_DONE` records the three-category review result: the per-criterion
+`REVIEW_DONE` returns review's pass/fail `verdict`; it keeps the request at
+`REVIEWING` and never performs the `ACCEPTED` transition. Product performs that
+transition after evaluating the verdict and machine evidence, and, for a
+user-facing request, only after the Human-QA Gate. It also records the
+three-category review result: the per-criterion
 `criteria_results`, a `scope_creep` line (changed files vs the request's `scope`
 globs - flag creep even if it works), and a mandatory `ease_of_misuse` line
 answering *"can a caller/input reach a wrong-but-accepted outcome the criteria

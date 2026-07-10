@@ -13,9 +13,8 @@ It also enforces the hardened loop engineering invariants:
 - FIX_REQUESTED<->IMPLEMENTING iterations per request are counted and warned
   when they exceed ``max_fix_cycles`` from ``loop-policy.md`` (anti-thrash);
 - ``loop-run-log.md`` and ``evidence/`` presence is checked;
-- ``evidence_recorded_ok`` is true only when every non-terminal request has a
-  non-empty evidence cell in ``requests.md`` (it proves a cell was filled in,
-  not that any command passed);
+- ``evidence_recorded_ok`` is true only when every non-terminal request has at
+  least one real ``evidence/*.json`` record; message pointers never count;
 - ``completion_gate_ok`` runs the real deterministic gate: it imports
   ``completion_gate`` in-process (never a subprocess), loads ``evidence/*.json``
   once, and evaluates every distinct ``request_id`` that appears in the RECORDS
@@ -24,9 +23,10 @@ It also enforces the hardened loop engineering invariants:
   ``request_id`` in ``gate_failed_requests``, whether or not the request is
   registered in ``requests.md`` and whether or not it is terminal: a terminal
   ACCEPTED request with failing evidence is exactly the lie this gate exists to
-  catch. Registered requests with zero records are left to ``missing_evidence``
-  only (never ``gate_failed``). It is true only when the gate is importable, no
-  recorded request failed, and no evidence file was malformed. If
+  catch. Registered requests at IMPLEMENTATION_DONE or later are evaluated even
+  with zero records, so the doctor agrees with the standalone gate's fail-closed
+  result. It is true only when the gate is importable, no required or recorded
+  request failed, and no evidence file was malformed. If
   ``completion_gate`` cannot be imported the doctor still runs, sets
   ``gate_available`` false, and emits a ``gate_unavailable`` warning;
 - decision-memory drift is checked against ``memory/decisions.jsonl`` using the
@@ -52,6 +52,10 @@ It also enforces the hardened loop engineering invariants:
   ``git status --porcelain``; that call is isolated, timed out, and fails
   silent-safe (any failure -> no warning). It is skipped entirely when git is
   absent.
+- G26 evidence-manifest coverage: every dispatched request must have an archived
+  IMPLEMENTATION_REQUEST with backticked VERIFY commands, and every declared
+  command must be covered by a real evidence record. Gaps are reported as
+  ``evidence_manifest_gap`` warnings.
 - G22 write-scope discipline, both WARNING-only (never touch handoff/auto-chain):
   ``write_scope_overlap`` (two lanes whose normalized write_scope globs overlap --
   one equals or prefix-contains another -- naming both lanes and the offending
@@ -111,6 +115,22 @@ REQUIRED_FILES = [
 ]
 LANE_FILES = ["inbox.md", "outbox.md", "current.md", "worklog.md"]
 TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "BLOCKED"}
+COMPLETION_GATE_REQUIRED_STATUSES = {
+    "IMPLEMENTATION_DONE",
+    "REVIEWING",
+    "FIX_REQUESTED",
+    "ACCEPTED",
+    "BLOCKED",
+}
+EVIDENCE_MANIFEST_REQUIRED_STATUSES = {
+    "REQUESTED",
+    "IMPLEMENTING",
+    "IMPLEMENTATION_DONE",
+    "REVIEWING",
+    "FIX_REQUESTED",
+    "ACCEPTED",
+    "BLOCKED",
+}
 UNVERIFIED_THREAD_VALUES = {"", "UNVERIFIED", "TBD", "NONE", "NULL", "-"}
 EMPTY_CELL_VALUES = {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}
 # Statuses involved in the FIX_REQUESTED<->IMPLEMENTING thrash cycle.
@@ -124,6 +144,7 @@ AUTO_CHAIN_RE = re.compile(r"(?i)\bauto_chain_next_session\s*:\s*true\b")
 STALE_RE = re.compile(r"(?i)\b(stale|pending re-creation|unreadable|unopenable|not visible|not found)\b")
 MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*max_fix_cycles\s*:\s*(\d+)\b")
 BUDGET_EXHAUSTED_RE = re.compile(r"(?im)^\s*budget_exhausted\s*:\s*true\b")
+VERIFY_COMMAND_RE = re.compile(r"(?i)\bVERIFY\s+`(?P<command>[^`\r\n]+)`")
 
 # G7 evidence-lineage naming contract (references/protocol.md "Evidence
 # Records"). An evidence filename is either:
@@ -361,6 +382,193 @@ def read_max_fix_cycles(policy_text: str) -> int:
         return int(match.group(1))
     except ValueError:
         return DEFAULT_MAX_FIX_CYCLES
+
+
+def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
+    """Return WARNING-only diagnostics for malformed run-log data rows."""
+    path = loop_dir / "loop-run-log.md"
+    if not path.exists():
+        return []
+    text = read_text(path)
+    if not text.strip():
+        return []
+    headers: Optional[list[str]] = None
+    header_line = 0
+    delimiter_seen = False
+    warnings: list[dict[str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = split_md_row(line)
+        if not cells:
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            if headers is not None:
+                delimiter_seen = True
+            continue
+        if headers is None:
+            headers = [cell.strip() for cell in cells]
+            header_line = lineno
+            continue
+        padded = cells + [""] * max(0, len(headers) - len(cells))
+        row = dict(zip(headers, padded[: len(headers)]))
+        request_id = (
+            row.get("request_id", "") or row.get("request", "") or row.get("req", "")
+        ).strip()
+        suffix = " (request {0})".format(request_id) if request_id else ""
+        raw_time = (
+            row.get("timestamp", "")
+            or row.get("at", "")
+            or row.get("delivered_at", "")
+            or row.get("time", "")
+        ).strip()
+        if not raw_time or parse_timestamp(raw_time) is None:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}{1}: timestamp is blank or invalid; "
+                    "ordering keeps the existing epoch fallback".format(lineno, suffix),
+                }
+            )
+        if not request_id:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}: request_id is blank; the row remains "
+                    "ignored by request reconstruction".format(lineno),
+                }
+            )
+        to_status = (
+            row.get("to_status", "")
+            or row.get("status", "")
+            or row.get("new_status", "")
+        ).strip()
+        if not to_status:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}{1}: to_status is blank; the row remains "
+                    "ignored for transition counting".format(lineno, suffix),
+                }
+            )
+        if len(cells) != len(headers):
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}{1}: row has {2} cells; expected {3}".format(
+                        lineno, suffix, len(cells), len(headers)
+                    ),
+                }
+            )
+    if headers is None:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "malformed_run_log",
+                "message": "loop-run-log.md line 1: no Markdown table found; reconstruction keeps "
+                "the existing empty fallback",
+            }
+        )
+    else:
+        if not delimiter_seen:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}: table header has no delimiter row; "
+                    "existing row parsing is unchanged".format(header_line),
+                }
+            )
+        required_groups = (
+            ("timestamp", ("timestamp", "at", "delivered_at", "time")),
+            ("request_id", ("request_id", "request", "req")),
+            ("to_status", ("to_status", "status", "new_status")),
+        )
+        missing = [
+            label for label, aliases in required_groups
+            if not any(alias in headers for alias in aliases)
+        ]
+        if missing:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_run_log",
+                    "message": "loop-run-log.md line {0}: table is missing required column(s): "
+                    "{1}".format(header_line, ", ".join(missing)),
+                }
+            )
+    return warnings
+
+
+_POLICY_KEY_RE = re.compile(r"^\s*(?:[-*]\s*)?max_fix_cycles\s*:", re.IGNORECASE)
+_POLICY_STRICT_RE = re.compile(
+    r"^\s*max_fix_cycles\s*:\s*(\d+)\s*$", re.IGNORECASE
+)
+
+
+def diagnose_policy(policy_text: str, source_present: bool) -> list[dict[str, str]]:
+    """Warn on malformed max_fix_cycles while preserving the existing reader."""
+    if not source_present:
+        return []
+    for lineno, line in enumerate(policy_text.splitlines(), start=1):
+        if not _POLICY_KEY_RE.match(line):
+            continue
+        match = _POLICY_STRICT_RE.match(line)
+        if match is None:
+            return [
+                {
+                    "severity": "warning",
+                    "code": "malformed_policy",
+                    "message": "loop-policy.md line {0}: max_fix_cycles is not an integer; "
+                    "using the existing fallback {1}".format(lineno, DEFAULT_MAX_FIX_CYCLES),
+                }
+            ]
+        value = int(match.group(1))
+        if value < 1 or value > 10:
+            return [
+                {
+                    "severity": "warning",
+                    "code": "malformed_policy",
+                    "message": "loop-policy.md line {0}: max_fix_cycles {1} is outside 1..10; "
+                    "reader behavior is unchanged".format(lineno, value),
+                }
+            ]
+        return []
+    return [
+        {
+            "severity": "warning",
+            "code": "malformed_policy",
+            "message": "loop-policy.md line 1: max_fix_cycles is missing; using the existing "
+            "fallback {0}".format(DEFAULT_MAX_FIX_CYCLES),
+        }
+    ]
+
+
+def table_key_line_numbers(path: Path, key: str) -> dict[str, int]:
+    """Map a Markdown table key cell to its source line for diagnostics."""
+    if not path.exists():
+        return {}
+    headers: Optional[list[str]] = None
+    result: dict[str, int] = {}
+    for lineno, line in enumerate(read_text(path).splitlines(), start=1):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = split_md_row(line)
+        if not cells or all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+        if headers is None:
+            headers = cells
+            continue
+        padded = cells + [""] * max(0, len(headers) - len(cells))
+        row = dict(zip(headers, padded[: len(headers)]))
+        value = (row.get(key, "") or "").strip()
+        if value and value not in result:
+            result[value] = lineno
+    return result
 
 
 def count_fix_cycles_from_log(loop_dir: Path) -> dict[str, int]:
@@ -1247,6 +1455,88 @@ def _has_archived_review_done(loop_dir: Path, request_id: str) -> bool:
     return False
 
 
+def normalize_verify_command(command: str) -> str:
+    """Normalize harmless whitespace while preserving command semantics."""
+    return " ".join((command or "").strip().split())
+
+
+def check_evidence_manifest_coverage(
+    loop_dir: Path,
+    requests: list[dict[str, Any]],
+    evidence_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare archived VERIFY manifests with recorded evidence commands.
+
+    Once a request is dispatched, missing archives, archives with no backticked
+    VERIFY commands, and declared commands with no matching evidence record are
+    all explicit gaps. The caller exposes them as warnings; the completion gate
+    remains independently strict.
+    """
+    records_by_request: dict[str, list[dict[str, Any]]] = {}
+    for record in evidence_records:
+        request_id = str(record.get("request_id", "")).strip()
+        if request_id:
+            records_by_request.setdefault(request_id, []).append(record)
+
+    gaps: list[dict[str, Any]] = []
+    for request in requests:
+        status = status_key(str(request.get("status", "")))
+        if status not in EVIDENCE_MANIFEST_REQUIRED_STATUSES:
+            continue
+        request_id = str(request.get("request_id", "")).strip()
+        if not request_id:
+            continue
+
+        message_dir = loop_dir / "messages" / request_id
+        manifest_paths = (
+            sorted(path for path in message_dir.glob("IMPLEMENTATION_REQUEST*.md") if path.is_file())
+            if message_dir.is_dir()
+            else []
+        )
+        manifest_files = [
+            str(path.relative_to(loop_dir)).replace("\\", "/") for path in manifest_paths
+        ]
+        expected_commands = sorted(
+            {
+                normalize_verify_command(match.group("command"))
+                for path in manifest_paths
+                for match in VERIFY_COMMAND_RE.finditer(read_text(path))
+                if normalize_verify_command(match.group("command"))
+            }
+        )
+        request_records = records_by_request.get(request_id, [])
+        evidence_commands = {
+            normalize_verify_command(str(record.get("command", "")))
+            for record in request_records
+            if normalize_verify_command(str(record.get("command", "")))
+        }
+        missing_commands = [
+            command for command in expected_commands if command not in evidence_commands
+        ]
+
+        reason = ""
+        if not manifest_paths:
+            reason = "missing_manifest"
+        elif not expected_commands:
+            reason = "empty_manifest"
+        elif missing_commands:
+            reason = "missing_coverage"
+        if not reason:
+            continue
+        gaps.append(
+            {
+                "request_id": request_id,
+                "status": status,
+                "reason": reason,
+                "manifest_files": manifest_files,
+                "expected_count": len(expected_commands),
+                "evidence_count": len(request_records),
+                "missing_commands": missing_commands,
+            }
+        )
+    return gaps
+
+
 def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime] = None) -> dict[str, Any]:
     if now is None:
         now = datetime.now(timezone.utc)
@@ -1272,6 +1562,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     blocked = [item for item in checkboxes if item["status"] == "!"]
 
     max_fix_cycles = read_max_fix_cycles(policy_text)
+    control_plane_warnings = diagnose_run_log(loop_dir)
+    control_plane_warnings.extend(
+        diagnose_policy(policy_text, (loop_dir / "loop-policy.md").exists())
+    )
 
     lanes = parse_table(loop_dir / "agent-lanes.md")
     lane_names = [row.get("lane", "") for row in lanes if row.get("lane")]
@@ -1341,12 +1635,27 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
 
     log_fix_counts = count_fix_cycles_from_log(loop_dir)
 
+    evidence_dir = loop_dir / "evidence"
+    evidence_dir_present = evidence_dir.exists() and evidence_dir.is_dir()
+    gate_available = GATE_AVAILABLE
+    gate_records: list[dict[str, Any]] = []
+    gate_load_errors: list[dict[str, str]] = []
+    if gate_available:
+        gate_records, gate_load_errors = completion_gate.load_evidence(evidence_dir)
+    evidence_request_ids = {
+        str(record.get("request_id", "")).strip()
+        for record in gate_records
+        if str(record.get("request_id", "")).strip()
+    }
+
     requests = parse_table(loop_dir / "requests.md")
+    request_line_numbers = table_key_line_numbers(loop_dir / "requests.md", "request_id")
     request_summaries: list[dict[str, Any]] = []
     owner_issues: list[str] = []
     non_terminal_requests: list[dict[str, Any]] = []
     thrash_requests: list[dict[str, Any]] = []
     missing_evidence_requests: list[str] = []
+    malformed_iteration_warnings: list[dict[str, str]] = []
     # G13: request_id -> recommended_answer for BLOCKED requests (the raising
     # lane's proposed resolution). BLOCKED is terminal, so this map -- not
     # non_terminal_requests -- is how the dashboard reaches a blocked request's
@@ -1363,14 +1672,37 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             iteration_num = int(iteration_raw)
         except ValueError:
             iteration_num = 0
+            malformed_iteration_warnings.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_iteration",
+                    "message": "requests.md line {line}: request {request_id} has malformed "
+                    "iteration {raw!r}; using the existing zero fallback".format(
+                        line=request_line_numbers.get(request_id, "?"),
+                        request_id=request_id,
+                        raw=iteration_raw,
+                    ),
+                }
+            )
+        else:
+            if iteration_num < 0:
+                malformed_iteration_warnings.append(
+                    {
+                        "severity": "warning",
+                        "code": "malformed_iteration",
+                        "message": "requests.md line {line}: request {request_id} has negative "
+                        "iteration {raw!r}; reader behavior is unchanged".format(
+                            line=request_line_numbers.get(request_id, "?"),
+                            request_id=request_id,
+                            raw=iteration_raw,
+                        ),
+                    }
+                )
         # Prefer the durable transition log; fall back to the iteration column.
         fix_cycles = log_fix_counts.get(request_id, iteration_num)
-        evidence_cell = (
-            row.get("evidence", "")
-            or row.get("evidence_path", "")
-            or row.get("last_message", "")
-        )
-        has_evidence = not is_empty_cell(evidence_cell)
+        # C4: only a real flat JSON record counts as evidence. ``last_message``
+        # is a message pointer and can never make an unverified request green.
+        has_evidence = request_id in evidence_request_ids
         # G13: a BLOCKED request carries the raising lane's recommended_answer
         # (from its archived BLOCKED envelope) so the dashboard can render the
         # proposed resolution inline on the your-turn item. Read only for BLOCKED
@@ -1427,9 +1759,6 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     budget_exhausted = bool(BUDGET_EXHAUSTED_RE.search(budget_text))
 
     run_log_present = (loop_dir / "loop-run-log.md").exists()
-    evidence_dir = loop_dir / "evidence"
-    evidence_dir_present = evidence_dir.exists() and evidence_dir.is_dir()
-
     # git health (F4): is the loop under version control, and is the write-scope
     # pre-commit guard armed? Both are advisory health fields, never gates. A
     # missing repo means write_scope/leases degrade to the honor system, so it
@@ -1500,38 +1829,36 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 }
             )
 
-    # evidence_recorded_ok: every non-terminal request has a non-empty evidence
-    # cell in requests.md. This only proves the cell was filled in; it does NOT
-    # prove any verification command exited 0. Vacuously true with no
-    # non-terminal requests.
+    # evidence_recorded_ok: every non-terminal request has at least one actual
+    # flat JSON evidence record. Vacuously true for a fresh loop with no
+    # requests. A message path in requests.md never counts.
     evidence_recorded_ok = not missing_evidence_requests
+
+    # B1: archived IMPLEMENTATION_REQUEST files are the expected VERIFY-command
+    # manifest. Compare their command set with real JSON evidence records. This
+    # is a warning-level cross-check; B3 separately blocks auto-chain on gaps.
+    evidence_manifest_gaps = check_evidence_manifest_coverage(
+        loop_dir, request_summaries, gate_records
+    )
 
     # completion_gate_ok: run the real deterministic gate in-process. Load the
     # recorded evidence/*.json records once, then evaluate every distinct
-    # request_id that actually appears in the RECORDS -- NOT only the
-    # non-terminal rows of requests.md. This makes the doctor agree with the
-    # gate on failing evidence regardless of registration: a failing record for
-    # a request that is unregistered, or already terminal (ACCEPTED/BLOCKED),
-    # still flips completion_gate_ok. A terminal ACCEPTED request with failing
-    # evidence is exactly the lie this gate exists to catch. Requests with zero
-    # records produce no record here, so registered-but-empty requests are left
-    # to the missing_evidence warning above (no gate_failed, no double-report).
+    # request_id that appears in the records, plus every registered request at
+    # IMPLEMENTATION_DONE or later. This makes the doctor agree with the gate on
+    # failing evidence regardless of registration and on required requests with
+    # zero records. A fresh loop has neither set and remains healthy.
     # The gate is unavailable -> completion_gate_ok is false and a
     # gate_unavailable warning is emitted, but the doctor never crashes.
-    gate_available = GATE_AVAILABLE
     gate_failed_requests: list[str] = []
-    gate_load_errors: list[dict[str, str]] = []
     gate_passing_requests: set[str] = set()
     if gate_available:
-        gate_records, gate_load_errors = completion_gate.load_evidence(evidence_dir)
-        recorded_ids = sorted(
-            {
-                str(rec.get("request_id", "")).strip()
-                for rec in gate_records
-                if str(rec.get("request_id", "")).strip()
-            }
-        )
-        for request_id in recorded_ids:
+        required_ids = {
+            request["request_id"]
+            for request in request_summaries
+            if request["status"] in COMPLETION_GATE_REQUIRED_STATUSES
+        }
+        evaluated_ids = sorted(evidence_request_ids | required_ids)
+        for request_id in evaluated_ids:
             # Evaluate against the records only (pass no load_errors here): a
             # request lands in gate_failed_requests when its OWN records did not
             # all exit 0. Malformed files are fail-closed on their own via the
@@ -1683,6 +2010,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
 
     issues: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
+    warnings.extend(control_plane_warnings)
+    warnings.extend(malformed_iteration_warnings)
 
     for path in missing_files:
         issues.append({"severity": "error", "code": "missing_file", "message": path})
@@ -1831,6 +2160,24 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 "severity": "warning",
                 "code": "missing_evidence",
                 "message": f"{request_id} has no recorded evidence",
+            }
+        )
+    for gap in evidence_manifest_gaps:
+        if gap["reason"] == "missing_manifest":
+            detail = "has no archived IMPLEMENTATION_REQUEST VERIFY manifest"
+        elif gap["reason"] == "empty_manifest":
+            detail = "has an archived IMPLEMENTATION_REQUEST but declares no backticked VERIFY commands"
+        else:
+            detail = "is missing evidence coverage for: {0}".format(
+                "; ".join(gap["missing_commands"])
+            )
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "evidence_manifest_gap",
+                "message": "request {0} {1} (expected {2} command(s), found {3} evidence record(s))".format(
+                    gap["request_id"], detail, gap["expected_count"], gap["evidence_count"]
+                ),
             }
         )
     # G7 (a) orphan_evidence: an evidence file naming a request_id with no row in
@@ -1982,6 +2329,9 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         and not stale_markers
         and not budget_exhausted
         and not thrash_requests
+        and gate_available
+        and completion_gate_ok
+        and not evidence_manifest_gaps
     )
 
     readiness_reasons: list[str] = []
@@ -2003,6 +2353,12 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         readiness_reasons.append("budget is exhausted")
     if thrash_requests:
         readiness_reasons.append("a request exceeded max_fix_cycles")
+    if not gate_available:
+        readiness_reasons.append("completion gate is unavailable")
+    if not completion_gate_ok:
+        readiness_reasons.append("completion gate did not pass")
+    if evidence_manifest_gaps:
+        readiness_reasons.append("evidence manifest is incomplete")
 
     return {
         "loop_dir": str(loop_dir),
@@ -2049,6 +2405,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "handoff_sensitive_content": handoff_sensitive,
         "tier_mismatches": tier_mismatches,
         "evidence_recorded_ok": evidence_recorded_ok,
+        "evidence_manifest_gaps": evidence_manifest_gaps,
         "gate_available": gate_available,
         "completion_gate_ok": completion_gate_ok,
         "gate_failed_requests": gate_failed_requests,

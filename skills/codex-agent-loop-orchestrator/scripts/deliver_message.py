@@ -218,8 +218,8 @@ def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
 
     A sender that delivers a message is demonstrably alive, so delivery is a
     natural heartbeat. Returns the list of files it rewrote (for reporting).
-    Best-effort and defensive: any per-file failure is swallowed so a heartbeat
-    write never blocks the actual delivery.
+    Best-effort and defensive: any per-file failure emits a stderr warning but
+    never blocks the actual delivery.
     """
     if not lane:
         return []
@@ -234,6 +234,15 @@ def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
         touched.append(posix_path(str(current)))
 
     return touched
+
+
+def _warn_heartbeat_failure(path: Path, exc: BaseException) -> None:
+    """Make a best-effort heartbeat degradation visible without changing delivery."""
+    sys.stderr.write(
+        "warning: heartbeat stamp failed for {0}: {1}: {2}\n".format(
+            posix_path(str(path)), type(exc).__name__, exc
+        )
+    )
 
 
 def _rewrite_atomic(path: Path, text: str) -> None:
@@ -265,7 +274,8 @@ def _update_registry_heartbeat(registry: Path, lane: str, when: str) -> bool:
         return False
     try:
         original = registry.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError) as exc:
+        _warn_heartbeat_failure(registry, exc)
         return False
 
     lines = original.splitlines(keepends=True)
@@ -312,7 +322,8 @@ def _update_registry_heartbeat(registry: Path, lane: str, when: str) -> bool:
         return False
     try:
         _rewrite_atomic(registry, "".join(out))
-    except OSError:
+    except OSError as exc:
+        _warn_heartbeat_failure(registry, exc)
         return False
     return True
 
@@ -327,7 +338,8 @@ def _update_current_heartbeat(current: Path, when: str) -> bool:
         return False
     try:
         original = current.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError) as exc:
+        _warn_heartbeat_failure(current, exc)
         return False
 
     changed = False
@@ -353,7 +365,8 @@ def _update_current_heartbeat(current: Path, when: str) -> bool:
         return False
     try:
         _rewrite_atomic(current, "".join(out_lines))
-    except OSError:
+    except OSError as exc:
+        _warn_heartbeat_failure(current, exc)
         return False
     return True
 

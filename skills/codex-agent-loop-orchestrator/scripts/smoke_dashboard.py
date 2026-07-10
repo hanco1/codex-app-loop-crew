@@ -428,6 +428,27 @@ def _check_guard_auth_detector() -> None:
         _fail("codex_guard.is_auth_failure should NOT match a plain TypeError")
 
 
+def _extract_i18n_rows(html_full: str) -> list:
+    blobs = re.findall(
+        r'<script type="application/json"[^>]*data-i18n-dict[^>]*>(.*?)</script>',
+        html_full,
+        re.S,
+    )
+    if not blobs:
+        _fail("served HTML has no data-i18n-dict JSON blocks")
+    rows = []
+    for blob in blobs:
+        try:
+            data = json.loads(blob.strip())
+        except ValueError as exc:
+            _fail("an embedded i18n dictionary is not valid JSON: {0}".format(exc))
+        part = data.get("strings")
+        if not isinstance(part, list):
+            _fail("an embedded i18n dictionary has no 'strings' array")
+        rows.extend(part)
+    return rows
+
+
 def _check_i18n_integrity(html_full: str) -> None:
     """Parse the embedded STRINGS blob from the served HTML and validate it.
 
@@ -435,19 +456,15 @@ def _check_i18n_integrity(html_full: str) -> None:
     ``zh``; and the served page includes the EN / zh language toggle control.
     """
     m = re.search(
-        r'<script type="application/json" id="i18n-strings">(.*?)</script>',
+        r'<script type="application/json" id="i18n-strings"[^>]*>(.*?)</script>',
         html_full,
         re.S,
     )
     if not m:
         _fail("served HTML has no embedded i18n-strings blob")
-    try:
-        data = json.loads(m.group(1).strip())
-    except ValueError as exc:
-        _fail("embedded i18n-strings blob is not valid JSON: {0}".format(exc))
-    rows = data.get("strings")
+    rows = _extract_i18n_rows(html_full)
     if not isinstance(rows, list) or not rows:
-        _fail("i18n-strings blob has no non-empty 'strings' array")
+        _fail("i18n dictionaries have no non-empty 'strings' array")
     seen_keys = set()
     for row in rows:
         key = row.get("key")
@@ -1851,6 +1868,239 @@ def _check_probe_standalone_json(fake_home: Path) -> None:
             _fail("AUTH TOKEN LEAK in probe stdout: {0}".format(token_name))
 
 
+def _check_g26_chunk3_markup(html_full: str, rows: list) -> None:
+    """G26 chunk 3: degraded dashboard states stay visible and localized."""
+    by_key = {row.get("key"): row for row in rows}
+    required = (
+        "pulse_data_stale",
+        "conn_banner_stale",
+        "data_read_error",
+        "data_parse_error",
+        "requests_data_unavailable",
+        "progress_data_unavailable",
+        "badge_doctor_note_unavailable",
+        "badge_completion_gate_note_not_passed",
+        "doctor_note_gate_malformed_evidence",
+        "bootstrap_module_unavailable",
+        "usage_probe_module_unavailable",
+        "usage_summary_module_unavailable",
+        "usage_refresh_still_cached",
+        "usage_refresh_failed_stale",
+    )
+    for key in required:
+        row = by_key.get(key)
+        if row is None:
+            _fail("G26 chunk 3: i18n dictionary is missing {0!r}".format(key))
+        if not (row.get("en") or "").strip() or not (row.get("zh") or "").strip():
+            _fail("G26 chunk 3: {0!r} must have non-empty EN and ZH".format(key))
+
+    for element_id in (
+        "data-diagnostics",
+        "add-lane-status",
+        "usage-refresh-note",
+        "progress-diagnostic",
+    ):
+        if 'id="{0}"'.format(element_id) not in html_full:
+            _fail("G26 chunk 3: served HTML is missing #{0}".format(element_id))
+    if 'id="data-diagnostics"' not in html_full or 'role="alert"' not in html_full:
+        _fail("G26 chunk 3: file diagnostics need a visible alert region")
+    if 'id="usage-refresh-note"' not in html_full or 'aria-live="polite"' not in html_full:
+        _fail("G26 chunk 3: refresh degradation needs an aria-live status")
+
+    # A failed poll keeps the last render, so the pulse/banner must explicitly
+    # name that snapshot as stale rather than merely changing color.
+    if 'pulseStateKey = "pulse_data_stale"' not in html_full:
+        _fail("G26 C14-refresh: failed polling must set the visible stale-data pulse")
+    conn = by_key.get("conn_banner_stale") or {}
+    if "last successful" not in (conn.get("en") or "").lower():
+        _fail("G26 C14-refresh: conn_banner must explain that the last successful snapshot remains")
+
+    # The refresh path has two distinct honest failures: the request itself can
+    # fail, or the backend can respond while admitting its cache was not dropped.
+    refresh_start = html_full.find("function refreshUsage(")
+    refresh_body = html_full[refresh_start:refresh_start + 2200] if refresh_start >= 0 else ""
+    for needle in (
+        "cache_drop_failed",
+        "refresh_degraded",
+        't("usage_refresh_still_cached")',
+        't("usage_refresh_failed_stale")',
+    ):
+        if needle not in refresh_body:
+            _fail("G26 C19/C14-refresh: refreshUsage is missing {0!r}".format(needle))
+
+    # Doctor unavailable is itself a health problem: show the sanitized reason
+    # and force the fold open. A malformed evidence warning must not be skipped.
+    rb_start = html_full.find("function renderBadges(")
+    rb_end = html_full.find("// ---- doctor notices", rb_start)
+    rb_body = html_full[rb_start:rb_end if rb_end >= 0 else rb_start + 4000]
+    if "doc.reason" not in rb_body:
+        _fail("G26 C11: renderBadges must surface doc.reason")
+    if "doc.available === false" not in rb_body or "healthForcedOpen" not in rb_body:
+        _fail("G26 C11: checker-unavailable must force Health open")
+    if "doc.completion_gate_ok === true" not in rb_body:
+        _fail("G26 C13: the completion note must branch on the gate boolean, not failed-count only")
+
+    skip_start = html_full.find("var DOCTOR_NOTE_SKIP")
+    skip_end = html_full.find("};", skip_start)
+    skip_body = html_full[skip_start:skip_end] if skip_start >= 0 and skip_end >= 0 else ""
+    if "gate_malformed_evidence" in skip_body:
+        _fail("G26 C13: gate_malformed_evidence must not remain in DOCTOR_NOTE_SKIP")
+    mapping_start = html_full.find("var DOCTOR_NOTE_KEYS")
+    mapping_end = html_full.find("};", mapping_start)
+    mapping = html_full[mapping_start:mapping_end] if mapping_start >= 0 and mapping_end >= 0 else ""
+    if 'gate_malformed_evidence: "doctor_note_gate_malformed_evidence"' not in mapping:
+        _fail("G26 C13: malformed evidence needs a humanized doctor notice")
+
+    for hook in ("renderDataDiagnostics", "renderCapabilities"):
+        if hook not in html_full:
+            _fail("G26 C12/C18: dashboard is missing {0}".format(hook))
+
+
+def _check_g26_chunk3_state(tmp_path: Path) -> None:
+    """G26 chunk 3: API diagnostics distinguish fallback causes with real data."""
+    loop = tmp_path / "g26_chunk3_state"
+    _bootstrap(loop)
+
+    clean = loop_dashboard.build_state(loop)
+    for key in (
+        "read_errors",
+        "parse_errors",
+        "file_status",
+        "capabilities",
+        "refresh_degraded",
+        "cache_drop_failed",
+    ):
+        if key not in clean:
+            _fail("G26 chunk 3: build_state is missing {0!r}".format(key))
+    if clean["read_errors"] or clean["parse_errors"]:
+        _fail("G26 C12 negative: a clean bootstrapped loop must not report file diagnostics")
+    if clean["refresh_degraded"] is not False or clean["cache_drop_failed"] is not False:
+        _fail("G26 C19 negative: a normal poll must not report refresh degradation")
+
+    # A valid empty table is different from a malformed table and must stay quiet.
+    requests_path = loop / "requests.md"
+    tracker_path = loop / "tracker.md"
+    requests_original = requests_path.read_bytes()
+    tracker_original = tracker_path.read_bytes()
+    requests_path.write_text(
+        "# Requests\n\n"
+        "| request_id | status | owner_lane | iteration |\n"
+        "| --- | --- | --- | --- |\n",
+        encoding="utf-8",
+    )
+    valid_empty = loop_dashboard.build_state(loop)
+    if any("requests.md" in str(item.get("source", "")) for item in valid_empty["parse_errors"]):
+        _fail("G26 C12 negative: a valid empty requests table must not be called malformed")
+
+    # Non-table core inputs retain their old empty fallback, but now expose the
+    # source/reason so the page cannot present that fallback as legitimate data.
+    requests_path.write_text("# Requests\n\nthis is not a table\n", encoding="utf-8")
+    tracker_path.write_text("# Tracker\n\n## Broken\n\nnot a checkpoint\n", encoding="utf-8")
+    malformed = loop_dashboard.build_state(loop)
+    malformed_sources = {str(item.get("source", "")) for item in malformed["parse_errors"]}
+    if not any(source.endswith("requests.md") for source in malformed_sources):
+        _fail("G26 C12: malformed requests.md must appear in parse_errors")
+    if not any(source.endswith("tracker.md") for source in malformed_sources):
+        _fail("G26 C12: malformed tracker.md must appear in parse_errors")
+    if malformed.get("requests") != [] or (malformed.get("tracker_progress") or {}).get("available") is not False:
+        _fail("G26 C12: diagnostics must not change the existing empty fallback values")
+
+    # Invalid UTF-8 used to escape the OSError-only guard and crash /api/state.
+    requests_path.write_bytes(b"\xff\xfe\xfa")
+    unreadable = loop_dashboard.build_state(loop)
+    if not any(
+        str(item.get("source", "")).endswith("requests.md")
+        for item in unreadable["read_errors"]
+    ):
+        _fail("G26 C12: unreadable requests.md must appear in read_errors")
+    if (unreadable.get("file_status") or {}).get("requests.md") != "unreadable":
+        _fail("G26 C12: file_status must distinguish unreadable requests.md")
+    requests_path.unlink()
+    missing = loop_dashboard.build_state(loop)
+    if (missing.get("file_status") or {}).get("requests.md") != "missing":
+        _fail("G26 C12: file_status must distinguish missing requests.md")
+    requests_path.write_bytes(requests_original)
+    tracker_path.write_bytes(tracker_original)
+
+    # Doctor import and runtime failures keep a sanitized reason on the wire.
+    saved_doctor = (
+        loop_dashboard.DOCTOR_AVAILABLE,
+        loop_dashboard.doctor,
+        loop_dashboard.DOCTOR_IMPORT_ERROR,
+    )
+    try:
+        loop_dashboard.DOCTOR_AVAILABLE = False
+        loop_dashboard.doctor = None
+        loop_dashboard.DOCTOR_IMPORT_ERROR = "ImportError: smoke doctor unavailable"
+        snap = loop_dashboard._doctor_snapshot(loop)
+        if snap.get("available") is not False or "smoke doctor unavailable" not in snap.get("reason", ""):
+            _fail("G26 C11: doctor import failure reason must survive into doctor.reason")
+    finally:
+        (
+            loop_dashboard.DOCTOR_AVAILABLE,
+            loop_dashboard.doctor,
+            loop_dashboard.DOCTOR_IMPORT_ERROR,
+        ) = saved_doctor
+
+    # Bootstrap/probe module failures are explicit capabilities. The affected
+    # lane control and usage panel can then render a module-unavailable signal.
+    saved_bootstrap = (
+        loop_dashboard.BOOTSTRAP_AVAILABLE,
+        loop_dashboard.bootstrap_agent_loop,
+        loop_dashboard.BOOTSTRAP_IMPORT_ERROR,
+    )
+    saved_probe = (
+        loop_dashboard.PROBE_AVAILABLE,
+        loop_dashboard.codex_host_probe,
+        loop_dashboard.PROBE_IMPORT_ERROR,
+    )
+    try:
+        loop_dashboard.BOOTSTRAP_AVAILABLE = False
+        loop_dashboard.bootstrap_agent_loop = None
+        loop_dashboard.BOOTSTRAP_IMPORT_ERROR = "ImportError: smoke bootstrap unavailable"
+        loop_dashboard.PROBE_AVAILABLE = False
+        loop_dashboard.codex_host_probe = None
+        loop_dashboard.PROBE_IMPORT_ERROR = "ImportError: smoke probe unavailable"
+        degraded = loop_dashboard.build_state(loop)
+        caps = degraded.get("capabilities") or {}
+        if (caps.get("bootstrap") or {}).get("available") is not False:
+            _fail("G26 C18: bootstrap capability must report unavailable")
+        if "smoke bootstrap unavailable" not in (caps.get("bootstrap") or {}).get("reason", ""):
+            _fail("G26 C18: bootstrap capability must preserve its sanitized import reason")
+        if (caps.get("probe") or {}).get("available") is not False:
+            _fail("G26 C18: probe capability must report unavailable")
+        usage = degraded.get("usage") or {}
+        if usage.get("reason_code") != "probe_module_unavailable":
+            _fail("G26 C18: probe import failure needs the module-unavailable usage reason code")
+    finally:
+        (
+            loop_dashboard.BOOTSTRAP_AVAILABLE,
+            loop_dashboard.bootstrap_agent_loop,
+            loop_dashboard.BOOTSTRAP_IMPORT_ERROR,
+        ) = saved_bootstrap
+        (
+            loop_dashboard.PROBE_AVAILABLE,
+            loop_dashboard.codex_host_probe,
+            loop_dashboard.PROBE_IMPORT_ERROR,
+        ) = saved_probe
+
+    # A manual refresh whose cache drop fails remains serviceable, but the API
+    # must admit that the response may still be cached.
+    original_drop = loop_dashboard.codex_host_probe.drop_caches
+    try:
+        def _raise_cache_drop() -> None:
+            raise RuntimeError("smoke cache drop failed")
+
+        loop_dashboard.codex_host_probe.drop_caches = _raise_cache_drop
+        cached = loop_dashboard.build_state(loop, refresh=True)
+    finally:
+        loop_dashboard.codex_host_probe.drop_caches = original_drop
+    if cached.get("refresh_degraded") is not True or cached.get("cache_drop_failed") is not True:
+        _fail("G26 C19: cache-drop failure must set refresh_degraded/cache_drop_failed")
+    if "smoke cache drop failed" not in cached.get("refresh_reason", ""):
+        _fail("G26 C19: degraded refresh must carry a sanitized reason")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         loop_dir = Path(tmp) / "loop"
@@ -1883,6 +2133,10 @@ def main() -> int:
         # CODEX_HOME must emit valid JSON (usage + account) with the known fake
         # identity and no token material. Uses the same hermetic fake home.
         _check_probe_standalone_json(fake_home)
+
+        # (G26 chunk 3) Exercise real malformed/unreadable files, guarded module
+        # failures, and a cache-drop exception against build_state itself.
+        _check_g26_chunk3_state(Path(tmp))
 
         # Start the server on an ephemeral port in a background thread.
         server = loop_dashboard.make_server(loop_dir, 0)
@@ -1933,11 +2187,11 @@ def main() -> int:
             # heartbeat / usage staleness -- structural markup + wiring hooks.
             _check_batch2_markup(html_full)
             # (Batch 2 i18n) every new key has a non-empty en AND zh.
-            _b2_blob = re.search(
-                r'<script type="application/json" id="i18n-strings">(.*?)</script>',
-                html_full, re.S)
-            _b2_rows = json.loads(_b2_blob.group(1).strip()).get("strings", [])
+            _b2_rows = _extract_i18n_rows(html_full)
             _check_batch2_i18n(_b2_rows)
+            # (G26 chunk 3) Honest stale/degraded controls, checker reasons,
+            # malformed-evidence notice, and all new EN/ZH strings.
+            _check_g26_chunk3_markup(html_full, _b2_rows)
             # (F8) recommended-tier lane chip: markup, wiring, i18n, grep-proof.
             _check_f8_tier_markup(html_full, _b2_rows)
             # (G17) running banner attributes each "working on" line to the

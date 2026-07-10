@@ -303,6 +303,10 @@ Each `FIX_REQUEST` finding carries a `severity`: `blocker`, `should-fix`, or
 When review finds only `should-fix`/`nit` items (no blocker), it may send
 `REVIEW_DONE` with the notes attached rather than `FIX_REQUEST`.
 
+Every `REVIEW_DONE` carries review's pass/fail `verdict` and leaves the request
+at `REVIEWING`; product alone performs the `ACCEPTED` transition. A user-facing
+request first passes the Human-QA Gate below.
+
 ### Invariant check (a violation is always a blocker)
 
 Beyond the three categories above, every review checks the slice's CHANGED
@@ -335,7 +339,7 @@ The canonical case is run 2's `REQ-20260707-073729-data-eng`: its
 the plumbing without asserting a single field value, so it passed on garbage.
 Field-level assertions (row count > 0, valid ISO calendar dates, merchant
 non-empty and non-numeric, amount sign) are what make such a command go red -
-see G2 real-input correctness below.
+see `references/protocol.md` ("Real-input correctness").
 
 ## Human-QA Gate (user-facing slices)
 
@@ -372,6 +376,9 @@ Create a continuation session only when all are true:
 - The tracker has unchecked work.
 - The next checkpoint is specific and scoped.
 - The current checkpoint is verified or explicitly blocked with a safe next action.
+- The completion gate is available and the doctor's `completion_gate_ok` is true.
+- The archived IMPLEMENTATION_REQUEST VERIFY manifest has no
+  `evidence_manifest_gap`; every declared command has an evidence record.
 - State files and message ledgers are updated before session creation.
 - No blocker needs human input, credentials, external data, destructive action, or production deployment.
 - No active verified thread already owns the same `request_id + lane + checkpoint`.
@@ -459,13 +466,14 @@ If the ID cannot be found, title updates fail repeatedly, or the thread becomes 
 
 On resume, do not start by inventing a new plan. First read:
 
-1. `goal.md`
-2. `tracker.md`
-3. `constraints.md`
-4. `handoff.md`
-5. `agent-lanes.md`
-6. `requests.md`
-7. this lane's `current.md` and `inbox.md`
+1. **Open the turn** using the single-source rule in `references/protocol.md` ("Open the turn").
+2. `goal.md`
+3. `tracker.md`
+4. `constraints.md`
+5. `handoff.md`
+6. `agent-lanes.md`
+7. `requests.md`
+8. this lane's `current.md` and `inbox.md`
 
 Continue the oldest non-terminal request owned by this lane. If ownership is unclear, ask product or mark `BLOCKED`.
 
@@ -473,13 +481,24 @@ If the optional decision cache is in use, follow the Memory Protocol pinned in `
 
 ## Stop Conditions
 
-Stop instead of handing off or auto-chaining when:
+This is the single complete Stop Conditions list. Stop and report clearly
+instead of handing off or auto-chaining when:
 
 - `Done When` is satisfied;
 - tracker has no unchecked work;
-- verification cannot run and no safe fallback exists;
+- thread tools are unavailable and the durable fallback cannot be written;
 - target lane lacks verified thread ID and thread creation is not allowed;
-- required action needs credentials, approval, private external data, destructive changes, billing changes, or production deployment;
-- write scopes conflict;
+- the current checkpoint is not closed enough to hand off;
+- verification cannot run, or any checkpoint verify command exits non-zero
+  (mark the checkpoint `BLOCKED`, never accept with a caveat; emit
+  `SHIP_CHECK_OK` only after the gate reads exit 0 for every required record);
+- `budget_exhausted: true` is set in `loop-budget.md`;
+- a required action needs credentials, approval, private external data,
+  destructive changes, billing changes, or production deployment;
+- write scopes conflict or lanes would need to write the same files;
+- a lane is asked to change code with no backing request row (route it through
+  the Human Direct-Ask Ritual first);
+- the next action would violate `constraints.md`;
 - `max_fix_cycles` is reached;
-- the next request would be vague or unbounded.
+- the next request would be vague or unbounded;
+- auto-chain would create an unbounded or duplicate continuation.

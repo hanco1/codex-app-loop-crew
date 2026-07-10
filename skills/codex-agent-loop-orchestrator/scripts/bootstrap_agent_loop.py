@@ -14,6 +14,8 @@ idempotent across repeated runs.
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from pathlib import Path
 
 
@@ -56,7 +58,7 @@ LANE_PRESETS = {
     },
     "docs": {
         "role": "Maintain docs, changelogs, release notes, and user-facing copy.",
-        "write_scope": "docs/**; docs/loop/lanes/docs/**",
+        "write_scope": "docs/user/**; CHANGELOG.md; docs/loop/lanes/docs/**",
     },
     "release": {
         "role": "Coordinate release readiness, QA checklist, packaging, and blockers.",
@@ -522,6 +524,16 @@ REGISTRY_COLUMNS = ["lane", "thread_id", "role", "write_scope", "worklog", "stat
 # tier exactly -- it never silently deviates from it.
 HIGHEST_TIER = "highest"
 SECOND_HIGHEST_TIER = "second-highest"
+REGISTRY_QUARANTINE_PREFIX = "<!-- bootstrap-quarantined-registry-row: "
+REGISTRY_QUARANTINE_SUFFIX = " -->"
+
+
+class RegistryRows(dict[str, dict[str, str]]):
+    """Lane rows plus malformed raw rows that must survive normalization."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.malformed_rows: list[tuple[int, str]] = []
 
 
 def recommended_tier_for(lane: str) -> str:
@@ -566,6 +578,24 @@ def render_registry(rows: dict[str, dict[str, str]]) -> str:
                 heartbeat=row.get("heartbeat", "-") or "-",
                 tier=(row.get("tier") or "").strip() or recommended_tier_for(lane),
             )
+        )
+    malformed_rows = getattr(rows, "malformed_rows", [])
+    if malformed_rows:
+        lines.extend(
+            [
+                "",
+                "## Quarantined malformed registry rows",
+                "",
+                "Bootstrap preserved these rows verbatim because they had fewer than six cells.",
+                "Fix them manually; they are not active lane registrations while quarantined.",
+                "",
+            ]
+        )
+        lines.extend(
+            REGISTRY_QUARANTINE_PREFIX
+            + json.dumps(raw_line, ensure_ascii=True)
+            + REGISTRY_QUARANTINE_SUFFIX
+            for _line_number, raw_line in malformed_rows
         )
     return "\n".join(lines) + "\n"
 
@@ -682,7 +712,7 @@ def parse_presets(values: list[str]) -> dict[str, dict[str, str]]:
     return lanes
 
 
-def existing_rows(path: Path) -> dict[str, dict[str, str]]:
+def existing_rows(path: Path) -> RegistryRows:
     """Read existing registry rows.
 
     Backward compatible with the legacy 6-column table (no heartbeat column) and
@@ -693,18 +723,52 @@ def existing_rows(path: Path) -> dict[str, dict[str, str]]:
     human opt-DOWN survives every round-trip (template rerun, --set-thread
     adoption, dashboard add_lane).
     """
+    rows = RegistryRows()
     if not path.exists():
-        return {}
+        return rows
 
-    rows: dict[str, dict[str, str]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.startswith("|") or "---" in line:
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if line.startswith(REGISTRY_QUARANTINE_PREFIX) and line.endswith(
+            REGISTRY_QUARANTINE_SUFFIX
+        ):
+            payload = line[
+                len(REGISTRY_QUARANTINE_PREFIX) : -len(REGISTRY_QUARANTINE_SUFFIX)
+            ]
+            try:
+                raw_line = json.loads(payload)
+            except (TypeError, ValueError):
+                raw_line = line
+            if not isinstance(raw_line, str):
+                raw_line = line
+            rows.malformed_rows.append((line_number, raw_line))
+            sys.stderr.write(
+                "warning: preserving malformed registry row in {0} line {1} "
+                "(expected at least 6 cells): {2}\n".format(
+                    posix_path(str(path)), line_number, raw_line
+                )
+            )
+            continue
+        if not line.startswith("|"):
             continue
         cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) < 6:
+        if cells and all(set(cell) <= {"-", ":", " "} for cell in cells):
             continue
         # Skip the header row regardless of column count.
-        if cells[0] == "lane" and cells[1] in {"thread_id", "thread id"}:
+        if len(cells) >= 2 and cells[0] == "lane" and cells[1] in {
+            "thread_id",
+            "thread id",
+        }:
+            continue
+        if len(cells) < 6:
+            rows.malformed_rows.append((line_number, line))
+            sys.stderr.write(
+                "warning: preserving malformed registry row in {0} line {1} "
+                "(expected at least 6 cells): {2}\n".format(
+                    posix_path(str(path)), line_number, line
+                )
+            )
             continue
         lane = cells[0]
         if not lane:

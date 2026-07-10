@@ -103,34 +103,59 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+
+def _safe_exception(exc: BaseException, limit: int = 300) -> str:
+    """Return a one-line, length-bounded exception description for the UI."""
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    text = "{0}: {1}".format(exc.__class__.__name__, detail)
+    return text[:limit]
+
+
+def _warn_module_unavailable(name: str, reason: str) -> None:
+    """Make optional-module startup degradation visible to process operators."""
+    print(
+        "warning: dashboard module unavailable: {0}: {1}".format(name, reason),
+        file=sys.stderr,
+    )
+
+
+DOCTOR_IMPORT_ERROR = ""
 try:
     import multi_agent_loop_doctor as doctor  # type: ignore
 
     DOCTOR_AVAILABLE = True
-except Exception:  # pragma: no cover - defensive; doctor import should succeed
+except Exception as exc:  # pragma: no cover - defensive; doctor import should succeed
     doctor = None  # type: ignore
     DOCTOR_AVAILABLE = False
+    DOCTOR_IMPORT_ERROR = _safe_exception(exc)
+    _warn_module_unavailable("multi_agent_loop_doctor", DOCTOR_IMPORT_ERROR)
 
+BOOTSTRAP_IMPORT_ERROR = ""
 try:
     import bootstrap_agent_loop  # type: ignore
 
     BOOTSTRAP_AVAILABLE = True
-except Exception:  # pragma: no cover - defensive; bootstrap import should succeed
+except Exception as exc:  # pragma: no cover - defensive; bootstrap import should succeed
     bootstrap_agent_loop = None  # type: ignore
     BOOTSTRAP_AVAILABLE = False
+    BOOTSTRAP_IMPORT_ERROR = _safe_exception(exc)
+    _warn_module_unavailable("bootstrap_agent_loop", BOOTSTRAP_IMPORT_ERROR)
 
 # The Codex host probe (usage/account) is the ONLY module that touches the
 # Codex host's undocumented data surfaces (session JSONL rate-limits, auth.json
 # identity). It is an OPTIONAL dependency: if it is missing, the dashboard stays
 # a pure loop tool and serves usage/account as unavailable rather than crashing.
 # Guard the import exactly like the doctor/bootstrap ones above.
+PROBE_IMPORT_ERROR = ""
 try:
     import codex_host_probe  # type: ignore
 
     PROBE_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     codex_host_probe = None  # type: ignore
     PROBE_AVAILABLE = False
+    PROBE_IMPORT_ERROR = _safe_exception(exc)
+    _warn_module_unavailable("codex_host_probe", PROBE_IMPORT_ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -249,12 +274,82 @@ _LAST_SERVER_FOR_TEST: Optional["_ThreadingHTTPServer"] = None
 def _read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
+
+
+def _read_text_status(path: Path) -> tuple[str, str, str]:
+    """Read UTF-8 text and distinguish missing, empty, and unreadable files."""
+    if not path.exists():
+        return "", "missing", ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return "", "unreadable", _safe_exception(exc)
+    return text, ("empty" if not text.strip() else "ok"), ""
 
 
 def _split_md_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _parse_md_table_text(
+    text: str,
+    source: str,
+    required_headers: tuple[str, ...] = (),
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Parse a Markdown table while retaining structural parse diagnostics."""
+    headers: Optional[list[str]] = None
+    header_line = 0
+    delimiter_seen = False
+    rows: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = _split_md_row(line)
+        if not cells:
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            if headers is not None:
+                delimiter_seen = True
+            continue
+        if headers is None:
+            headers = [cell.strip() for cell in cells]
+            header_line = lineno
+            continue
+        if len(cells) != len(headers):
+            errors.append(
+                {
+                    "source": source,
+                    "reason": "line {0}: table row has {1} cells; expected {2}".format(
+                        lineno, len(cells), len(headers)
+                    ),
+                }
+            )
+        if len(cells) < len(headers):
+            cells = cells + [""] * (len(headers) - len(cells))
+        rows.append(dict(zip(headers, cells[: len(headers)])))
+
+    if headers is None:
+        errors.append({"source": source, "reason": "no Markdown table found"})
+        return rows, errors
+    if not delimiter_seen:
+        errors.append(
+            {
+                "source": source,
+                "reason": "line {0}: table header has no delimiter row".format(header_line),
+            }
+        )
+    missing = [name for name in required_headers if name not in headers]
+    if missing:
+        errors.append(
+            {
+                "source": source,
+                "reason": "table is missing required column(s): {0}".format(", ".join(missing)),
+            }
+        )
+    return rows, errors
 
 
 def _parse_md_table(path: Path) -> list[dict[str, str]]:
@@ -267,22 +362,7 @@ def _parse_md_table(path: Path) -> list[dict[str, str]]:
     text = _read_text(path)
     if not text:
         return []
-    headers: Optional[list[str]] = None
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        if not line.lstrip().startswith("|"):
-            continue
-        cells = _split_md_row(line)
-        if not cells:
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        if headers is None:
-            headers = [cell.strip() for cell in cells]
-            continue
-        if len(cells) < len(headers):
-            cells = cells + [""] * (len(headers) - len(cells))
-        rows.append(dict(zip(headers, cells[: len(headers)])))
+    rows, _errors = _parse_md_table_text(text, str(path).replace("\\", "/"))
     return rows
 
 
@@ -557,7 +637,7 @@ def _first_request_id(text: str) -> str:
     return m.group(0) if m else ""
 
 
-def parse_tracker_progress(loop_dir: Path) -> dict[str, Any]:
+def parse_tracker_progress(loop_dir: Path, text: Optional[str] = None) -> dict[str, Any]:
     """Parse ``tracker.md``'s ``## Checkpoints`` section into progress data.
 
     Returns a structure the dashboard renders as a prominent Progress view:
@@ -576,7 +656,8 @@ def parse_tracker_progress(loop_dir: Path) -> dict[str, Any]:
     (they are criteria, not progress). Never raises; a malformed tracker
     degrades to ``available: False``.
     """
-    text = _read_text(loop_dir / "tracker.md")
+    if text is None:
+        text = _read_text(loop_dir / "tracker.md")
     if not text:
         return {"available": False, "total": 0, "done": 0, "blocked": 0,
                 "current_index": None, "checkpoints": []}
@@ -740,8 +821,15 @@ def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
     """
     records: list[dict[str, Any]] = []
     load_errors: list[dict[str, str]] = []
+    parser_degraded = False
+    parser_reason = ""
     if not evidence_dir.is_dir():
-        return {"records": records, "load_errors": load_errors}
+        return {
+            "records": records,
+            "load_errors": load_errors,
+            "parser_degraded": parser_degraded,
+            "parser_reason": parser_reason,
+        }
 
     gate = None
     if DOCTOR_AVAILABLE and getattr(doctor, "completion_gate", None) is not None:
@@ -764,11 +852,21 @@ def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
                 {"source": e.get("source", ""), "reason": e.get("reason", "")}
                 for e in gate_errors
             ]
-            return {"records": records, "load_errors": load_errors}
-        except Exception:
+            return {
+                "records": records,
+                "load_errors": load_errors,
+                "parser_degraded": parser_degraded,
+                "parser_reason": parser_reason,
+            }
+        except Exception as exc:
             # Fall through to the direct reader on any gate hiccup.
             records = []
             load_errors = []
+            parser_degraded = True
+            parser_reason = _safe_exception(exc)
+    else:
+        parser_degraded = True
+        parser_reason = "completion gate evidence loader unavailable"
 
     for path in sorted(evidence_dir.glob("*.json")):
         source = str(path).replace("\\", "/")
@@ -784,6 +882,35 @@ def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
         if not isinstance(data, dict):
             load_errors.append({"source": source, "reason": "not a JSON object"})
             continue
+        required = ("request_id", "checkpoint", "command", "exit_code", "ran_at")
+        missing = [key for key in required if key not in data]
+        if missing:
+            load_errors.append(
+                {
+                    "source": source,
+                    "reason": "missing required field(s): {0}".format(", ".join(missing)),
+                }
+            )
+            continue
+        empty = [
+            key for key in ("request_id", "checkpoint", "command", "ran_at")
+            if not str(data.get(key, "")).strip()
+        ]
+        if empty:
+            load_errors.append(
+                {
+                    "source": source,
+                    "reason": "empty required field(s): {0}".format(", ".join(empty)),
+                }
+            )
+            continue
+        exit_code = data.get("exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            load_errors.append({"source": source, "reason": "exit_code must be an integer"})
+            continue
+        if _parse_timestamp(str(data.get("ran_at", ""))) is None:
+            load_errors.append({"source": source, "reason": "ran_at must be a timestamp"})
+            continue
         records.append(
             {
                 "request_id": str(data.get("request_id", "")).strip(),
@@ -794,7 +921,12 @@ def _load_evidence_records(evidence_dir: Path) -> dict[str, Any]:
                 "source": source,
             }
         )
-    return {"records": records, "load_errors": load_errors}
+    return {
+        "records": records,
+        "load_errors": load_errors,
+        "parser_degraded": parser_degraded,
+        "parser_reason": parser_reason,
+    }
 
 
 def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
@@ -805,13 +937,14 @@ def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
     ``available: false`` object so the page can still render.
     """
     if not DOCTOR_AVAILABLE or doctor is None:
-        return {"available": False, "reason": "multi_agent_loop_doctor is not importable"}
+        reason = DOCTOR_IMPORT_ERROR or "multi_agent_loop_doctor is not importable"
+        return {"available": False, "reason": reason}
     try:
         result = doctor.summarize(
             loop_dir, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS
         )
     except Exception as exc:  # loop not bootstrapped, unreadable files, etc.
-        return {"available": False, "reason": "doctor error: {0}".format(exc)}
+        return {"available": False, "reason": "doctor error: {0}".format(_safe_exception(exc))}
 
     decisions = result.get("decisions") or {}
     requests = result.get("requests") or {}
@@ -861,7 +994,11 @@ def _doctor_snapshot(loop_dir: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def read_max_fix_cycles(loop_dir: Path) -> dict[str, Any]:
+def read_max_fix_cycles(
+    loop_dir: Path,
+    text: Optional[str] = None,
+    source_present: Optional[bool] = None,
+) -> dict[str, Any]:
     """Read the ``max_fix_cycles`` value from ``loop-policy.md``.
 
     Returns ``{"max_fix_cycles": int, "source_present": bool}``. When the file
@@ -870,8 +1007,9 @@ def read_max_fix_cycles(loop_dir: Path) -> dict[str, Any]:
     raises; a malformed value degrades to the default.
     """
     policy_path = loop_dir / "loop-policy.md"
-    text = _read_text(policy_path)
-    present = bool(text)
+    if text is None:
+        text = _read_text(policy_path)
+    present = bool(text) if source_present is None else source_present
     value = DEFAULT_MAX_FIX_CYCLES
     for line in text.splitlines():
         m = _MAX_FIX_CYCLES_RE.match(line)
@@ -897,9 +1035,10 @@ def read_max_fix_cycles(loop_dir: Path) -> dict[str, Any]:
 # crashes. The refresh path calls the probe's ``drop_caches`` (guarded) to force a
 # rescan. The privacy/red-line notes for both providers live in that module.
 
-# Reason surfaced when the probe module could not be imported at all, so a
-# consumer can tell "host probe absent" apart from "logged out / no data yet".
+# Legacy token retained for compatibility/documentation; new snapshots use the
+# broader module-unavailable code because an import can be absent OR broken.
 PROBE_MISSING_REASON = "probe_module_missing"
+PROBE_UNAVAILABLE_REASON = "probe_module_unavailable"
 
 
 def _compute_account_stale(account: dict[str, Any], usage: dict[str, Any]) -> None:
@@ -999,14 +1138,19 @@ def build_state(
     it forces a rescan, it never writes to disk. Normal polling passes
     ``refresh=False`` and rides the caches.
     """
+    refresh_degraded = False
+    cache_drop_failed = False
+    refresh_reason = ""
     if refresh and PROBE_AVAILABLE and codex_host_probe is not None:
         # Drop the probe's usage/account caches so the next read rescans. Guarded
         # so a missing probe (or a probe without the function) never crashes the
         # read; still read-only -- it forces a rescan, it writes nothing.
         try:
             codex_host_probe.drop_caches()
-        except Exception:  # pragma: no cover - defensive; drop must never raise
-            pass
+        except Exception as exc:  # keep serving, but admit the response may be cached
+            refresh_degraded = True
+            cache_drop_failed = True
+            refresh_reason = _safe_exception(exc)
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -1014,13 +1158,47 @@ def build_state(
     registry_path = loop_dir / "agent-lanes.md"
     requests_path = loop_dir / "requests.md"
     run_log_path = loop_dir / "loop-run-log.md"
+    policy_path = loop_dir / "loop-policy.md"
+    tracker_path = loop_dir / "tracker.md"
     evidence_dir = loop_dir / "evidence"
 
     bootstrapped = registry_path.exists()
 
+    # Core control-plane reads carry their degradation metadata alongside the
+    # existing fallback values. Missing, valid-empty, malformed, and unreadable
+    # are distinct so the client never presents a fallback as authoritative.
+    read_errors: list[dict[str, str]] = []
+    parse_errors: list[dict[str, str]] = []
+    file_status: dict[str, str] = {}
+
+    def read_core(path: Path) -> str:
+        text, status, reason = _read_text_status(path)
+        file_status[path.name] = status
+        if status == "unreadable":
+            read_errors.append(
+                {"source": str(path).replace("\\", "/"), "reason": reason}
+            )
+        return text
+
+    requests_text = read_core(requests_path)
+    registry_text = read_core(registry_path)
+    run_log_text = read_core(run_log_path)
+    policy_text = read_core(policy_path)
+    tracker_text = read_core(tracker_path)
+
     # Requests queue (parsed first so lane cards can cross-reference the
     # human-readable goal/next_action of the lane's CURRENT request -- F14).
-    requests = _parse_md_table(requests_path)
+    if file_status[requests_path.name] == "ok":
+        requests, request_parse_errors = _parse_md_table_text(
+            requests_text,
+            str(requests_path).replace("\\", "/"),
+            ("request_id", "status"),
+        )
+        parse_errors.extend(request_parse_errors)
+        if request_parse_errors:
+            file_status[requests_path.name] = "malformed"
+    else:
+        requests = []
     requests_by_id: dict[str, dict[str, str]] = {}
     for req in requests:
         rid = (req.get("request_id", "") or "").strip()
@@ -1028,7 +1206,17 @@ def build_state(
             requests_by_id[rid] = req
 
     # Registry rows + per-lane detail.
-    lane_rows = _parse_md_table(registry_path)
+    if file_status[registry_path.name] == "ok":
+        lane_rows, registry_parse_errors = _parse_md_table_text(
+            registry_text,
+            str(registry_path).replace("\\", "/"),
+            ("lane", "thread_id", "status"),
+        )
+        parse_errors.extend(registry_parse_errors)
+        if registry_parse_errors:
+            file_status[registry_path.name] = "malformed"
+    else:
+        lane_rows = []
     lanes: list[dict[str, Any]] = []
     for row in lane_rows:
         lane = (row.get("lane", "") or "").strip()
@@ -1105,16 +1293,38 @@ def build_state(
     # DATA rows by their timestamp cell (header/separator preserved) so the tail
     # shows the chronologically-latest transitions, matching the timestamp-sorted
     # reconstruction the in-process doctor now uses.
-    run_log_tail = _run_log_tail_sorted(_read_text(run_log_path), RUNLOG_TAIL)
+    run_log_tail = _run_log_tail_sorted(run_log_text, RUNLOG_TAIL)
 
     # Doctor snapshot (in-process).
     doctor_snapshot = _doctor_snapshot(loop_dir)
 
     # Current anti-thrash cap (read-only view of loop-policy.md).
-    policy = read_max_fix_cycles(loop_dir)
+    policy = read_max_fix_cycles(
+        loop_dir,
+        text=policy_text,
+        source_present=bool(policy_text),
+    )
+    if file_status[policy_path.name] == "ok" and not any(
+        _MAX_FIX_CYCLES_RE.match(line) for line in policy_text.splitlines()
+    ):
+        parse_errors.append(
+            {
+                "source": str(policy_path).replace("\\", "/"),
+                "reason": "max_fix_cycles is missing or malformed",
+            }
+        )
+        file_status[policy_path.name] = "malformed"
 
     # Tracker progress (F14) + human project name (F2).
-    tracker_progress = parse_tracker_progress(loop_dir)
+    tracker_progress = parse_tracker_progress(loop_dir, text=tracker_text)
+    if file_status[tracker_path.name] == "ok" and tracker_progress.get("available") is not True:
+        parse_errors.append(
+            {
+                "source": str(tracker_path).replace("\\", "/"),
+                "reason": "no valid ## Checkpoints checkbox rows found",
+            }
+        )
+        file_status[tracker_path.name] = "malformed"
     project = read_project(loop_dir)
     # Awaiting-objective state (F3): a fresh loop whose goal.md is still the
     # placeholder template AND that has no real requests yet. This is the
@@ -1130,9 +1340,17 @@ def build_state(
         try:
             usage = codex_host_probe.build_usage()
         except Exception as exc:  # pragma: no cover - defensive belt-and-suspenders
-            usage = {"available": False, "reason": "usage provider error: {0}".format(exc)}
+            usage = {
+                "available": False,
+                "reason_code": "usage_provider_error",
+                "reason": _safe_exception(exc),
+            }
     else:
-        usage = {"available": False, "reason": PROBE_MISSING_REASON}
+        usage = {
+            "available": False,
+            "reason_code": PROBE_UNAVAILABLE_REASON,
+            "reason": PROBE_IMPORT_ERROR or PROBE_UNAVAILABLE_REASON,
+        }
 
     # Scoped account identity from auth.json (email/name/plan/auth_mode/short id
     # only -- never tokens), also from the host probe. Attached UNDER usage as
@@ -1143,9 +1361,13 @@ def build_state(
         try:
             account = codex_host_probe.build_account()
         except Exception as exc:  # pragma: no cover - defensive belt-and-suspenders
-            account = {"available": False, "detail": "account provider error: {0}".format(exc)}
+            account = {"available": False, "detail": _safe_exception(exc)}
     else:
-        account = {"available": False, "detail": PROBE_MISSING_REASON}
+        account = {
+            "available": False,
+            "reason_code": PROBE_UNAVAILABLE_REASON,
+            "detail": PROBE_IMPORT_ERROR or PROBE_UNAVAILABLE_REASON,
+        }
     # Flag when the quota snapshot predates the current login (plan changed, or
     # auth.json refreshed after the last rate-limit event). Comparative only.
     _compute_account_stale(account, usage)
@@ -1156,6 +1378,26 @@ def build_state(
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "loop_dir": str(loop_dir).replace("\\", "/"),
         "bootstrapped": bootstrapped,
+        "read_errors": read_errors,
+        "parse_errors": parse_errors,
+        "file_status": file_status,
+        "capabilities": {
+            "doctor": {
+                "available": DOCTOR_AVAILABLE,
+                "reason": DOCTOR_IMPORT_ERROR,
+            },
+            "bootstrap": {
+                "available": BOOTSTRAP_AVAILABLE,
+                "reason": BOOTSTRAP_IMPORT_ERROR,
+            },
+            "probe": {
+                "available": PROBE_AVAILABLE,
+                "reason": PROBE_IMPORT_ERROR,
+            },
+        },
+        "refresh_degraded": refresh_degraded,
+        "cache_drop_failed": cache_drop_failed,
+        "refresh_reason": refresh_reason,
         "stale_heartbeat_mins": STALE_HEARTBEAT_MINS,
         "reserved_lane_names": sorted(RESERVED_LANE_NAMES),
         "lanes": lanes,
@@ -1303,7 +1545,9 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
     else:
         return {
             "ok": False,
-            "error": "bootstrap_agent_loop is not importable; cannot create lane files",
+            "error": "bootstrap_agent_loop unavailable: {0}; cannot create lane files".format(
+                BOOTSTRAP_IMPORT_ERROR or "module is not importable"
+            ),
         }
 
     # Rebuild the registry table from the full row set and write it atomically.

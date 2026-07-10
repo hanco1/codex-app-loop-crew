@@ -88,6 +88,7 @@ import bootstrap_agent_loop  # noqa: E402
 import completion_gate  # noqa: E402
 import deliver_message  # noqa: E402
 import multi_agent_loop_doctor as doctor  # noqa: E402
+import precommit_scope_guard  # noqa: E402
 import record_decision  # noqa: E402
 
 
@@ -99,6 +100,9 @@ _SKILL_DIR = Path(__file__).resolve().parent.parent
 _SKILL_MD = _SKILL_DIR / "SKILL.md"
 _PROTOCOL_MD = _SKILL_DIR / "references" / "protocol.md"
 _LOOP_STATE_MD = _SKILL_DIR / "references" / "loop-state.md"
+_REFERENCE_MD_FILES = tuple(sorted((_SKILL_DIR / "references").glob("*.md")))
+_DASHBOARD_HTML = _SKILL_DIR / "scripts" / "dashboard.html"
+_LOOP_DASHBOARD_PY = _SKILL_DIR / "scripts" / "loop_dashboard.py"
 
 
 def _fail(message: str) -> None:
@@ -147,11 +151,11 @@ def _write_evidence(evidence_dir: Path, request_id: str, iteration: int, command
 
 
 def _append_request_row(requests_path: Path, request_id: str, owner_lane: str, note: str) -> None:
-    """Append one non-terminal request row with a filled evidence/last_message cell.
+    """Append one non-terminal request row with a filled last_message cell.
 
     Columns: request_id, status, owner_lane, iteration, source_docs,
-    last_message, next_action, updated_at. A non-empty last_message makes the
-    doctor's evidence_recorded_ok treat the request as having a recorded cell.
+    last_message, next_action, updated_at. ``last_message`` is only a message
+    pointer; real evidence must come from an ``evidence/*.json`` record.
     """
     row = "| {rid} | IMPLEMENTING | {owner} | 1 | goal.md | {note} | continue | 2026-07-04T00:00:00Z |\n".format(
         rid=request_id, owner=owner_lane, note=note
@@ -213,6 +217,723 @@ def _record_one_decision(loop_dir: Path, request_id: str, source_doc: Path, gate
 
 def _doctor(loop_dir: Path) -> dict:
     return doctor.summarize(loop_dir, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS)
+
+
+def _git(repo: Path, *args: str) -> None:
+    """Run git in a disposable smoke repo and fail with its real stderr."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        _fail(
+            "git {0} failed in disposable repo: {1}".format(
+                " ".join(args), result.stderr.decode("utf-8", "replace").strip()
+            )
+        )
+
+
+def _guard_repo(tmp_path: Path, name: str, overlap: bool = True) -> tuple[Path, Path]:
+    """Create a committed real git repo, optionally with overlapping scopes."""
+    repo = tmp_path / name
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "--quiet")
+    _git(repo, "config", "user.email", "smoke@example.com")
+    _git(repo, "config", "user.name", "smoke")
+    loop = repo / "docs" / "loop"
+    _bootstrap(
+        loop,
+        [
+            "--no-default-lanes",
+            "--extra-lane",
+            "implementation|Own source|src/**",
+            "--extra-lane",
+            (
+                "frontend|Own shared source|src/shared/**"
+                if overlap
+                else "frontend|Own UI|ui/**"
+            ),
+        ],
+    )
+    (repo / "src" / "shared").mkdir(parents=True, exist_ok=True)
+    (repo / "src" / "own.py").write_text("value = 1\n", encoding="utf-8")
+    (repo / "src" / "shared" / "item.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "--quiet", "-m", "seed")
+    return repo, loop
+
+
+def _run_guard(repo: Path, loop: Path, lane: str) -> tuple[int, str, str]:
+    """Run the actual guard CLI so staged-path discovery uses the real index."""
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(precommit_scope_guard.__file__).resolve()),
+            "--loop-dir",
+            str(loop),
+            "--lane",
+            lane,
+        ],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    return (
+        result.returncode,
+        result.stdout.decode("utf-8", "replace"),
+        result.stderr.decode("utf-8", "replace"),
+    )
+
+
+def _check_g26_c3_leases(tmp_path: Path) -> None:
+    """G26 C3-leases: unreadable leases warn and protect other static scopes."""
+    repo_ok, loop_ok = _guard_repo(tmp_path, "g26_c3_allow")
+    (loop_ok / "leases.md").write_bytes(b"\xff\xfe\x00")
+    own_path = repo_ok / "src" / "own.py"
+    own_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo_ok, "add", "src/own.py")
+    rc_ok, _stdout_ok, stderr_ok = _run_guard(repo_ok, loop_ok, "implementation")
+    if rc_ok != 0:
+        _fail("G26 C3 negative: unreadable leases must not block an exclusive-scope path")
+    if "leases.md" not in stderr_ok or "utf-8" not in stderr_ok.lower():
+        _fail("G26 C3 negative: allowed commit must still surface the leases read failure")
+
+    repo_block, loop_block = _guard_repo(tmp_path, "g26_c3_block")
+    (loop_block / "leases.md").write_bytes(b"\xff\xfe\x00")
+    shared_path = repo_block / "src" / "shared" / "item.py"
+    shared_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo_block, "add", "src/shared/item.py")
+    rc_block, _stdout_block, stderr_block = _run_guard(
+        repo_block, loop_block, "implementation"
+    )
+    if rc_block == 0:
+        _fail("G26 C3 positive: unreadable leases must block a path in another lane's scope")
+    if "leases.md" not in stderr_block or "frontend" not in stderr_block:
+        _fail("G26 C3 positive: rejection must name the failed file and other static lane")
+
+
+def _check_g26_c20_blank_active_lease(tmp_path: Path) -> None:
+    """G26 C20: an ACTIVE blank lease glob rejects instead of disappearing."""
+    repo, loop = _guard_repo(tmp_path, "g26_c20_active")
+    request_id = "REQ-20260709-020001-frontend"
+    (loop / "leases.md").write_text(
+        "# File Leases\n\n"
+        "| file_glob | lane | request_id | acquired_at | status |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | frontend | {0} | 2026-07-09T00:00:00Z | ACTIVE |\n".format(request_id),
+        encoding="utf-8",
+    )
+    own_path = repo / "src" / "own.py"
+    own_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "src/own.py")
+    rc, _stdout, stderr = _run_guard(repo, loop, "implementation")
+    if rc == 0:
+        _fail("G26 C20 positive: another lane's ACTIVE blank lease glob must reject")
+    if request_id not in stderr or "frontend" not in stderr:
+        _fail("G26 C20 positive: rejection must name the malformed lease request and lane")
+    if "file_glob" not in stderr or "blank" not in stderr.lower():
+        _fail("G26 C20 positive: rejection must explicitly identify the blank file_glob")
+
+    repo_released, loop_released = _guard_repo(tmp_path, "g26_c20_released")
+    (loop_released / "leases.md").write_text(
+        "# File Leases\n\n"
+        "| file_glob | lane | request_id | acquired_at | status |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | frontend | {0} | 2026-07-09T00:00:00Z | RELEASED |\n".format(request_id),
+        encoding="utf-8",
+    )
+    released_path = repo_released / "src" / "own.py"
+    released_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo_released, "add", "src/own.py")
+    rc_released, _stdout_released, stderr_released = _run_guard(
+        repo_released, loop_released, "implementation"
+    )
+    if rc_released != 0:
+        _fail("G26 C20 negative: an inactive blank lease must remain ignored")
+    if "blank" in stderr_released.lower():
+        _fail("G26 C20 negative: an inactive blank lease must not raise an ACTIVE warning")
+
+
+def _check_g26_b9_unknown_lease_status(tmp_path: Path) -> None:
+    """G26 B9: unknown status uses explicit fall-through, not a dead pass branch."""
+    source = Path(precommit_scope_guard.__file__).read_text(encoding="utf-8")
+    dead_branch = re.compile(
+        r"if status and status not in ACTIVE_LEASE_STATUSES:\s*"
+        r"(?:#[^\n]*\n\s*)+pass"
+    )
+    if dead_branch.search(source):
+        _fail("G26 B9: unknown lease status must not rely on a dead pass branch")
+
+    repo, loop = _guard_repo(tmp_path, "g26_b9_unknown", overlap=False)
+    (loop / "leases.md").write_text(
+        "# File Leases\n\n"
+        "| file_glob | lane | request_id | acquired_at | status |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| src/own.py | frontend | REQ-20260709-020002-frontend | "
+        "2026-07-09T00:00:00Z | FUTURE_STATUS |\n",
+        encoding="utf-8",
+    )
+    shared_path = repo / "src" / "own.py"
+    shared_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "src/own.py")
+    rc, _stdout, stderr = _run_guard(repo, loop, "implementation")
+    if rc == 0:
+        _fail("G26 B9: an unknown non-empty lease status must remain fail-closed")
+    if "FUTURE_STATUS" in stderr:
+        _fail("G26 B9: behavior should reject by lease coverage, not invent status handling")
+    if "active lease held by lane 'frontend'" not in stderr:
+        _fail("G26 B9: unknown status must fall through to normal active-lease enforcement")
+
+
+def _check_g26_b4_guard_overlap(tmp_path: Path) -> None:
+    """G26 B4: only paths in a registry's shared region fail closed."""
+    repo_shared, loop_shared = _guard_repo(tmp_path, "g26_b4_shared")
+    shared_path = repo_shared / "src" / "shared" / "item.py"
+    shared_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo_shared, "add", "src/shared/item.py")
+    rc_shared, _stdout_shared, stderr_shared = _run_guard(
+        repo_shared, loop_shared, "implementation"
+    )
+    if rc_shared == 0:
+        _fail("G26 B4 positive: a staged path in two static scopes must be rejected")
+    overlap_words = ("overlap", "implementation", "frontend", "src/shared/item.py")
+    if any(word not in stderr_shared for word in overlap_words):
+        _fail("G26 B4 positive: rejection must name the overlap, both lanes, and path")
+    if "fix" not in stderr_shared.lower() or "agent-lanes.md" not in stderr_shared:
+        _fail("G26 B4 positive: rejection must tell the user to fix the registry scopes")
+
+    repo_exclusive, loop_exclusive = _guard_repo(tmp_path, "g26_b4_exclusive")
+    exclusive_path = repo_exclusive / "src" / "own.py"
+    exclusive_path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo_exclusive, "add", "src/own.py")
+    rc_exclusive, _stdout_exclusive, stderr_exclusive = _run_guard(
+        repo_exclusive, loop_exclusive, "implementation"
+    )
+    if rc_exclusive != 0:
+        _fail("G26 B4 negative: overlap elsewhere must not block an exclusive-scope path")
+    if "overlap" in stderr_exclusive.lower():
+        _fail("G26 B4 negative: an exclusive path must not emit a scope-overlap warning")
+
+    repo_ritual = tmp_path / "g26_b4_ritual"
+    repo_ritual.mkdir(parents=True, exist_ok=True)
+    _git(repo_ritual, "init", "--quiet")
+    _git(repo_ritual, "config", "user.email", "smoke@example.com")
+    _git(repo_ritual, "config", "user.name", "smoke")
+    loop_ritual = repo_ritual / "docs" / "loop"
+    _bootstrap(loop_ritual)
+    _git(repo_ritual, "add", "-A")
+    _git(repo_ritual, "commit", "--quiet", "-m", "seed")
+    current = loop_ritual / "lanes" / "review" / "current.md"
+    current.write_text(current.read_text(encoding="utf-8") + "\nritual: updated\n", encoding="utf-8")
+    _git(repo_ritual, "add", "docs/loop/lanes/review/current.md")
+    rc_ritual, _stdout_ritual, stderr_ritual = _run_guard(
+        repo_ritual, loop_ritual, "review"
+    )
+    if rc_ritual != 0:
+        _fail("G26 B4 carve-out: a lane must still write its own ritual directory")
+    if "overlap" in stderr_ritual.lower():
+        _fail("G26 B4 carve-out: product ledger nesting must not be reported as ambiguity")
+
+
+def _check_g26_b5_docs_preset(tmp_path: Path) -> None:
+    """G26 B5: the built-in docs preset is disjoint from product."""
+    loop = tmp_path / "g26_b5_docs_preset"
+    _bootstrap(loop, ["--preset", "docs"])
+    rows = bootstrap_agent_loop.existing_rows(loop / "agent-lanes.md")
+    docs_scope = rows.get("docs", {}).get("write_scope", "")
+    scope_tokens = {token.strip() for token in docs_scope.split(";") if token.strip()}
+    if "docs/**" in scope_tokens:
+        _fail("G26 B5: the docs preset must not claim the product-owned docs/** tree")
+    for expected in ("docs/user/**", "CHANGELOG.md", "docs/loop/lanes/docs/**"):
+        if expected not in scope_tokens:
+            _fail("G26 B5: docs preset is missing disjoint scope entry {0}".format(expected))
+    result = _doctor(loop)
+    docs_overlaps = [
+        warning
+        for warning in result["warnings"]
+        if warning["code"] == "write_scope_overlap" and "docs" in warning["message"]
+    ]
+    if docs_overlaps:
+        _fail("G26 B5 positive: built-in product + docs lanes must be disjoint")
+
+    loop_bad = tmp_path / "g26_b5_old_style"
+    _bootstrap(
+        loop_bad,
+        ["--extra-lane", "docs-old|Own every doc|docs/**"],
+    )
+    bad = _doctor(loop_bad)
+    if not any(
+        warning["code"] == "write_scope_overlap"
+        and "docs-old" in warning["message"]
+        and "product" in warning["message"]
+        for warning in bad["warnings"]
+    ):
+        _fail("G26 B5 negative: a custom docs/** lane must still overlap product")
+
+
+def _check_g26_c10_registry_rows(tmp_path: Path) -> None:
+    """G26 C10: malformed registry rows survive every bootstrap rewrite."""
+    import contextlib
+    import io
+
+    loop = tmp_path / "g26_c10_registry"
+    _bootstrap(loop)
+    registry = loop / "agent-lanes.md"
+    malformed = "| ghost | codex:ghost-thread | Orphaned identity |"
+    with registry.open("a", encoding="utf-8") as handle:
+        handle.write(malformed + "\n")
+
+    stderr_first = io.StringIO()
+    with contextlib.redirect_stderr(stderr_first):
+        _bootstrap(
+            loop,
+            ["--set-thread", "review=codex:20260709-0000-0000-0000-000000000010"],
+        )
+    first_text = registry.read_text(encoding="utf-8")
+    first_warning = stderr_first.getvalue()
+    if first_text.count(malformed) != 1:
+        _fail("G26 C10: first registry rewrite must preserve the malformed row exactly once")
+    if "quarantined malformed registry rows" not in first_text.lower():
+        _fail("G26 C10: preserved malformed rows must be visibly quarantined")
+    if "agent-lanes.md" not in first_warning or "line" not in first_warning.lower():
+        _fail("G26 C10: rewrite must emit a loud warning with file and line")
+    if malformed not in first_warning:
+        _fail("G26 C10: warning must quote the malformed row that was preserved")
+    if "codex:20260709-0000-0000-0000-000000000010" not in first_text:
+        _fail("G26 C10: quarantine must not prevent valid --set-thread updates")
+    guard_rows = precommit_scope_guard.parse_table(registry)
+    if any(row.get("lane") == "ghost" for row in guard_rows):
+        _fail("G26 C10: a quarantined row must not become an active guard registry row")
+
+    stderr_second = io.StringIO()
+    with contextlib.redirect_stderr(stderr_second):
+        _bootstrap(loop)
+    second_text = registry.read_text(encoding="utf-8")
+    if second_text.count(malformed) != 1:
+        _fail("G26 C10: repeated rewrites must neither drop nor duplicate the malformed row")
+    if malformed not in stderr_second.getvalue():
+        _fail("G26 C10: every rewrite must keep the malformed-row warning visible")
+
+    clean_loop = tmp_path / "g26_c10_clean"
+    clean_stderr = io.StringIO()
+    with contextlib.redirect_stderr(clean_stderr):
+        _bootstrap(clean_loop)
+        _bootstrap(clean_loop)
+    if clean_stderr.getvalue():
+        _fail("G26 C10 negative: a well-formed registry must not emit malformed-row warnings")
+    if "quarantined malformed registry rows" in (
+        clean_loop / "agent-lanes.md"
+    ).read_text(encoding="utf-8").lower():
+        _fail("G26 C10 negative: a clean registry must not gain a quarantine section")
+
+
+def _check_g26_c1_heartbeat_warning(tmp_path: Path) -> None:
+    """G26 C1: heartbeat failures warn per file without failing delivery."""
+    import contextlib
+    import io
+
+    loop = tmp_path / "g26_c1_broken_heartbeat"
+    _bootstrap(loop)
+    registry = loop / "agent-lanes.md"
+    current = loop / "lanes" / "implementation" / "current.md"
+    registry.write_bytes(b"\xff\xfe\x00")
+    current.write_bytes(b"\xff\xfe\x00")
+    message = tmp_path / "g26_c1_message.md"
+    message.write_text("# LOOP_STATUS\n\nstill alive\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = deliver_message.main(
+                [
+                    "--loop-dir",
+                    str(loop),
+                    "--to-lane",
+                    "product",
+                    "--from-lane",
+                    "implementation",
+                    "--request-id",
+                    "REQ-20260709-030001-implementation",
+                    "--message-type",
+                    "LOOP_STATUS",
+                    "--iteration",
+                    "1",
+                    "--message-file",
+                    str(message),
+                ]
+            )
+    except (OSError, UnicodeDecodeError) as exc:
+        _fail("G26 C1: heartbeat failure escaped and changed delivery behavior: {0}".format(exc))
+    if rc != 0:
+        _fail("G26 C1: heartbeat failure must not change delivery's zero exit status")
+    if "delivered " not in stdout.getvalue() or "indexed " not in stdout.getvalue():
+        _fail("G26 C1: heartbeat failure must not hide successful delivery/index output")
+    delivered = list((loop / "lanes" / "product" / "inbox" / "new").glob("*.md"))
+    if len(delivered) != 1:
+        _fail("G26 C1: message must remain delivered despite both heartbeat failures")
+    warning_lines = [
+        line
+        for line in stderr.getvalue().splitlines()
+        if "warning:" in line.lower() and "heartbeat" in line.lower()
+    ]
+    if len(warning_lines) != 2:
+        _fail("G26 C1: expected one heartbeat warning per failed file, got {0}".format(warning_lines))
+    warning_text = "\n".join(warning_lines)
+    for failed_path in (registry, current):
+        if deliver_message.posix_path(str(failed_path)) not in warning_text:
+            _fail("G26 C1: heartbeat warning must name failed path {0}".format(failed_path))
+    if "UnicodeDecodeError" not in warning_text or "utf-8" not in warning_text.lower():
+        _fail("G26 C1: heartbeat warning must include the concrete decode exception")
+
+    clean_loop = tmp_path / "g26_c1_clean_heartbeat"
+    _bootstrap(clean_loop)
+    clean_stdout = io.StringIO()
+    clean_stderr = io.StringIO()
+    with contextlib.redirect_stdout(clean_stdout), contextlib.redirect_stderr(clean_stderr):
+        clean_rc = deliver_message.main(
+            [
+                "--loop-dir",
+                str(clean_loop),
+                "--to-lane",
+                "product",
+                "--from-lane",
+                "implementation",
+                "--request-id",
+                "REQ-20260709-030002-implementation",
+                "--message-type",
+                "LOOP_STATUS",
+                "--iteration",
+                "1",
+                "--message-file",
+                str(message),
+            ]
+        )
+    if clean_rc != 0:
+        _fail("G26 C1 negative: clean heartbeat delivery must pass")
+    if "heartbeat" in clean_stderr.getvalue().lower():
+        _fail("G26 C1 negative: successful heartbeat stamps must not warn")
+
+
+def _check_g26_c7_malformed_diagnostics(tmp_path: Path) -> None:
+    """G26 C7: malformed control-plane inputs warn without changing fallbacks."""
+    loop = tmp_path / "g26_c7_malformed_inputs"
+    _bootstrap(loop)
+
+    run_request = "REQ-20260709-031000-implementation"
+    (loop / "loop-run-log.md").write_text(
+        "# Loop Run Log\n\n"
+        "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        "| definitely-not-a-time | {rid} | 1 | IMPLEMENTING | FIX_REQUESTED | review | bad time |\n"
+        "| 2026-07-09T03:11:00Z |  | 1 | IMPLEMENTING | FIX_REQUESTED | review | no request |\n"
+        "| 2026-07-09T03:12:00Z | {rid} | 2 | FIX_REQUESTED |  | implementation | no status |\n".format(
+            rid=run_request
+        ),
+        encoding="utf-8",
+    )
+
+    policy_path = loop / "loop-policy.md"
+    policy_text = policy_path.read_text(encoding="utf-8")
+    if "max_fix_cycles: 3" not in policy_text:
+        _fail("G26 C7 fixture: bootstrap policy is missing max_fix_cycles: 3")
+    policy_path.write_text(
+        policy_text.replace("max_fix_cycles: 3", "max_fix_cycles: definitely-not-an-int", 1),
+        encoding="utf-8",
+    )
+
+    iteration_request = "REQ-20260709-031500-implementation"
+    with (loop / "requests.md").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "| {rid} | IMPLEMENTING | implementation | not-an-iteration | goal.md | msg | continue | "
+            "2026-07-09T03:15:00Z |\n".format(rid=iteration_request)
+        )
+
+    result = _doctor(loop)
+    by_code = {}
+    for warning in result["warnings"]:
+        by_code.setdefault(warning["code"], []).append(warning["message"])
+
+    for code in ("malformed_run_log", "malformed_policy", "malformed_iteration"):
+        if code not in by_code:
+            _fail("G26 C7: doctor did not emit {0}".format(code))
+        if any(issue["code"] == code for issue in result["issues"]):
+            _fail("G26 C7: {0} must remain WARNING-only".format(code))
+
+    run_messages = "\n".join(by_code["malformed_run_log"])
+    if "loop-run-log.md" not in run_messages or "line" not in run_messages.lower():
+        _fail("G26 C7: run-log warnings must name the file and line")
+    if run_request not in run_messages:
+        _fail("G26 C7: malformed run-log warning must name the request when present")
+    if "timestamp" not in run_messages or "request_id" not in run_messages or "to_status" not in run_messages:
+        _fail("G26 C7: run-log warnings must distinguish bad timestamp/request/status cells")
+
+    policy_messages = "\n".join(by_code["malformed_policy"])
+    if "loop-policy.md" not in policy_messages or "line" not in policy_messages.lower():
+        _fail("G26 C7: malformed policy warning must name the file and line")
+    if result.get("max_fix_cycles") != doctor.DEFAULT_MAX_FIX_CYCLES:
+        _fail("G26 C7: malformed policy must retain the existing default fallback")
+
+    iteration_messages = "\n".join(by_code["malformed_iteration"])
+    if iteration_request not in iteration_messages or "requests.md" not in iteration_messages:
+        _fail("G26 C7: malformed iteration warning must name requests.md and request_id")
+    iteration_summary = next(
+        item for item in result["requests"]["non_terminal"]
+        if item["request_id"] == iteration_request
+    )
+    if iteration_summary.get("fix_cycles") != 0:
+        _fail("G26 C7: malformed iteration must retain the existing zero fallback")
+
+    clean_loop = tmp_path / "g26_c7_clean_inputs"
+    _bootstrap(clean_loop)
+    clean = _doctor(clean_loop)
+    if any(
+        warning["code"] in {"malformed_run_log", "malformed_policy", "malformed_iteration"}
+        for warning in clean["warnings"]
+    ):
+        _fail("G26 C7 negative: clean control-plane files must not emit malformed warnings")
+
+
+def _check_g26_b2_c4(tmp_path: Path) -> None:
+    """G26 B2/C4: zero real evidence never becomes doctor gate-green.
+
+    A pristine loop with no requests is healthy. Once a request reaches
+    IMPLEMENTATION_DONE, however, a populated last_message cell is only a
+    message pointer: it must not count as evidence or make the completion gate
+    pass. Adding one real passing evidence record is the positive control.
+    """
+    loop = tmp_path / "g26_b2_c4"
+    _bootstrap(loop)
+
+    fresh = _doctor(loop)
+    if fresh["evidence_recorded_ok"] is not True:
+        _fail("G26 B2: a fresh loop with no requests must keep evidence_recorded_ok=True")
+    if fresh["completion_gate_ok"] is not True:
+        _fail("G26 B2: a fresh loop with no requests must keep completion_gate_ok=True")
+
+    request_id = "REQ-20260709-010001-implementation"
+    requests_path = loop / "requests.md"
+    _append_request_row(
+        requests_path,
+        request_id,
+        "implementation",
+        "messages/REQ-20260709-010001-implementation/IMPLEMENTATION_DONE-iter-1.md",
+    )
+    _set_request_status(requests_path, request_id, "IMPLEMENTATION_DONE")
+
+    empty = _doctor(loop)
+    request = next(item for item in empty["requests"]["non_terminal"] if item["request_id"] == request_id)
+    if request["has_evidence"] is not False:
+        _fail("G26 C4: last_message must not make a zero-record request report has_evidence=True")
+    if empty["evidence_recorded_ok"] is not False:
+        _fail("G26 B2: a DONE+ request with zero records must set evidence_recorded_ok=False")
+    if empty["completion_gate_ok"] is not False:
+        _fail("G26 B2: a DONE+ request with zero records must set completion_gate_ok=False")
+    if not any(
+        warning["code"] == "missing_evidence" and request_id in warning["message"]
+        for warning in empty["warnings"]
+    ):
+        _fail("G26 B2: the zero-record DONE+ request must emit missing_evidence")
+
+    _write_evidence(loop / "evidence", request_id, 1, "python -m unittest", 0)
+    recorded = _doctor(loop)
+    request = next(item for item in recorded["requests"]["non_terminal"] if item["request_id"] == request_id)
+    if request["has_evidence"] is not True:
+        _fail("G26 B2 positive: a real JSON record must make has_evidence=True")
+    if recorded["evidence_recorded_ok"] is not True:
+        _fail("G26 B2 positive: a real JSON record must make evidence_recorded_ok=True")
+    if recorded["completion_gate_ok"] is not True:
+        _fail("G26 B2 positive: one valid passing record must make completion_gate_ok=True")
+
+
+def _check_g26_b1_c15(tmp_path: Path) -> None:
+    """G26 B1/C15: manifest coverage and evidence fields fail honestly."""
+    import json
+
+    loop = tmp_path / "g26_b1_c15"
+    _bootstrap(loop)
+    request_id = "REQ-20260709-010002-implementation"
+    requests_path = loop / "requests.md"
+    _append_request_row(requests_path, request_id, "implementation", "implementation done")
+    _set_request_status(requests_path, request_id, "IMPLEMENTATION_DONE")
+
+    message_dir = loop / "messages" / request_id
+    message_dir.mkdir(parents=True, exist_ok=True)
+    (message_dir / "IMPLEMENTATION_REQUEST-iter-1.md").write_text(
+        "# IMPLEMENTATION_REQUEST\n\n"
+        "message_type: IMPLEMENTATION_REQUEST\n"
+        "request_id: {0}\n"
+        "acceptance_criteria:\n"
+        "- Core passes. VERIFY `python -m unittest tests.core`\n"
+        "- UI passes. VERIFY `python -m unittest tests.ui`\n"
+        "- Smoke passes. VERIFY `python scripts/smoke.py --local`\n".format(request_id),
+        encoding="utf-8",
+    )
+    evidence_dir = loop / "evidence"
+    _write_evidence(evidence_dir, request_id, 1, "python -m unittest tests.core", 0)
+    _write_evidence(evidence_dir, request_id, 1, "python -m unittest tests.ui", 0)
+
+    partial = _doctor(loop)
+    gaps = partial.get("evidence_manifest_gaps") or []
+    match = [gap for gap in gaps if gap.get("request_id") == request_id]
+    if not match:
+        _fail("G26 B1: partial VERIFY coverage must expose evidence_manifest_gaps")
+    if match[0].get("missing_commands") != ["python scripts/smoke.py --local"]:
+        _fail("G26 B1: the manifest gap must name the uncovered VERIFY command")
+    if match[0].get("expected_count") != 3 or match[0].get("evidence_count") != 2:
+        _fail("G26 B1: manifest gap counts must report expected=3 and evidence=2")
+    if not any(
+        warning["code"] == "evidence_manifest_gap" and request_id in warning["message"]
+        for warning in partial["warnings"]
+    ):
+        _fail("G26 B1: partial coverage must emit evidence_manifest_gap")
+
+    _write_evidence(evidence_dir, request_id, 1, "python scripts/smoke.py --local", 0)
+    covered = _doctor(loop)
+    if any(gap.get("request_id") == request_id for gap in covered.get("evidence_manifest_gaps", [])):
+        _fail("G26 B1 positive: complete VERIFY coverage must clear evidence_manifest_gap")
+    if any(
+        warning["code"] == "evidence_manifest_gap" and request_id in warning["message"]
+        for warning in covered["warnings"]
+    ):
+        _fail("G26 B1 positive: complete VERIFY coverage must not warn")
+
+    # C15 negative: required keys with empty string values are malformed, and
+    # an invalid ran_at is not a timestamp. Both used to pass key-presence-only
+    # loading when exit_code was zero.
+    malformed_dir = tmp_path / "g26_c15_evidence"
+    malformed_dir.mkdir()
+    empty_path = malformed_dir / "empty.json"
+    empty_path.write_text(
+        json.dumps(
+            {
+                "request_id": "",
+                "checkpoint": "",
+                "command": "",
+                "exit_code": 0,
+                "ran_at": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    invalid_time_path = malformed_dir / "invalid-time.json"
+    invalid_time_path.write_text(
+        json.dumps(
+            {
+                "request_id": "REQ-20260709-010003-implementation",
+                "checkpoint": "smoke",
+                "command": "python -m unittest",
+                "exit_code": 0,
+                "ran_at": "not-a-timestamp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    malformed_records, malformed_errors = completion_gate.load_evidence(malformed_dir)
+    malformed = completion_gate.evaluate(malformed_records, malformed_errors, None)
+    if malformed["ok"] is not False:
+        _fail("G26 C15: empty string fields and invalid ran_at must fail the unscoped gate")
+    reasons = " ".join(error.get("reason", "") for error in malformed_errors)
+    if "empty" not in reasons or "ran_at" not in reasons or "timestamp" not in reasons:
+        _fail("G26 C15: load errors must clearly name empty fields and invalid ran_at timestamp")
+
+    empty_path.unlink()
+    invalid_time_path.unlink()
+    valid_id = "REQ-20260709-010004-implementation"
+    _write_evidence(malformed_dir, valid_id, 1, "python -m unittest", 0)
+    valid_records, valid_errors = completion_gate.load_evidence(malformed_dir)
+    valid = completion_gate.evaluate(valid_records, valid_errors, valid_id)
+    if valid["ok"] is not True:
+        _fail("G26 C15 positive: a complete non-empty record with a valid timestamp must pass")
+
+
+def _check_g26_b3(tmp_path: Path) -> None:
+    """G26 B3: auto-chain requires an available green gate and full manifest."""
+    import json
+
+    loop = tmp_path / "g26_b3"
+    _bootstrap(loop)
+    (loop / "tracker.md").write_text("# Tracker\n\n- [ ] Continue the verified checkpoint.\n", encoding="utf-8")
+    with (loop / "handoff.md").open("a", encoding="utf-8") as handle:
+        handle.write("\nauto_chain_next_session: true\n")
+
+    request_id = "REQ-20260709-010005-implementation"
+    requests_path = loop / "requests.md"
+    _append_request_row(requests_path, request_id, "implementation", "implementation done")
+    _set_request_status(requests_path, request_id, "IMPLEMENTATION_DONE")
+    message_dir = loop / "messages" / request_id
+    message_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = message_dir / "IMPLEMENTATION_REQUEST-iter-1.md"
+    manifest_path.write_text(
+        "# IMPLEMENTATION_REQUEST\n\n"
+        "message_type: IMPLEMENTATION_REQUEST\n"
+        "request_id: {0}\n"
+        "acceptance_criteria:\n"
+        "- Tests pass. VERIFY `python -m unittest`\n".format(request_id),
+        encoding="utf-8",
+    )
+    evidence_dir = loop / "evidence"
+    _write_evidence(evidence_dir, request_id, 1, "python -m unittest", 0)
+    evidence_path = next(evidence_dir.glob("{0}-*.json".format(request_id)))
+
+    ready = _doctor(loop)
+    if ready["auto_chain_ready"] is not True:
+        _fail("G26 B3 positive: available green gate plus complete manifest must allow auto-chain")
+
+    failing_record = json.loads(evidence_path.read_text(encoding="utf-8"))
+    failing_record["exit_code"] = 1
+    evidence_path.write_text(json.dumps(failing_record), encoding="utf-8")
+    failed = _doctor(loop)
+    if failed["completion_gate_ok"] is not False:
+        _fail("G26 B3 setup: non-zero evidence must make completion_gate_ok=False")
+    if failed["auto_chain_ready"] is not False:
+        _fail("G26 B3: auto-chain must stop when completion_gate_ok=False")
+    if "completion gate did not pass" not in failed["readiness_reasons"]:
+        _fail("G26 B3: readiness reasons must name the failed completion gate")
+
+    failing_record["exit_code"] = 0
+    evidence_path.write_text(json.dumps(failing_record), encoding="utf-8")
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8")
+        + "- Smoke passes. VERIFY `python scripts/smoke.py`\n",
+        encoding="utf-8",
+    )
+    manifest_gap = _doctor(loop)
+    if manifest_gap["completion_gate_ok"] is not True:
+        _fail("G26 B3 setup: passing recorded evidence must keep completion_gate_ok=True")
+    if not manifest_gap.get("evidence_manifest_gaps"):
+        _fail("G26 B3 setup: the uncovered second VERIFY command must create a manifest gap")
+    if manifest_gap["auto_chain_ready"] is not False:
+        _fail("G26 B3: auto-chain must stop on an evidence-manifest gap")
+    if "evidence manifest is incomplete" not in manifest_gap["readiness_reasons"]:
+        _fail("G26 B3: readiness reasons must name incomplete evidence manifest coverage")
+
+    _write_evidence(evidence_dir, request_id, 1, "python scripts/smoke.py", 0)
+    covered = _doctor(loop)
+    if covered["auto_chain_ready"] is not True:
+        _fail("G26 B3 positive: filling the manifest gap must restore auto-chain readiness")
+
+    original_gate_available = doctor.GATE_AVAILABLE
+    doctor.GATE_AVAILABLE = False
+    try:
+        unavailable = _doctor(loop)
+    finally:
+        doctor.GATE_AVAILABLE = original_gate_available
+    if unavailable["gate_available"] is not False:
+        _fail("G26 B3 setup: the unavailable-gate probe must report gate_available=False")
+    if unavailable["auto_chain_ready"] is not False:
+        _fail("G26 B3: auto-chain must stop when the completion gate is unavailable")
+    if "completion gate is unavailable" not in unavailable["readiness_reasons"]:
+        _fail("G26 B3: readiness reasons must name gate unavailability")
 
 
 def _find_registry_row(registry: Path, lane: str) -> str:
@@ -1016,6 +1737,39 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
 
+        # ---- G26 C3-leases: unreadable lease file is visible/fail-closed ---
+        _check_g26_c3_leases(tmp_path)
+
+        # ---- G26 C20: ACTIVE blank lease globs cannot disappear ------------
+        _check_g26_c20_blank_active_lease(tmp_path)
+
+        # ---- G26 B9: unknown lease statuses use one explicit fall-through --
+        _check_g26_b9_unknown_lease_status(tmp_path)
+
+        # ---- G26 B4: scope overlap blocks only the shared region -----------
+        _check_g26_b4_guard_overlap(tmp_path)
+
+        # ---- G26 B5: docs preset is disjoint from product ------------------
+        _check_g26_b5_docs_preset(tmp_path)
+
+        # ---- G26 C10: malformed registry rows survive rewrites ------------
+        _check_g26_c10_registry_rows(tmp_path)
+
+        # ---- G26 C1: heartbeat write failures warn, delivery still passes --
+        _check_g26_c1_heartbeat_warning(tmp_path)
+
+        # ---- G26 C7: malformed control-plane inputs warn, fallbacks stay ----
+        _check_g26_c7_malformed_diagnostics(tmp_path)
+
+        # ---- G26 B2/C4: evidence truth (real records, never messages) -------
+        _check_g26_b2_c4(tmp_path)
+
+        # ---- G26 B1/C15: manifest coverage + strict evidence fields --------
+        _check_g26_b1_c15(tmp_path)
+
+        # ---- G26 B3: auto-chain depends on gate + manifest truth -----------
+        _check_g26_b3(tmp_path)
+
         # ---- Loop A: full memory-layer flow with default lanes ---------------
         loop_a = tmp_path / "loop_a"
         _bootstrap(loop_a)
@@ -1670,6 +2424,11 @@ def main() -> int:
         skill_md = _read_doc(_SKILL_MD)
         protocol_md = _read_doc(_PROTOCOL_MD)
         loop_state_md = _read_doc(_LOOP_STATE_MD)
+        protocol_docs = [("SKILL.md", skill_md)]
+        protocol_docs.extend(
+            ("references/{0}".format(path.name), _read_doc(path))
+            for path in _REFERENCE_MD_FILES
+        )
 
         # The leading token appears in all three files (case-insensitive).
         for name, text in (
@@ -1715,6 +2474,203 @@ def main() -> int:
             _fail("SKILL.md must point to references/protocol.md for the ritual")
         if "protocol.md" not in loop_state_md:
             _fail("loop-state.md must point to references/protocol.md for the ritual")
+
+        # ---- G26 chunk 4: protocol-doc synchronization ---------------------
+        skill_lower = skill_md.lower()
+        protocol_lower = protocol_md.lower()
+        loop_state_lower = loop_state_md.lower()
+
+        # B7: REVIEW_DONE is a review verdict, never the ACCEPTED transition.
+        # The example stays non-terminal at REVIEWING; product alone performs
+        # acceptance, after human QA when the request is user-facing.
+        review_done_match = re.search(
+            r"(?ms)^## REVIEW_DONE\s*$.*?(?=^## FIX_REQUEST\s*$)",
+            protocol_md,
+        )
+        if not review_done_match:
+            _fail("protocol.md must contain a REVIEW_DONE section before FIX_REQUEST")
+        review_done_section = review_done_match.group(0)
+        review_done_lower = review_done_section.lower()
+        if "status: accepted" in review_done_lower:
+            _fail("B7: the REVIEW_DONE example must never write status: ACCEPTED")
+        for name, text in protocol_docs:
+            for code_fence in re.findall(r"(?ms)^```[^\n]*\n(.*?)^```\s*$", text):
+                if (
+                    "review_done" in code_fence.lower()
+                    and re.search(r"(?im)^status:\s*accepted\s*$", code_fence)
+                ):
+                    _fail(
+                        "B7: REVIEW_DONE example in {0} must never write "
+                        "status: ACCEPTED".format(name)
+                    )
+        if "status: reviewing" not in review_done_lower:
+            _fail("B7: the REVIEW_DONE example must remain at status: REVIEWING")
+        if "verdict: pass" not in review_done_lower:
+            _fail("B7: the REVIEW_DONE example must carry a pass/fail VERDICT")
+        if "product" not in review_done_lower or "accepted transition" not in review_done_lower:
+            _fail("B7: REVIEW_DONE wording must assign the ACCEPTED transition to product")
+        if "pass/fail `verdict`" not in skill_lower:
+            _fail("B7: SKILL.md must describe REVIEW_DONE as a pass/fail VERDICT")
+        if "product alone performs the `accepted` transition" not in skill_lower:
+            _fail("B7: SKILL.md must reserve the ACCEPTED transition for product")
+        if "unless the user assigns that authority elsewhere" in skill_lower:
+            _fail("B7: SKILL.md must not delegate the product-only ACCEPTED transition")
+        if "product alone performs the `accepted` transition" not in loop_state_lower:
+            _fail("B7: loop-state.md must reserve the ACCEPTED transition for product")
+        if "pass/fail `verdict`" not in loop_state_lower or "at `reviewing`" not in loop_state_lower:
+            _fail("B7: loop-state.md must keep REVIEW_DONE as a verdict at REVIEWING")
+        if "product or review marks a request `accepted`" in protocol_lower:
+            _fail("B7: protocol.md must not authorize review to mark a request ACCEPTED")
+
+        # OPEN-THE-TURN: the full rule lives exactly once, immediately beside
+        # the close-the-turn ritual in protocol.md. The two other docs carry
+        # only the leading token + pointer, never another full rule.
+        for name, text in (
+            ("SKILL.md", skill_md),
+            ("protocol.md", protocol_md),
+            ("loop-state.md", loop_state_md),
+        ):
+            if "open the turn" not in text.lower():
+                _fail("{0} must reference the ritual by the token 'open the turn'".format(name))
+
+        open_full_signature = "a lane's turn starts by re-reading"
+        open_full_sources = [
+            name
+            for name, text in protocol_docs
+            if open_full_signature in " ".join(text.lower().split())
+        ]
+        if open_full_sources != ["references/protocol.md"]:
+            _fail(
+                "the full open-the-turn rule must live in exactly protocol.md; "
+                "found it in {0}".format(open_full_sources or "(nowhere)")
+            )
+        open_rule_needles = (
+            "agent-lanes.md",
+            "requests.md",
+            "goal.md",
+            "## invariants",
+            "constraints.md",
+            "loop-policy.md",
+            "anything added since your last turn is binding",
+        )
+        for needle in open_rule_needles:
+            if needle not in protocol_lower:
+                _fail("protocol.md open-the-turn rule is missing: {0}".format(needle))
+        open_heading_at = protocol_lower.find("open the turn")
+        close_heading_at = protocol_lower.find("close the turn", open_heading_at + 1)
+        if open_heading_at < 0 or close_heading_at < 0 or close_heading_at - open_heading_at > 1200:
+            _fail("protocol.md must place open the turn immediately beside close the turn")
+        for name, text in (("SKILL.md", skill_md), ("loop-state.md", loop_state_md)):
+            lower = text.lower()
+            if "open the turn" not in lower or "protocol.md" not in lower:
+                _fail("{0} must carry the open-the-turn token + protocol.md pointer".format(name))
+            pointer_lines = [line for line in text.splitlines() if "open the turn" in line.lower()]
+            if len(pointer_lines) != 1 or "protocol.md" not in pointer_lines[0]:
+                _fail(
+                    "{0} must carry exactly one one-line open-the-turn pointer + token".format(
+                        name
+                    )
+                )
+
+        # Recovery Gate gains the pointer as an additional numbered item; all
+        # pre-existing recovery reads remain present.
+        recovery_match = re.search(
+            r"(?ms)^## Recovery Gate\s*$.*?(?=^## Stop Conditions\s*$)",
+            loop_state_md,
+        )
+        if not recovery_match:
+            _fail("loop-state.md must retain Recovery Gate before Stop Conditions")
+        recovery_lower = recovery_match.group(0).lower()
+        if "1. **open the turn**" not in recovery_lower or "protocol.md" not in recovery_lower:
+            _fail("OPEN-THE-TURN must be added as an item in loop-state.md's Recovery Gate")
+        for needle in (
+            "`goal.md`",
+            "`tracker.md`",
+            "`constraints.md`",
+            "`handoff.md`",
+            "`agent-lanes.md`",
+            "`requests.md`",
+            "this lane's `current.md` and `inbox.md`",
+        ):
+            if needle not in recovery_lower:
+                _fail("OPEN-THE-TURN must not replace Recovery Gate item: {0}".format(needle))
+
+        # A6: loop-state.md is the one complete Stop Conditions source;
+        # SKILL.md keeps only a hard gate and an exact pointer, not a second list.
+        skill_stop_match = re.search(r"(?ms)^## Stop Conditions\s*$.*?(?=^---\s*$)", skill_md)
+        state_stop_match = re.search(r"(?ms)^## Stop Conditions\s*$.*\Z", loop_state_md)
+        if not skill_stop_match or not state_stop_match:
+            _fail("A6: both docs must retain a Stop Conditions heading")
+        skill_stop = skill_stop_match.group(0)
+        state_stop_lower = state_stop_match.group(0).lower()
+        if "references/loop-state.md" not in skill_stop or "- " in skill_stop:
+            _fail("A6: SKILL.md Stop Conditions must be pointer-only, with no duplicate bullet list")
+        for needle in (
+            "`done when` is satisfied",
+            "budget_exhausted: true",
+            "no backing request row",
+            "violate `constraints.md`",
+            "unbounded or duplicate continuation",
+        ):
+            if needle not in state_stop_lower:
+                _fail("A6: canonical loop-state.md Stop Conditions is missing: {0}".format(needle))
+
+        # D2/D3: capability discovery and the real-input cross-file pointer.
+        if "`create_thread`, `list_threads`, `read_thread`" not in skill_md:
+            _fail("D2: SKILL.md discovery list must include list_threads")
+        if "see g2 real-input correctness below" in loop_state_lower:
+            _fail("D3: loop-state.md must not point to a nonexistent section below")
+        if "references/protocol.md" not in loop_state_md or '"Real-input correctness"' not in loop_state_md:
+            _fail("D3: loop-state.md must point to protocol.md's Real-input correctness section")
+
+        # B6: compare public wording with the server's canonical POST route
+        # tuple, then ensure the HTML footer names all three human controls.
+        dashboard_html = _read_doc(_DASHBOARD_HTML)
+        loop_dashboard_py = _read_doc(_LOOP_DASHBOARD_PY)
+        route_tuple = re.search(
+            r'if route not in \(([^\n]+)\):',
+            loop_dashboard_py,
+        )
+        if not route_tuple:
+            _fail("B6: could not find loop_dashboard.py's canonical write-route tuple")
+        actual_write_endpoints = set(re.findall(r'"(/api/[^"?]+)"', route_tuple.group(1)))
+        expected_write_endpoints = {"/api/lanes", "/api/policy", "/api/project"}
+        if actual_write_endpoints != expected_write_endpoints:
+            _fail(
+                "B6: server write endpoints changed; expected {0}, got {1}".format(
+                    sorted(expected_write_endpoints), sorted(actual_write_endpoints)
+                )
+            )
+        if "three human-only write endpoints" not in skill_lower:
+            _fail("B6: SKILL.md must state there are three human-only write endpoints")
+        dashboard_lower = dashboard_html.lower()
+        dashboard_collapsed = " ".join(dashboard_lower.split())
+        if "three human-only write endpoints" not in dashboard_collapsed:
+            _fail("B6: dashboard.html header comment must state there are three write endpoints")
+        for endpoint in sorted(expected_write_endpoints):
+            public_token = "post {0}".format(endpoint)
+            if public_token not in skill_lower:
+                _fail("B6: SKILL.md is missing public endpoint wording: {0}".format(public_token))
+            if public_token not in dashboard_collapsed:
+                _fail("B6: dashboard.html is missing public endpoint wording: {0}".format(public_token))
+        footer_match = re.search(
+            r'"key":"footer_reassurance","en":"([^"]+)","zh":"([^"]+)"',
+            dashboard_html,
+        )
+        if not footer_match:
+            _fail("B6: dashboard footer_reassurance bilingual entry is missing")
+        footer_en = footer_match.group(1).lower()
+        footer_zh = footer_match.group(2)
+        if "three" not in footer_en or "\u4e09" not in footer_zh:
+            _fail("B6: dashboard footer must state the endpoint count in EN and ZH")
+        for needle in ("adding a lane", "fix-retry limit", "project name"):
+            if needle not in footer_en:
+                _fail("B6: dashboard footer must name all three writes; missing {0!r}".format(needle))
+        for needle in ("\u65b0\u589e\u901a\u9053", "\u4fee\u590d\u91cd\u8bd5\u4e0a\u9650", "\u9879\u76ee\u540d\u79f0"):
+            if needle not in footer_zh:
+                _fail("B6: dashboard ZH footer must name all three writes; missing {0!r}".format(needle))
+        if "the only thing it can change" in dashboard_collapsed:
+            _fail("B6: dashboard footer must not claim adding a lane is its only write")
 
         # ---- G4: commit-as-lane is the 5th close-the-turn step --------------
         # The single source (protocol.md) must carry a 5th mandatory step:
@@ -1771,8 +2727,10 @@ def main() -> int:
         if "no code ships without a request_id and independent review" not in skill_lower:
             _fail("the single cardinal statement must carry the full rule text")
         # New Stop Condition: asked to change code with no backing request row.
-        if "no backing request row" not in skill_lower:
-            _fail("SKILL.md Stop Conditions must include 'asked to change code with no backing request row'")
+        # A6 single-sources the complete list in loop-state.md; SKILL.md points
+        # there instead of maintaining a second copy.
+        if "no backing request row" not in loop_state_lower:
+            _fail("loop-state.md Stop Conditions must include 'asked to change code with no backing request row'")
 
         # ---- G1: red-capable acceptance criteria ----------------------------
         # protocol.md IMPLEMENTATION_REQUEST template must teach red-capable

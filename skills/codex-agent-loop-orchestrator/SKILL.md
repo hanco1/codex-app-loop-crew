@@ -69,8 +69,8 @@ python <skill_dir>/scripts/install_precommit.py --loop-dir docs/loop
 
 CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no lane is rejected. So pair the install with commit-as-lane guidance and use it on every commit: `CODEX_LANE=<lane> git commit -m "..."`. If a lane cannot reliably export `CODEX_LANE` yet (for example the initial bootstrap commit before any lane exists), keep the guard warn-first by invoking `precommit_scope_guard.py --allow-unscoped` for that commit rather than skipping enforcement wholesale. Without a git repo the guard cannot install and write_scope/leases silently degrade to the honor system - so the git check is not optional.
 
-5. Read `agent-lanes.md`, `requests.md`, `loop-policy.md`, and the relevant lane `current.md` before sending or resuming cross-agent work.
-6. Use `tool_search` for thread tools before assuming they exist. Look for `create_thread`, `read_thread`, `send_message_to_thread`, and `set_thread_title`.
+5. **Open the turn** before acting by following the single authoritative rule in `references/protocol.md` ("Open the turn"); then read the relevant lane `current.md` before cross-agent work.
+6. Use `tool_search` for thread tools before assuming they exist. Look for `create_thread`, `list_threads`, `read_thread`, `send_message_to_thread`, and `set_thread_title`.
 7. On a Codex-app host, `tool_search` first for the cross-thread `codex_app.*` tools (the app's own thread/message tools) and prefer them for delivery. When they are absent (headless `codex exec`, sandboxed, or a non-app host), fall back to the durable file inbox (`deliver_message.py` / `inbox/`); the loop works identically either way because delivery is just one plane over repo files.
 
 ## Intake (before the first request)
@@ -200,7 +200,7 @@ The loop has one optional memory artifact: an append-only decision cache at `doc
 
 ## Dashboard
 
-`scripts/loop_dashboard.py` is a mostly read-only local viewer (binds `127.0.0.1:8765`, stdlib `http.server`) that renders the loop files, the in-process doctor result, a Codex rate-limit usage panel (5h + weekly remaining, read privately from the newest `~/.codex` session JSONL - only rate-limit and token-count numbers, never conversation content), and a `max_fix_cycles` control. It has two human-only write endpoints: `POST /api/lanes` (add one lane) and `POST /api/policy` (set the anti-thrash `max_fix_cycles` cap, 1..10, written to `loop-policy.md`). Agents never read the dashboard and deleting it does not affect the loop.
+`scripts/loop_dashboard.py` is a mostly read-only local viewer (binds `127.0.0.1:8765`, stdlib `http.server`) that renders the loop files, the in-process doctor result, a Codex rate-limit usage panel (5h + weekly remaining, read privately from the newest `~/.codex` session JSONL - only rate-limit and token-count numbers, never conversation content), and a `max_fix_cycles` control. It has three human-only write endpoints: `POST /api/lanes` (add one lane), `POST /api/policy` (set the anti-thrash `max_fix_cycles` cap, 1..10, written to `loop-policy.md`), and `POST /api/project` (set the display-only project name in `project.md`). Agents never read the dashboard and deleting it does not affect the loop.
 
 After the First Move completes (loop bootstrapped, lanes/threads registered), START the dashboard as a background process and report its URL to the user:
 
@@ -316,7 +316,7 @@ Lifecycle:
 PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED
 ```
 
-Reuse the same `request_id` across fix cycles and increment `iteration`. Product is the default owner of final acceptance; review can recommend pass/fail but product decides whether to mark tracker checkpoints complete unless the user assigns that authority elsewhere.
+Reuse the same `request_id` across fix cycles and increment `iteration`. Review returns a pass/fail `verdict`; product alone performs the `ACCEPTED` transition and decides whether to mark tracker checkpoints complete. For user-facing requests, product performs that transition only after the Human-QA Gate passes.
 
 ## Message Protocol
 
@@ -327,7 +327,7 @@ Use these message types:
 - `IMPLEMENTATION_REQUEST`: product -> implementation
 - `IMPLEMENTATION_DONE`: implementation -> product or review
 - `REVIEW_REQUEST`: product or implementation -> review
-- `REVIEW_DONE`: review -> product
+- `REVIEW_DONE`: review -> product; carries a pass/fail `verdict`, never an acceptance transition
 - `FIX_REQUEST`: review or product -> implementation
 - `BLOCKED`: any lane -> product
 - `LOOP_STATUS`: any lane -> product or coordinator
@@ -476,19 +476,9 @@ Only create a continuation thread when `auto_chain_next_session: true`, unchecke
 
 ## Stop Conditions
 
-Stop and report clearly when:
-
-- thread tools are not available and durable fallback cannot be written;
-- a target lane has no verified thread ID and thread creation is not allowed;
-- the current checkpoint is not closed enough to hand off;
-- verification cannot run, or any checkpoint verify command exits non-zero (mark the checkpoint BLOCKED, never accept-with-caveat; the implementation lane runs each verify command and records its real exit code under `docs/loop/evidence/*.json`, and `SHIP_CHECK_OK` is emitted only when the gate reads every such record as exit 0);
-- `budget_exhausted: true` is set in `docs/loop/loop-budget.md`;
-- a blocker needs credentials, approval, external data, or destructive action;
-- lanes would need to write the same files concurrently;
-- a lane is asked to change code with no backing request row (route it through the Human Direct-Ask Ritual first; its cardinal rule applies);
-- the next action would violate `constraints.md`;
-- `max_fix_cycles` is reached;
-- auto-chain would create an unbounded or duplicate continuation.
+Stop and report clearly when any condition in `references/loop-state.md`
+("Stop Conditions") applies. That section is the single complete list; do not
+maintain a second list here.
 
 ---
 

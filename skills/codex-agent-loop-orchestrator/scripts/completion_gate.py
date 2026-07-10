@@ -20,6 +20,9 @@ Each evidence file is a JSON object:
       "ran_at": "2026-06-23T11:00:00Z"
     }
 
+The four string fields must be non-empty. ``ran_at`` must be a valid
+timezone-aware ISO-8601 timestamp.
+
 Exit codes:
     0  SHIP_CHECK_OK   -- gate passed for the scoped request(s)
     1  SHIP_CHECK_FAIL -- a record failed, is malformed, or required evidence is missing
@@ -29,11 +32,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
 REQUIRED_FIELDS = ("request_id", "checkpoint", "command", "exit_code", "ran_at")
+REQUIRED_STRING_FIELDS = ("request_id", "checkpoint", "command", "ran_at")
 
 
 def posix_path(path: Path) -> str:
@@ -58,6 +63,20 @@ def coerce_exit_code(value: Any) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def valid_timestamp(value: Any) -> bool:
+    """Return True for a non-empty ISO-8601 timestamp with a timezone."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip()
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def load_evidence(evidence_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
@@ -93,6 +112,26 @@ def load_evidence(evidence_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
         if missing:
             load_errors.append(
                 {"source": source, "reason": "missing fields: {0}".format(", ".join(missing))}
+            )
+            continue
+        empty_or_non_string = [
+            field
+            for field in REQUIRED_STRING_FIELDS
+            if not isinstance(data.get(field), str) or not data.get(field, "").strip()
+        ]
+        if empty_or_non_string:
+            load_errors.append(
+                {
+                    "source": source,
+                    "reason": "empty or non-string fields: {0}".format(
+                        ", ".join(empty_or_non_string)
+                    ),
+                }
+            )
+            continue
+        if not valid_timestamp(data.get("ran_at")):
+            load_errors.append(
+                {"source": source, "reason": "ran_at is not a valid timezone-aware ISO timestamp"}
             )
             continue
         record = dict(data)
