@@ -74,9 +74,12 @@ Prints ``SMOKE_OK`` and exits 0 only if every assertion passes.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -87,6 +90,7 @@ if _SCRIPTS_DIR not in sys.path:
 import bootstrap_agent_loop  # noqa: E402
 import completion_gate  # noqa: E402
 import deliver_message  # noqa: E402
+import loop_dashboard  # noqa: E402
 import multi_agent_loop_doctor as doctor  # noqa: E402
 import precommit_scope_guard  # noqa: E402
 import record_decision  # noqa: E402
@@ -1733,6 +1737,302 @@ def _check_g22(tmp_path: Path) -> None:
         _fail("G22 (vi): a disjoint --extra-lane must NOT print an overlap advisory; got {0!r}".format(buf2.getvalue()))
 
 
+def _check_g27_gate_manifest_performance(tmp_path: Path) -> None:
+    """Bound the doctor's 800-request gate + manifest pass against O(N^2)."""
+    request_count = 800
+    limit_seconds = request_count * 0.00125
+    loop = tmp_path / "g27_perf_800"
+    evidence_dir = loop / "evidence"
+    messages_dir = loop / "messages"
+    lane_dir = loop / "lanes" / "implementation"
+    evidence_dir.mkdir(parents=True)
+    messages_dir.mkdir()
+    lane_dir.mkdir(parents=True)
+
+    files = {
+        "goal.md": "# Goal\n## Invariants\n- none\n",
+        "tracker.md": "# Tracker\n## Checkpoints\n- [x] perf\n",
+        "constraints.md": "# Constraints\n",
+        "handoff.md": "# Handoff\n",
+        "loop-policy.md": "max_fix_cycles: 3\nauto_chain_next_session: false\n",
+        "loop-budget.md": "budget_exhausted: false\n",
+        "loop-run-log.md": (
+            "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
+        ),
+        "agent-lanes.md": (
+            "| lane | thread_id | role | write_scope | worklog | status | heartbeat | tier |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "| implementation | t | impl | src/** | lanes/implementation/worklog.md | "
+            "active | 2026-07-10T00:00:00Z | highest |\n"
+        ),
+    }
+    for name, text in files.items():
+        (loop / name).write_text(text, encoding="utf-8")
+    for name in ("inbox.md", "outbox.md", "current.md", "worklog.md"):
+        (lane_dir / name).write_text("# x\n", encoding="utf-8")
+
+    request_lines = [
+        "| request_id | status | owner_lane | iteration | source_docs | last_message | next_action | updated_at |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for index in range(request_count):
+        request_id = "REQ-20260710-{0:06d}-implementation".format(index)
+        command = "python -m test_{0}".format(index)
+        status = "ACCEPTED" if index == 0 else "PLANNED"
+        request_lines.append(
+            "| {0} | {1} | implementation | 1 | goal.md | done | none | "
+            "2026-07-10T00:00:00Z |".format(request_id, status)
+        )
+        evidence = {
+            "request_id": request_id,
+            "checkpoint": "perf",
+            "command": command,
+            "exit_code": 0,
+            "ran_at": "2026-07-10T00:00:00Z",
+        }
+        (evidence_dir / (request_id + "-iter-1.json")).write_text(
+            json.dumps(evidence), encoding="utf-8"
+        )
+        if index == 0:
+            request_messages = messages_dir / request_id
+            request_messages.mkdir()
+            (request_messages / "IMPLEMENTATION_REQUEST-iter-1.md").write_text(
+                "# IMPLEMENTATION_REQUEST\nVERIFY `{0}`\n".format(command),
+                encoding="utf-8",
+            )
+    (loop / "requests.md").write_text(
+        "\n".join(request_lines) + "\n", encoding="utf-8"
+    )
+
+    parsed_records, parsed_errors = completion_gate.load_evidence(evidence_dir)
+
+    class ScanBoundRecords(list):
+        """Charge a fixed tax each time code rescans the full evidence list."""
+
+        def __init__(self, records):
+            super().__init__(records)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            time.sleep(0.002)
+            return super().__iter__()
+
+    bounded_records = ScanBoundRecords(parsed_records)
+    original_loader = doctor.completion_gate.load_evidence
+
+    def load_preparsed(_evidence_dir: Path):
+        return bounded_records, parsed_errors
+
+    doctor.completion_gate.load_evidence = load_preparsed
+    try:
+        started = time.perf_counter()
+        result = _doctor(loop)
+        elapsed = time.perf_counter() - started
+    finally:
+        doctor.completion_gate.load_evidence = original_loader
+    if not result["completion_gate_ok"]:
+        _fail("G27 perf fixture must remain gate-green")
+    if result["evidence_manifest_gaps"]:
+        _fail("G27 perf fixture must have complete evidence manifests")
+    print(
+        "G27_PERF_800 seconds={0:.6f} limit={1:.3f}".format(
+            elapsed, limit_seconds
+        )
+    )
+    if elapsed >= limit_seconds:
+        _fail(
+            "G27 doctor gate+manifest pass regressed toward O(N^2): "
+            "{0:.3f}s >= {1:.3f}s for {2} requests".format(
+                elapsed, limit_seconds, request_count
+            )
+        )
+    if bounded_records.iterations > 2:
+        _fail(
+            "G27 doctor rescanned the full evidence list {0} times".format(
+                bounded_records.iterations
+            )
+        )
+
+
+def _check_g27_single_parse_and_decision_cache(tmp_path: Path) -> None:
+    """Pin one run-log read and one hash for repeated source signatures."""
+    loop = tmp_path / "g27_single_parse"
+    _bootstrap(loop)
+    run_log = loop / "loop-run-log.md"
+    run_log.write_text(
+        "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        "| 2026-07-10T00:00:02Z | REQ-G27 | 1 | FIX_REQUESTED | "
+        "IMPLEMENTING | implementation | retry |\n"
+        "| 2026-07-10T00:00:01Z | REQ-G27 | 1 | REVIEWING | "
+        "FIX_REQUESTED | review | fix |\n",
+        encoding="utf-8",
+    )
+    source = loop / "source.md"
+    source.write_text("shared decision source\n", encoding="utf-8")
+    content_hash = record_decision.normalize_then_hash([source])
+    decisions = []
+    for index in range(12):
+        decisions.append(
+            json.dumps(
+                {
+                    "decision_id": "REQ-G27-d{0}".format(index),
+                    "request_id": "REQ-G27",
+                    "source_docs": ["source.md"],
+                    "content_hash": content_hash,
+                }
+            )
+        )
+    (loop / "memory" / "decisions.jsonl").write_text(
+        "\n".join(decisions) + "\n", encoding="utf-8"
+    )
+
+    original_read_text = doctor.read_text
+    original_hash = doctor.normalize_then_hash
+    calls = {"run_log_reads": 0, "hashes": 0}
+
+    def counted_read_text(path: Path) -> str:
+        if Path(path) == run_log:
+            calls["run_log_reads"] += 1
+        return original_read_text(path)
+
+    def counted_hash(paths) -> str:
+        calls["hashes"] += 1
+        return original_hash(paths)
+
+    doctor.read_text = counted_read_text
+    doctor.normalize_then_hash = counted_hash
+    try:
+        result = _doctor(loop)
+    finally:
+        doctor.read_text = original_read_text
+        doctor.normalize_then_hash = original_hash
+
+    if result["decisions"]["stale"] != 0:
+        _fail("G27 decision cache fixture must remain non-stale")
+    if calls != {"run_log_reads": 1, "hashes": 1}:
+        _fail(
+            "G27 per-run sharing expected one run-log read and one repeated-source hash; "
+            "got run_log_reads={0}, hashes={1}".format(
+                calls["run_log_reads"], calls["hashes"]
+            )
+        )
+
+
+def _usage_event(used_percent: float) -> str:
+    return json.dumps(
+        {
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 300,
+                        "resets_at": 1,
+                    },
+                    "plan_type": "pro",
+                },
+            },
+        }
+    )
+
+
+def _check_g27_session_path_and_git_cadence(tmp_path: Path) -> None:
+    """Pin short-TTL session discovery and terminal-loop git cadence."""
+    errors = []
+    probe = loop_dashboard.codex_host_probe
+    home = tmp_path / "g27_codex_home"
+    sessions = home / "sessions" / "2026" / "07" / "10"
+    sessions.mkdir(parents=True)
+    first = sessions / "first.jsonl"
+    first.write_text(_usage_event(10.0) + "\n", encoding="utf-8")
+    os.utime(first, (1000.0, 1000.0))
+
+    original_iglob = probe.glob.iglob
+    original_ttl = getattr(loop_dashboard, "SESSION_PATH_CACHE_TTL_SECONDS", None)
+    scans = {"count": 0}
+
+    def counted_iglob(*args, **kwargs):
+        scans["count"] += 1
+        return original_iglob(*args, **kwargs)
+
+    probe.drop_caches()
+    probe.glob.iglob = counted_iglob
+    try:
+        usage_first = probe.build_usage(home)
+        usage_cached = probe.build_usage(home)
+        second = sessions / "second.jsonl"
+        second.write_text(_usage_event(20.0) + "\n", encoding="utf-8")
+        os.utime(second, (2000.0, 2000.0))
+        loop_dashboard.SESSION_PATH_CACHE_TTL_SECONDS = 0.0
+        usage_newer = probe.build_usage(home)
+        if scans["count"] != 2:
+            errors.append(
+                "G27 newest-session path cache expected two scans across TTL expiry; got {0}".format(
+                    scans["count"]
+                )
+            )
+        if usage_first != usage_cached:
+            errors.append("G27 session path cache changed an unchanged usage snapshot")
+        newer_primary = (usage_newer.get("primary") or {}).get("used_percent")
+        if newer_primary != 20.0:
+            errors.append("G27 TTL expiry must select the newer session by mtime")
+        probe.drop_caches()
+        probe.build_usage(home)
+        if scans["count"] != 3:
+            errors.append("G27 manual refresh must clear the newest-session path cache")
+    finally:
+        probe.glob.iglob = original_iglob
+        if original_ttl is None:
+            try:
+                del loop_dashboard.SESSION_PATH_CACHE_TTL_SECONDS
+            except AttributeError:
+                pass
+        else:
+            loop_dashboard.SESSION_PATH_CACHE_TTL_SECONDS = original_ttl
+        probe.drop_caches()
+
+    repo = tmp_path / "g27_git_cadence"
+    repo.mkdir()
+    _git(repo, "init")
+    loop = repo / "docs" / "loop"
+    loop.mkdir(parents=True)
+    src = repo / "src"
+    src.mkdir()
+    (src / "work.py").write_text("print('dirty')\n", encoding="utf-8")
+    lanes = [{"lane": "implementation", "write_scope": "src/**"}]
+    original_status = doctor._git_status_porcelain
+    status_calls = {"count": 0}
+
+    def counted_status(git_root: Path):
+        status_calls["count"] += 1
+        return original_status(git_root)
+
+    doctor._git_status_porcelain = counted_status
+    try:
+        first_findings = doctor.check_uncommitted_work(loop, lanes, True, True)
+        second_findings = doctor.check_uncommitted_work(loop, lanes, True, True)
+    finally:
+        doctor._git_status_porcelain = original_status
+    cadence = getattr(doctor, "GIT_STATUS_CADENCE_SECONDS", 0)
+    if not 15 <= cadence <= 30:
+        errors.append("G27 git status cadence must be within 15..30 seconds")
+    if status_calls["count"] != 1:
+        errors.append(
+            "G27 repeated terminal-loop checks must reuse git status; got {0} calls".format(
+                status_calls["count"]
+            )
+        )
+    if not first_findings or first_findings != second_findings:
+        errors.append("G27 git cadence must preserve uncommitted_work warning semantics")
+    if errors:
+        _fail("; ".join(errors))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -3271,6 +3571,15 @@ def main() -> int:
 
         # ---- G22: disjoint write-scope rules (doctor + bootstrap + wording) -
         _check_g22(tmp_path)
+
+        # ---- G27: gate + manifest pass remains linear at 800 requests -------
+        _check_g27_gate_manifest_performance(tmp_path)
+
+        # ---- G27: run log + decision sources are shared within one run -------
+        _check_g27_single_parse_and_decision_cache(tmp_path)
+
+        # ---- G27: newest-session and git checks use bounded cadences ---------
+        _check_g27_session_path_and_git_cadence(tmp_path)
 
     print("SMOKE_OK")
     return 0

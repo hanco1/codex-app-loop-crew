@@ -141,10 +141,23 @@ def load_evidence(evidence_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
     return records, load_errors
 
 
+def index_records(
+    records: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Index pre-parsed evidence by stripped request_id, preserving order."""
+    records_by_request: Dict[str, List[Dict[str, Any]]] = {}
+    for record in records:
+        request_id = str(record.get("request_id", "")).strip()
+        if request_id:
+            records_by_request.setdefault(request_id, []).append(record)
+    return records_by_request
+
+
 def evaluate(
     records: List[Dict[str, Any]],
     load_errors: List[Dict[str, str]],
     request_id: Optional[str],
+    records_by_request: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate the gate for a single request or all requests.
 
@@ -161,6 +174,8 @@ def evaluate(
 
     if request_id is None:
         scoped_records = list(records)
+    elif records_by_request is not None:
+        scoped_records = list(records_by_request.get(request_id, []))
     else:
         scoped_records = [rec for rec in records if str(rec.get("request_id", "")).strip() == request_id]
 

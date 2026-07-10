@@ -104,20 +104,19 @@ import bootstrap_agent_loop  # noqa: E402
 import loop_dashboard  # noqa: E402
 
 
-def _find_repo_tool(rel: str) -> Path:
+def _find_repo_tool(rel: str):
     """Walk upward from this file to find a repo tool by relative path.
 
-    Returns the first existing ``<ancestor>/<rel>``; raises AssertionError if
-    none is found. Used to locate ``tools/codex_guard.py`` without hard-coding
-    the depth from scripts/ to the repo root.
+    Returns the first existing ``<ancestor>/<rel>``, or ``None`` when absent.
+    Used to locate optional dev-repo tools without hard-coding the depth from
+    scripts/ to the repo root.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / rel
         if candidate.exists():
             return candidate
-    _fail("could not locate {0} above {1}".format(rel, here))
-    raise AssertionError  # unreachable; keeps type checkers happy
+    return None
 
 
 def _fail(message: str) -> None:
@@ -164,6 +163,16 @@ def _http_get(url: str) -> tuple:
             return resp.getcode(), resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _http_get_with_headers(url: str, headers=None) -> tuple:
+    """Return (status, body_bytes, response_headers) for conditional GET probes."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.getcode(), resp.read(), dict(resp.headers.items())
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers.items())
 
 
 def _http_post_json(url: str, payload: dict) -> tuple:
@@ -396,6 +405,12 @@ def _check_guard_auth_detector() -> None:
     by path so this works regardless of the guard living outside scripts/.
     """
     guard_path = _find_repo_tool("tools/codex_guard.py")
+    if guard_path is None:
+        print(
+            "SKIP: guard auth detector "
+            "(dev-repo tool not present - expected in installed/published layouts)"
+        )
+        return
     tools_dir = str(guard_path.parent)
     if tools_dir not in sys.path:
         sys.path.insert(0, tools_dir)
@@ -737,6 +752,109 @@ def _check_usage_limits_layout_markup(html_full: str) -> None:
     # The refresh wiring must hit the read-only refresh variant.
     if "/api/state?refresh=1" not in html_full:
         _fail("script never calls the /api/state?refresh=1 refresh variant")
+
+
+def _check_poll_coordinator(html_full: str) -> None:
+    """G27: enforce one generation-guarded dashboard poll coordinator."""
+    scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html_full, re.S)
+    poll_scripts = [script for script in scripts if "POLL_MS" in script]
+    if len(poll_scripts) != 1:
+        _fail("G27: expected exactly one executable polling script")
+    script = poll_scripts[0]
+
+    if len(re.findall(r"\bfunction\s+scheduleNext\s*\(", script)) != 1:
+        _fail("G27: polling must have exactly one scheduleNext function")
+    if len(re.findall(r"pollTimer\s*=\s*setTimeout\s*\(", script)) != 1:
+        _fail("G27: pollTimer must have exactly one scheduling call site")
+    if re.search(r"setTimeout\s*\(\s*(?:poll|requestPoll|runPoll)\s*,", script):
+        _fail("G27: bare polling setTimeout found outside scheduleNext")
+
+    required = (
+        "var POLL_MS = 2000",
+        "var pollInFlight = false",
+        "var pollGeneration = 0",
+        "function requestPoll(options)",
+        "function runPoll(request)",
+        "pollGeneration += 1",
+        "request.generation === pollGeneration",
+        "scheduleNext(request.generation)",
+    )
+    for needle in required:
+        if needle not in script:
+            _fail("G27: poll coordinator is missing {0!r}".format(needle))
+    stale_guard = "if (request.generation !== pollGeneration) return;"
+    if script.count(stale_guard) != 2:
+        _fail("G27: stale poll success/error paths must both be generation-guarded")
+
+    # Manual refresh and POST-triggered state refreshes must use the same
+    # coordinator. Direct state fetches are the old double-chain escape hatch.
+    if re.search(r"fetch\s*\(\s*['\"]\/api\/state", script):
+        _fail("G27: state fetch bypasses the poll coordinator")
+    if script.count("requestPoll({ force: true") != 7:
+        _fail("G27: refresh, load-more, and visibility work must route through requestPoll")
+
+    # Conditional polling must reuse the last ETag, treat 304 as connectivity
+    # success, and skip render without breaking the coordinator's finish path.
+    for needle in (
+        "var stateEtag = null",
+        'headers["If-None-Match"] = stateEtag',
+        "if (r.status === 304)",
+        'stateEtag = r.headers.get("ETag")',
+        "if (result.notModified) {",
+        "setConn(true, stateHasStaleData(lastState || {}))",
+    ):
+        if needle not in script:
+            _fail("G27: conditional polling is missing {0!r}".format(needle))
+
+    # Hidden-tab cadence changes through the same coordinator and its sole
+    # scheduling site; becoming visible forces one immediate coordinated poll.
+    visibility_start = script.find('document.addEventListener("visibilitychange"')
+    if visibility_start < 0:
+        _fail("G27: visibilitychange throttle is missing")
+    visibility_body = script[visibility_start:visibility_start + 800]
+    for needle in (
+        "var HIDDEN_POLL_MS = 30000",
+        "document.hidden ? HIDDEN_POLL_MS : POLL_MS",
+        "requestPoll({ force: true, defer: true })",
+        "requestPoll({ force: true })",
+    ):
+        if needle not in script:
+            _fail("G27: visibility throttle missing {0!r}".format(needle))
+    if "setTimeout" in visibility_body:
+        _fail("G27: visibilitychange must not create a second polling timer")
+
+    # Every state read, including refresh=1, uses the coordinator's one fetch
+    # implementation and therefore the same abort timeout/failure path.
+    for needle in (
+        "var FETCH_TIMEOUT_MS = 15000",
+        "new AbortController()",
+        "controller.abort()",
+        "signal: controller.signal",
+        "clearTimeout(fetchTimeoutTimer)",
+        "url: stateUrl(true)",
+    ):
+        if needle not in script:
+            _fail("G27: state fetch timeout missing {0!r}".format(needle))
+
+
+def _check_g27_pagination_markup(html_full: str, rows: list) -> None:
+    """G27 C: every bounded collection has an honest visible-more control."""
+    for collection in ("requests", "evidence", "run-log"):
+        if 'id="{0}-pagination"'.format(collection) not in html_full:
+            _fail("G27 pagination control missing for {0}".format(collection))
+    keys = {row.get("key"): row for row in rows}
+    for key in ("pagination_showing", "pagination_load_more", "pagination_loading"):
+        row = keys.get(key) or {}
+        if not str(row.get("en", "")).strip() or not str(row.get("zh", "")).strip():
+            _fail("G27 pagination i18n key {0!r} needs non-empty EN/ZH".format(key))
+    for needle in (
+        "function renderPagination(collection, meta)",
+        "function loadFullCollection(collection)",
+        'fullCollections[collection] = true',
+        'encodeURIComponent(full.join(","))',
+    ):
+        if needle not in html_full:
+            _fail("G27 pagination wiring missing {0!r}".format(needle))
 
 
 def _check_g18_progress_collapse(html_full: str, rows: list) -> None:
@@ -2101,6 +2219,187 @@ def _check_g26_chunk3_state(tmp_path: Path) -> None:
         _fail("G26 C19: degraded refresh must carry a sanitized reason")
 
 
+def _check_g27_pagination(tmp: Path) -> None:
+    """G27 C: active+recent defaults are bounded, counted, and expandable."""
+    loop = tmp / "g27_pagination"
+    _bootstrap(loop)
+    accepted_ids = ["REQ-20260710-1200{0:02d}-done".format(i) for i in range(60)]
+    active_ids = ["REQ-20260710-130000-live", "REQ-20260710-130001-blocked"]
+    request_rows = []
+    for i, rid in enumerate(accepted_ids):
+        request_rows.append(
+            "| {0} | ACCEPTED | review | 1 | goal.md | done | archive | "
+            "2026-07-10T12:{1:02d}:00Z |\n".format(rid, i % 60)
+        )
+    request_rows.extend((
+        "| {0} | IMPLEMENTING | implementation | 1 | goal.md | work | continue | "
+        "2026-07-10T13:00:00Z |\n".format(active_ids[0]),
+        "| {0} | BLOCKED | product | 2 | goal.md | blocked | ask human | "
+        "2026-07-10T13:01:00Z |\n".format(active_ids[1]),
+    ))
+    (loop / "requests.md").write_text(
+        "# Requests\n\n| request_id | status | owner_lane | iteration | source_docs | "
+        "last_message | next_action | updated_at |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n" + "".join(request_rows),
+        encoding="utf-8",
+    )
+
+    evidence_dir = loop / "evidence"
+    for i in range(105):
+        rid = accepted_ids[i % len(accepted_ids)]
+        record = {
+            "request_id": rid,
+            "checkpoint": "pagination-{0}".format(i),
+            "command": "verify-{0}".format(i),
+            "exit_code": 0,
+            "ran_at": "2026-07-10T12:{0:02d}:{1:02d}Z".format((i // 60) % 60, i % 60),
+        }
+        (evidence_dir / "evidence-{0:03d}.json".format(i)).write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+    for i, rid in enumerate(active_ids):
+        record = {
+            "request_id": rid,
+            "checkpoint": "active-{0}".format(i),
+            "command": "verify-active-{0}".format(i),
+            "exit_code": 0,
+            "ran_at": "2026-07-10T13:0{0}:00Z".format(i),
+        }
+        (evidence_dir / "evidence-active-{0}.json".format(i)).write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+
+    log_rows = []
+    for i, rid in enumerate(accepted_ids + active_ids):
+        to_status = "ACCEPTED" if rid in accepted_ids else (
+            "IMPLEMENTING" if rid == active_ids[0] else "BLOCKED"
+        )
+        log_rows.append(
+            "| 2026-07-10T12:{0:02d}:00Z | {1} | 1 | REQUESTED | {2} | review | row |\n".format(
+                i % 60, rid, to_status
+            )
+        )
+    (loop / "loop-run-log.md").write_text(
+        "# Loop Run Log\n\n| timestamp | request_id | iteration | from_status | "
+        "to_status | lane | note |\n| --- | --- | --- | --- | --- | --- | --- |\n"
+        + "".join(log_rows),
+        encoding="utf-8",
+    )
+
+    server = loop_dashboard.make_server(loop, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = "http://127.0.0.1:{0}/api/state".format(server.server_address[1])
+    try:
+        status, body = _http_get(base)
+        if status != 200:
+            _fail("G27 pagination default request failed with {0}".format(status))
+        state = json.loads(body.decode("utf-8"))
+        meta = state.get("pagination") or {}
+        expected = {
+            "requests": (52, 62),
+            "evidence": (102, 107),
+            "run_log": (52, 62),
+        }
+        actual_lengths = {
+            "requests": len(state.get("requests") or []),
+            "evidence": len((state.get("evidence") or {}).get("records") or []),
+            "run_log": len(state.get("run_log_tail") or []),
+        }
+        for name, pair in expected.items():
+            shown, total = pair
+            item = meta.get(name) or {}
+            if (actual_lengths[name], item.get("shown"), item.get("total"),
+                    item.get("truncated")) != (shown, shown, total, True):
+                _fail("G27 pagination {0} expected {1}/{2} truncated; got {3!r}/{4!r}".format(
+                    name, shown, total, actual_lengths[name], item
+                ))
+
+        status_full, body_full = _http_get(base + "?full=requests,evidence,run_log")
+        if status_full != 200:
+            _fail("G27 full pagination request failed with {0}".format(status_full))
+        full = json.loads(body_full.decode("utf-8"))
+        full_lengths = {
+            "requests": len(full.get("requests") or []),
+            "evidence": len((full.get("evidence") or {}).get("records") or []),
+            "run_log": len(full.get("run_log_tail") or []),
+        }
+        if full_lengths != {"requests": 62, "evidence": 107, "run_log": 62}:
+            _fail("G27 full pagination returned wrong counts: {0!r}".format(full_lengths))
+        if any((full.get("pagination", {}).get(name) or {}).get("truncated")
+               for name in full_lengths):
+            _fail("G27 full pagination must mark every requested collection untruncated")
+        print(
+            "PAGINATION_PROBE requests=52/62 evidence=102/107 run_log=52/62 "
+            "full=62,107,62"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _check_g27_snapshot_cache_and_etag(base: str, loop_dir: Path) -> None:
+    """G27 C: concurrent reads share one build and unchanged state returns 304."""
+    original = loop_dashboard.build_state
+    calls = [0]
+    calls_lock = threading.Lock()
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def counted_build(*args, **kwargs):
+        with calls_lock:
+            calls[0] += 1
+            current = calls[0]
+        if current == 1:
+            build_started.set()
+            if not release_build.wait(timeout=5):
+                _fail("G27 snapshot single-flight probe timed out")
+        return original(*args, **kwargs)
+
+    results = []
+
+    def read_state() -> None:
+        results.append(_http_get(base + "/api/state"))
+
+    loop_dashboard._clear_state_snapshot_cache(loop_dir)
+    loop_dashboard.build_state = counted_build
+    try:
+        first = threading.Thread(target=read_state)
+        second = threading.Thread(target=read_state)
+        first.start()
+        if not build_started.wait(timeout=5):
+            _fail("G27 snapshot builder never started")
+        second.start()
+        time.sleep(0.05)
+        release_build.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+    finally:
+        release_build.set()
+        loop_dashboard.build_state = original
+    if first.is_alive() or second.is_alive():
+        _fail("G27 snapshot single-flight requests did not finish")
+    if calls[0] != 1:
+        _fail("G27 snapshot single-flight expected one build, got {0}".format(calls[0]))
+    if len(results) != 2 or any(status != 200 for status, _ in results):
+        _fail("G27 snapshot single-flight requests did not both return 200")
+
+    status, body, headers = _http_get_with_headers(base + "/api/state")
+    etag = headers.get("ETag") or headers.get("Etag")
+    if status != 200 or not body or not etag:
+        _fail("G27 ETag probe needs a 200 response with body and ETag")
+    status_304, body_304, headers_304 = _http_get_with_headers(
+        base + "/api/state", {"If-None-Match": etag}
+    )
+    if status_304 != 304 or body_304:
+        _fail("G27 If-None-Match expected 304 with no body, got {0}/{1} bytes".format(
+            status_304, len(body_304)
+        ))
+    if (headers_304.get("ETag") or headers_304.get("Etag")) != etag:
+        _fail("G27 304 response must echo the matching ETag")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         loop_dir = Path(tmp) / "loop"
@@ -2147,6 +2446,9 @@ def main() -> int:
         thread.start()
 
         base = "http://127.0.0.1:{0}".format(port)
+
+        _check_g27_snapshot_cache_and_etag(base, loop_dir)
+        _check_g27_pagination(Path(tmp))
         try:
             # Snapshot the whole tree BEFORE any read, to prove GETs don't write.
             snap_before = _snapshot_tree(loop_dir)
@@ -2182,6 +2484,9 @@ def main() -> int:
             # (v4) Layout: Lanes first, then the collapsible Usage & Limits
             # section (with its own localStorage key, live summary, refresh).
             _check_usage_limits_layout_markup(html_full)
+            # (G27) One generation-guarded coordinator owns all state polling;
+            # manual and POST refreshes cannot start durable parallel chains.
+            _check_poll_coordinator(html_full)
             # (Batch 2) Progress view / your-turn banner / blocked taxonomy /
             # project rename / needs-you sort / in-place update / honest
             # heartbeat / usage staleness -- structural markup + wiring hooks.
@@ -2189,6 +2494,7 @@ def main() -> int:
             # (Batch 2 i18n) every new key has a non-empty en AND zh.
             _b2_rows = _extract_i18n_rows(html_full)
             _check_batch2_i18n(_b2_rows)
+            _check_g27_pagination_markup(html_full, _b2_rows)
             # (G26 chunk 3) Honest stale/degraded controls, checker reasons,
             # malformed-evidence notice, and all new EN/ZH strings.
             _check_g26_chunk3_markup(html_full, _b2_rows)

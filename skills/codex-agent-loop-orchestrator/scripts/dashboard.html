@@ -1368,6 +1368,19 @@
       color: var(--muted);
       letter-spacing: .04em;
     }
+    .pagination-control {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pagination-control button { min-height: 44px; }
 
     /* ---------- Add-lane modal ---------- */
     .modal-backdrop {
@@ -1784,6 +1797,10 @@
       <div class="empty" id="requests-empty" data-i18n="requests_empty" style="display:none">
         No requests yet. New work will show up here automatically.
       </div>
+      <div class="pagination-control" id="requests-pagination" aria-live="polite">
+        <span id="requests-pagination-summary"></span>
+        <button type="button" class="ghost" data-full-collection="requests"></button>
+      </div>
     </section>
 
     <!-- Evidence -->
@@ -1812,6 +1829,10 @@
         No evidence recorded yet. This fills in as tasks are checked off.
       </div>
       <div class="hint" id="evidence-errors" style="margin-top:12px"></div>
+      <div class="pagination-control" id="evidence-pagination" aria-live="polite">
+        <span id="evidence-pagination-summary"></span>
+        <button type="button" class="ghost" data-full-collection="evidence"></button>
+      </div>
     </section>
 
     <!-- Run-log timeline -->
@@ -1825,6 +1846,10 @@
       <ul class="timeline" id="runlog"></ul>
       <div class="empty" id="runlog-empty" data-i18n="runlog_empty" style="display:none">
         No history yet. Status changes will appear here as they happen.
+      </div>
+      <div class="pagination-control" id="run-log-pagination" aria-live="polite">
+        <span id="run-log-pagination-summary"></span>
+        <button type="button" class="ghost" data-full-collection="run_log"></button>
       </div>
     </section>
 
@@ -1892,12 +1917,27 @@
   ]}
   </script>
 
+  <script type="application/json" id="i18n-strings-g27" data-i18n-dict>
+  {"strings":[
+    {"key":"pagination_showing","en":"Showing N of N","zh":"当前显示 N / N 条","subtitle_en":"","subtitle_zh":""},
+    {"key":"pagination_load_more","en":"Load more","zh":"加载更多","subtitle_en":"","subtitle_zh":""},
+    {"key":"pagination_loading","en":"Loading...","zh":"正在加载...","subtitle_en":"","subtitle_zh":""}
+  ]}
+  </script>
+
   <script>
     (function () {
       "use strict";
 
       var POLL_MS = 2000;
+      var HIDDEN_POLL_MS = 30000;
+      var FETCH_TIMEOUT_MS = 15000;
       var pollTimer = null;
+      var pollInFlight = false;
+      var pollGeneration = 0;
+      var pollQueue = [];
+      var stateEtag = null;
+      var fullCollections = {};
       var lastState = null;   // most recent /api/state, so the toggle re-renders instantly
 
       // ---- tiny DOM helpers ----
@@ -3214,11 +3254,32 @@
         return "";
       }
 
-      function renderRequests(requests, state) {
+      function renderPagination(collection, meta) {
+        meta = meta || {};
+        var domName = collection === "run_log" ? "run-log" : collection;
+        var control = $(domName + "-pagination");
+        if (!control) return;
+        var truncated = meta.truncated === true;
+        control.style.display = truncated ? "flex" : "none";
+        if (!truncated) return;
+        $(domName + "-pagination-summary").textContent = tfmt(
+          "pagination_showing", [meta.shown || 0, meta.total || 0]
+        );
+        var button = control.querySelector("button[data-full-collection]");
+        if (button) {
+          button.disabled = false;
+          button.textContent = t("pagination_load_more");
+        }
+      }
+
+      function renderRequests(requests, state, meta) {
         var table = $("requests-table");
         var body = $("requests-body");
         body.textContent = "";
-        $("requests-count").textContent = tfmt("requests_count", [requests.length]);
+        $("requests-count").textContent = tfmt(
+          "requests_count", [(meta && meta.total) || requests.length]
+        );
+        renderPagination("requests", meta);
         if (!requests.length) {
           table.style.display = "none";
           var empty = $("requests-empty");
@@ -3256,13 +3317,16 @@
       }
 
       // ---- evidence table ----
-      function renderEvidence(evidence) {
+      function renderEvidence(evidence, meta) {
         var records = (evidence && evidence.records) || [];
         var errors = (evidence && evidence.load_errors) || [];
         var table = $("evidence-table");
         var body = $("evidence-body");
         body.textContent = "";
-        $("evidence-count").textContent = tfmt("evidence_count", [records.length]);
+        $("evidence-count").textContent = tfmt(
+          "evidence_count", [(meta && meta.total) || records.length]
+        );
+        renderPagination("evidence", meta);
 
         if (!records.length) {
           table.style.display = "none";
@@ -3299,10 +3363,13 @@
       }
 
       // ---- run-log timeline ----
-      function renderRunLog(lines) {
+      function renderRunLog(lines, meta) {
         var ul = $("runlog");
         ul.textContent = "";
-        $("runlog-count").textContent = tfmt("runlog_count", [lines.length]);
+        $("runlog-count").textContent = tfmt(
+          "runlog_count", [(meta && meta.total) || lines.length]
+        );
+        renderPagination("run_log", meta);
         if (!lines.length) {
           $("runlog-empty").style.display = "block";
           return;
@@ -3673,6 +3740,14 @@
         }
       }
 
+      function stateHasStaleData(state) {
+        var anyStale = (state.lanes || []).some(function (l) {
+          return l.heartbeat && l.heartbeat.state === "stale";
+        });
+        return anyStale || !!((state.read_errors || []).length)
+          || !!((state.parse_errors || []).length) || state.refresh_degraded === true;
+      }
+
       function render(state) {
         lastState = state;
         var loopDirFull = state.loop_dir || "docs/loop";
@@ -3680,12 +3755,7 @@
         loopDirEl.textContent = shortenLoopDir(loopDirFull);
         loopDirEl.title = loopDirFull;
         var doc = state.doctor || {};
-        var anyStale = (state.lanes || []).some(function (l) {
-          return l.heartbeat && l.heartbeat.state === "stale";
-        });
-        anyStale = anyStale || !!((state.read_errors || []).length)
-          || !!((state.parse_errors || []).length) || state.refresh_degraded === true;
-        setConn(true, anyStale);
+        setConn(true, stateHasStaleData(state));
         renderProject(state.project || {});
         renderDataDiagnostics(state);
         renderCapabilities(state);
@@ -3719,26 +3789,151 @@
         renderPolicy(state.policy || {});
         renderBadges(doc);
         renderLanes(state, analysis, gapOwnerNames);
-        renderRequests(state.requests || [], state);
-        renderEvidence(state.evidence || {});
-        renderRunLog(state.run_log_tail || []);
+        var pagination = state.pagination || {};
+        renderRequests(state.requests || [], state, pagination.requests);
+        renderEvidence(state.evidence || {}, pagination.evidence);
+        renderRunLog(state.run_log_tail || [], pagination.run_log);
         $("foot-generated").textContent =
           t("footer_generated").replace(/--\s*$/, (state.generated_at || "--"));
       }
 
       // ---- polling ----
-      function poll() {
-        fetch("/api/state", { cache: "no-store" })
+      function stateUrl(refresh) {
+        var url = refresh ? "/api/state?refresh=1" : "/api/state";
+        var full = Object.keys(fullCollections).filter(function (name) {
+          return fullCollections[name] === true;
+        }).sort();
+        if (full.length) {
+          url += (url.indexOf("?") === -1 ? "?" : "&")
+            + "full=" + encodeURIComponent(full.join(","));
+        }
+        return url;
+      }
+
+      function loadFullCollection(collection) {
+        if (fullCollections[collection] === true) return;
+        fullCollections[collection] = true;
+        var domName = collection === "run_log" ? "run-log" : collection;
+        var control = $(domName + "-pagination");
+        var button = control && control.querySelector("button[data-full-collection]");
+        if (button) {
+          button.disabled = true;
+          button.textContent = t("pagination_loading");
+        }
+        requestPoll({ force: true,
+          url: stateUrl(false),
+          onError: function () {
+            delete fullCollections[collection];
+            var meta = (((lastState || {}).pagination || {})[collection]) || {};
+            renderPagination(collection, meta);
+          }
+        });
+      }
+
+      function scheduleNext(generation) {
+        if (generation !== pollGeneration || pollTimer !== null) return;
+        var delay = document.hidden ? HIDDEN_POLL_MS : POLL_MS;
+        pollTimer = setTimeout(function () {
+          pollTimer = null;
+          if (generation === pollGeneration) requestPoll();
+        }, delay);
+      }
+
+      function finishPoll(request) {
+        pollInFlight = false;
+        if (typeof request.onFinally === "function") request.onFinally();
+        if (pollQueue.length) {
+          runPoll(pollQueue.shift());
+          return;
+        }
+        if (request.generation === pollGeneration) scheduleNext(request.generation);
+      }
+
+      function runPoll(request) {
+        pollInFlight = true;
+        var headers = {};
+        if (stateEtag) headers["If-None-Match"] = stateEtag;
+        var controller = new AbortController();
+        var fetchTimeoutTimer = setTimeout(function () {
+          controller.abort();
+        }, FETCH_TIMEOUT_MS);
+        fetch(request.url, {
+          cache: "no-store",
+          headers: headers,
+          signal: controller.signal
+        })
           .then(function (r) {
+            if (r.status === 304) return { notModified: true };
             if (!r.ok) throw new Error("HTTP " + r.status);
-            return r.json();
+            stateEtag = r.headers.get("ETag") || stateEtag;
+            return r.json().then(function (state) {
+              return { notModified: false, state: state };
+            });
           })
-          .then(function (state) { render(state); })
-          .catch(function () { setConn(false, false); })
+          .then(function (result) {
+            if (request.generation !== pollGeneration) return;
+            if (result.notModified) {
+              setConn(true, stateHasStaleData(lastState || {}));
+              return;
+            }
+            var state = result.state;
+            render(state);
+            if (typeof request.onSuccess === "function") request.onSuccess(state);
+          })
+          .catch(function (error) {
+            if (request.generation !== pollGeneration) return;
+            setConn(false, false);
+            if (typeof request.onError === "function") request.onError(error);
+          })
           .then(function () {
-            pollTimer = setTimeout(poll, POLL_MS);
+            clearTimeout(fetchTimeoutTimer);
+            finishPoll(request);
           });
       }
+
+      function requestPoll(options) {
+        options = options || {};
+        if (options.force === true) {
+          pollGeneration += 1;
+          if (pollTimer !== null) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+          }
+        }
+        if (options.defer === true) {
+          scheduleNext(pollGeneration);
+          return;
+        }
+        var request = {
+          generation: pollGeneration,
+          url: options.url || stateUrl(false),
+          onSuccess: options.onSuccess,
+          onError: options.onError,
+          onFinally: options.onFinally
+        };
+        if (pollInFlight) {
+          pollQueue.push(request);
+          return;
+        }
+        runPoll(request);
+      }
+
+      document.addEventListener("visibilitychange", function () {
+        if (document.hidden) {
+          requestPoll({ force: true, defer: true });
+        } else {
+          requestPoll({ force: true });
+        }
+      });
+
+      (function wirePaginationControls() {
+        var buttons = document.querySelectorAll("button[data-full-collection]");
+        Array.prototype.forEach.call(buttons, function (button) {
+          button.addEventListener("click", function () {
+            loadFullCollection(button.getAttribute("data-full-collection"));
+          });
+        });
+      })();
 
       // ---- language toggle ----
       function setLang(next) {
@@ -3814,13 +4009,9 @@
         var btn = $("usage-refresh");
         var note = $("usage-refresh-note");
         if (btn) { btn.disabled = true; btn.classList.add("busy"); }
-        fetch("/api/state?refresh=1", { cache: "no-store" })
-          .then(function (r) {
-            if (!r.ok) throw new Error("HTTP " + r.status);
-            return r.json();
-          })
-          .then(function (state) {
-            render(state);
+        requestPoll({ force: true,
+          url: stateUrl(true),
+          onSuccess: function (state) {
             if (note) {
               if (state.cache_drop_failed === true || state.refresh_degraded === true) {
                 note.className = "usage-refresh-note show";
@@ -3830,23 +4021,23 @@
                 note.textContent = "";
               }
             }
-          })
-          .catch(function () {
+          },
+          onError: function () {
             // Keep the last successful values, but label them as stale.
-            setConn(false, false);
             if (note) {
               note.className = "usage-refresh-note show err";
               note.textContent = t("usage_refresh_failed_stale");
             }
-          })
-          .then(function () {
+          },
+          onFinally: function () {
             usageRefreshing = false;
             if (btn) {
               var probe = ((lastState || {}).capabilities || {}).probe || {};
               btn.disabled = probe.available === false;
               btn.classList.remove("busy");
             }
-          });
+          }
+        });
       }
       (function wireUsageRefresh() {
         var btn = $("usage-refresh");
@@ -3916,8 +4107,7 @@
               // "Created lane \"X.\" ..." with X replaced by the lane name.
               msg.textContent = t("modal_form_msg_success")
                 .replace("X", res.body.lane);
-              if (pollTimer) clearTimeout(pollTimer);
-              poll();
+              requestPoll({ force: true });
               setTimeout(closeModal, 700);
             } else {
               msg.className = "form-msg err";
@@ -3982,8 +4172,7 @@
                 msg.textContent = t("project_msg_success");
                 // Close first so renderProject can repaint the input/title.
                 closeRename();
-                if (pollTimer) clearTimeout(pollTimer);
-                poll();
+                requestPoll({ force: true });
               } else {
                 msg.className = "pr-msg err";
                 msg.textContent = t("project_msg_server_error");
@@ -4049,8 +4238,7 @@
               mfcDirty = false;
               msg.textContent = t("mfc_msg_success").replace(/N/, String(mfcCurrent));
               paintMfc();
-              if (pollTimer) clearTimeout(pollTimer);
-              poll();
+              requestPoll({ force: true });
             } else {
               msg.className = "policy-msg err";
               msg.textContent = t("mfc_msg_server_error");
@@ -4068,7 +4256,7 @@
       paintHealthCollapse();   // collapsed by default before the first poll
       paintUsageCollapse();    // Usage & Limits also collapsed by default
       paintProgressCollapse(); // Progress OPEN by default (G18)
-      poll();
+      requestPoll();
     })();
   </script>
 </body>

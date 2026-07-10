@@ -86,15 +86,19 @@ Design constraints honored here:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import socketserver
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs
 
 # Import the loop's own helpers in-process (never a subprocess). They live in
 # scripts/ beside this file. Guard every import so a missing/partial toolkit
@@ -158,6 +162,166 @@ except Exception as exc:
     _warn_module_unavailable("codex_host_probe", PROBE_IMPORT_ERROR)
 
 
+# ``build_usage`` must find the newest session by mtime, but walking every
+# session path on every 2s dashboard poll is unnecessary. Keep only the chosen
+# path for four seconds; after that short TTL the original full mtime scan is
+# mandatory, so a newly-created session can never be pinned indefinitely. A
+# manual refresh clears this path cache together with the probe's content cache.
+SESSION_PATH_CACHE_TTL_SECONDS = 4.0
+_SESSION_PATH_CACHE: dict[str, tuple[float, Optional[Path]]] = {}
+_SESSION_PATH_CACHE_LOCK = threading.Lock()
+_ORIGINAL_NEWEST_SESSION_FILE = (
+    getattr(codex_host_probe, "_newest_session_file", None)
+    if PROBE_AVAILABLE and codex_host_probe is not None
+    else None
+)
+_ORIGINAL_PROBE_DROP_CACHES = (
+    getattr(codex_host_probe, "drop_caches", None)
+    if PROBE_AVAILABLE and codex_host_probe is not None
+    else None
+)
+
+
+def _cached_newest_session_file(codex_home: Path) -> Optional[Path]:
+    """Reuse newest-session discovery briefly, then revalidate by full mtime scan."""
+    if _ORIGINAL_NEWEST_SESSION_FILE is None:
+        return None
+    key = str(codex_home)
+    now = time.monotonic()
+    with _SESSION_PATH_CACHE_LOCK:
+        cached = _SESSION_PATH_CACHE.get(key)
+        if cached is not None:
+            checked_at, path = cached
+            if now - checked_at < SESSION_PATH_CACHE_TTL_SECONDS:
+                return path
+        path = _ORIGINAL_NEWEST_SESSION_FILE(codex_home)
+        _SESSION_PATH_CACHE[key] = (now, path)
+        return path
+
+
+def _drop_probe_and_session_path_caches() -> None:
+    """Clear probe content caches and the G27 short-TTL path cache."""
+    with _SESSION_PATH_CACHE_LOCK:
+        _SESSION_PATH_CACHE.clear()
+    if _ORIGINAL_PROBE_DROP_CACHES is not None:
+        _ORIGINAL_PROBE_DROP_CACHES()
+
+
+if PROBE_AVAILABLE and codex_host_probe is not None:
+    if _ORIGINAL_NEWEST_SESSION_FILE is not None:
+        codex_host_probe._newest_session_file = _cached_newest_session_file
+    if _ORIGINAL_PROBE_DROP_CACHES is not None:
+        codex_host_probe.drop_caches = _drop_probe_and_session_path_caches
+
+
+# A dashboard poll is frequent and the state build can touch many loop files.
+# Cache one immutable-by-convention snapshot per loop briefly. The per-key
+# Event is the single-flight: waiters share the builder's result instead of
+# starting duplicate doctor/evidence/file scans on ThreadingHTTPServer threads.
+STATE_SNAPSHOT_CACHE_TTL_SECONDS = 0.75
+_STATE_SNAPSHOT_CACHE: dict[
+    str, tuple[float, str, tuple[tuple[str, int, int], ...], dict[str, Any]]
+] = {}
+_STATE_SNAPSHOT_FLIGHTS: dict[str, tuple[threading.Event, bool]] = {}
+_STATE_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _state_snapshot_key(loop_dir: Path) -> str:
+    try:
+        return str(loop_dir.resolve())
+    except OSError:
+        return str(loop_dir.absolute())
+
+
+def _clear_state_snapshot_cache(loop_dir: Optional[Path] = None) -> None:
+    """Invalidate one loop snapshot, or all snapshots when no loop is given."""
+    with _STATE_SNAPSHOT_LOCK:
+        if loop_dir is None:
+            _STATE_SNAPSHOT_CACHE.clear()
+        else:
+            _STATE_SNAPSHOT_CACHE.pop(_state_snapshot_key(loop_dir), None)
+
+
+def _state_source_stamp(loop_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Return a cheap invalidation stamp without reading or hashing contents."""
+    paths = list(loop_dir.glob("*.md"))
+    paths.extend(loop_dir.glob("lanes/*/current.md"))
+    paths.extend(loop_dir.glob("lanes/*/worklog.md"))
+    paths.extend(loop_dir.glob("lanes/*/workspace"))
+    paths.extend((loop_dir / "evidence", loop_dir / "memory" / "decisions.jsonl"))
+    stamp: list[tuple[str, int, int]] = []
+    for path in sorted(set(paths), key=lambda item: str(item)):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stamp.append((str(path), stat.st_mtime_ns, stat.st_size))
+    return tuple(stamp)
+
+
+def _get_state_snapshot(loop_dir: Path, refresh: bool = False) -> dict[str, Any]:
+    """Return a short-lived state snapshot with per-loop single-flight builds."""
+    key = _state_snapshot_key(loop_dir)
+    codex_home = os.environ.get("CODEX_HOME", "")
+    force_refresh = refresh
+    while True:
+        now = time.monotonic()
+        source_stamp = _state_source_stamp(loop_dir)
+        should_build = False
+        with _STATE_SNAPSHOT_LOCK:
+            cached = _STATE_SNAPSHOT_CACHE.get(key)
+            if not force_refresh and cached is not None:
+                built_at, cached_codex_home, cached_stamp, state = cached
+                if (cached_codex_home == codex_home
+                        and cached_stamp == source_stamp
+                        and now - built_at < STATE_SNAPSHOT_CACHE_TTL_SECONDS):
+                    return state
+
+            flight = _STATE_SNAPSHOT_FLIGHTS.get(key)
+            if flight is None:
+                event = threading.Event()
+                _STATE_SNAPSHOT_FLIGHTS[key] = (event, force_refresh)
+                should_build = True
+                flight_was_refresh = force_refresh
+            else:
+                event, flight_was_refresh = flight
+
+        if not should_build:
+            event.wait()
+            # A refresh never accepts an ordinary build that happened to be in
+            # progress first. It waits, then performs one forced rebuild. Two
+            # refresh callers do share the same forced build.
+            if force_refresh and not flight_was_refresh:
+                continue
+            force_refresh = False
+            continue
+
+        try:
+            state = build_state(loop_dir, refresh=force_refresh)
+        except Exception:
+            with _STATE_SNAPSHOT_LOCK:
+                _STATE_SNAPSHOT_FLIGHTS.pop(key, None)
+                event.set()
+            raise
+        with _STATE_SNAPSHOT_LOCK:
+            _STATE_SNAPSHOT_CACHE[key] = (
+                time.monotonic(), codex_home, source_stamp, state
+            )
+            _STATE_SNAPSHOT_FLIGHTS.pop(key, None)
+            event.set()
+        return state
+
+
+def _state_etag(state: dict[str, Any]) -> str:
+    """Hash semantic state while excluding the rebuild timestamp heartbeat."""
+    semantic = dict(state)
+    semantic.pop("generated_at", None)
+    encoded = json.dumps(
+        semantic, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return '"{0}"'.format(hashlib.sha256(encoded).hexdigest())
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -192,8 +356,14 @@ RESERVED_LANE_NAMES = frozenset(
 # How many trailing worklog rows and run-log rows to surface. Small on purpose:
 # the dashboard is a glance, not an archive.
 WORKLOG_TAIL = 15
-RUNLOG_TAIL = 20
+REQUESTS_PAGE_SIZE = 50
+EVIDENCE_PAGE_SIZE = 100
+RUNLOG_PAGE_SIZE = 50
 CURRENT_MAX_CHARS = 4000
+
+_INACTIVE_REQUEST_STATUSES = frozenset(
+    {"ACCEPTED", "CANCELED", "CANCELLED", "CLOSED", "DONE"}
+)
 
 # Registry columns, in the order bootstrap writes them. The trailing ``tier`` is
 # the F8 advisory model-tier column; parsing here is header-driven so the exact
@@ -1293,7 +1463,9 @@ def build_state(
     # DATA rows by their timestamp cell (header/separator preserved) so the tail
     # shows the chronologically-latest transitions, matching the timestamp-sorted
     # reconstruction the in-process doctor now uses.
-    run_log_tail = _run_log_tail_sorted(run_log_text, RUNLOG_TAIL)
+    # Keep the sorted source collection in the cached snapshot. The API layer
+    # applies the active+recent bound (or ?full=run_log) without rebuilding.
+    run_log_tail = _run_log_tail_sorted(run_log_text, 0)
 
     # Doctor snapshot (in-process).
     doctor_snapshot = _doctor_snapshot(loop_dir)
@@ -1411,6 +1583,130 @@ def build_state(
         "project": project,
         "awaiting_objective": awaiting_objective,
     }
+
+
+def _request_is_active(request: dict[str, Any]) -> bool:
+    status = str(request.get("status", "")).strip().upper()
+    return status not in _INACTIVE_REQUEST_STATUSES
+
+
+def _recent_key(value: str, index: int) -> tuple[datetime, int]:
+    return (_parse_timestamp(value) or datetime.fromtimestamp(0, timezone.utc), index)
+
+
+def _active_plus_recent(
+    items: list[Any], active_indexes: set[int], recent_indexes: list[int], limit: int
+) -> list[Any]:
+    keep = set(active_indexes)
+    keep.update(recent_indexes[-limit:] if limit > 0 else recent_indexes)
+    return [item for index, item in enumerate(items) if index in keep]
+
+
+def _bounded_requests(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    active = {index for index, row in enumerate(requests) if _request_is_active(row)}
+    inactive = [index for index in range(len(requests)) if index not in active]
+    inactive.sort(
+        key=lambda index: _recent_key(
+            str(requests[index].get("updated_at", "")
+                or requests[index].get("updated", "")),
+            index,
+        )
+    )
+    return _active_plus_recent(requests, active, inactive, REQUESTS_PAGE_SIZE)
+
+
+def _bounded_evidence(
+    records: list[dict[str, Any]], active_request_ids: set[str]
+) -> list[dict[str, Any]]:
+    active = {
+        index for index, row in enumerate(records)
+        if str(row.get("request_id", "")).strip() in active_request_ids
+    }
+    inactive = [index for index in range(len(records)) if index not in active]
+    inactive.sort(
+        key=lambda index: _recent_key(str(records[index].get("ran_at", "")), index)
+    )
+    return _active_plus_recent(records, active, inactive, EVIDENCE_PAGE_SIZE)
+
+
+def _run_log_data(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Return (line, timestamp, request_id) for actual table data rows."""
+    data: list[tuple[str, str, str]] = []
+    for line in lines:
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = _split_md_row(line)
+        if not cells or all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+        if cells[0].strip().lower() in ("timestamp", "at", "time", "delivered_at"):
+            continue
+        timestamp = cells[0].strip()
+        request_id = cells[1].strip() if len(cells) > 1 else ""
+        data.append((line, timestamp, request_id))
+    return data
+
+
+def _bounded_run_log(lines: list[str], active_request_ids: set[str]) -> list[str]:
+    data = _run_log_data(lines)
+    active = {
+        index for index, item in enumerate(data) if item[2] in active_request_ids
+    }
+    inactive = [index for index in range(len(data)) if index not in active]
+    inactive.sort(key=lambda index: _recent_key(data[index][1], index))
+    selected = _active_plus_recent(data, active, inactive, RUNLOG_PAGE_SIZE)
+    return [item[0] for item in selected]
+
+
+def _paginate_state(
+    state: dict[str, Any], full_collections: set[str]
+) -> dict[str, Any]:
+    """Project cached full state into an honest active+recent API response."""
+    projected = dict(state)
+    all_requests = list(state.get("requests") or [])
+    active_request_ids = {
+        str(row.get("request_id", "")).strip()
+        for row in all_requests if _request_is_active(row)
+    }
+    requests = (
+        all_requests if "requests" in full_collections else _bounded_requests(all_requests)
+    )
+    projected["requests"] = requests
+
+    source_evidence = state.get("evidence") or {}
+    evidence = dict(source_evidence)
+    all_evidence = list(source_evidence.get("records") or [])
+    evidence_records = (
+        all_evidence if "evidence" in full_collections
+        else _bounded_evidence(all_evidence, active_request_ids)
+    )
+    evidence["records"] = evidence_records
+    projected["evidence"] = evidence
+
+    all_run_log = [item[0] for item in _run_log_data(list(state.get("run_log_tail") or []))]
+    run_log = (
+        all_run_log if "run_log" in full_collections
+        else _bounded_run_log(list(state.get("run_log_tail") or []), active_request_ids)
+    )
+    projected["run_log_tail"] = run_log
+
+    projected["pagination"] = {
+        "requests": {
+            "shown": len(requests),
+            "total": len(all_requests),
+            "truncated": len(requests) < len(all_requests),
+        },
+        "evidence": {
+            "shown": len(evidence_records),
+            "total": len(all_evidence),
+            "truncated": len(evidence_records) < len(all_evidence),
+        },
+        "run_log": {
+            "shown": len(run_log),
+            "total": len(all_run_log),
+            "truncated": len(run_log) < len(all_run_log),
+        },
+    }
+    return projected
 
 
 # ---------------------------------------------------------------------------
@@ -1758,6 +2054,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_state_json(self, state: dict[str, Any]) -> None:
+        """Send state with a stable validator, or an empty 304 on a match."""
+        etag = _state_etag(state)
+        candidates = [
+            item.strip() for item in self.headers.get("If-None-Match", "").split(",")
+        ]
+        if "*" in candidates or etag in candidates:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = json.dumps(state, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("ETag", etag)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_html(self, status: int, text: str) -> None:
         body = text.encode("utf-8")
         self.send_response(status)
@@ -1779,6 +2097,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Strip any query string; we route on the path alone.
         return self.path.split("?", 1)[0].rstrip("/") or "/"
 
+    def _query_params(self) -> dict[str, list[str]]:
+        parts = self.path.split("?", 1)
+        return parse_qs(parts[1], keep_blank_values=True) if len(parts) > 1 else {}
+
     def _wants_refresh(self) -> bool:
         """True when the request carries a ``refresh=1`` query flag.
 
@@ -1786,14 +2108,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         usage/account caches and rescan; it opens no new endpoint and writes
         nothing. Parsed by hand (no extra import) as a simple ``key=value`` scan.
         """
-        parts = self.path.split("?", 1)
-        if len(parts) < 2 or not parts[1]:
-            return False
-        for pair in parts[1].split("&"):
-            key, _, value = pair.partition("=")
-            if key == "refresh" and value in ("1", "true", "yes"):
-                return True
-        return False
+        return any(
+            value in ("1", "true", "yes")
+            for value in self._query_params().get("refresh", [])
+        )
+
+    def _full_collections(self) -> set[str]:
+        allowed = {"requests", "evidence", "run_log"}
+        requested: set[str] = set()
+        for value in self._query_params().get("full", []):
+            requested.update(part.strip() for part in value.split(","))
+        return requested & allowed
 
     # -- verbs --------------------------------------------------------------
 
@@ -1814,11 +2139,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # responding (read-only; still not a new endpoint, still no writes).
             refresh = self._wants_refresh()
             try:
-                state = build_state(self.loop_dir, refresh=refresh)
+                state = _get_state_snapshot(self.loop_dir, refresh=refresh)
+                state = _paginate_state(state, self._full_collections())
             except Exception as exc:  # never let a read crash the server
                 self._send_json(500, {"error": "failed to build state: {0}".format(exc)})
                 return
-            self._send_json(200, state)
+            self._send_state_json(state)
             return
         # Unknown GET path.
         self._send_json(404, {"error": "not found", "path": route})
@@ -1866,6 +2192,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result = set_max_fix_cycles(self.loop_dir, payload.get("max_fix_cycles"))
         else:  # /api/project
             result = set_project_name(self.loop_dir, payload.get("name"))
+        if result.get("ok"):
+            _clear_state_snapshot_cache(self.loop_dir)
         self._send_json(200 if result.get("ok") else 400, result)
 
     # Explicitly reject other verbs with 405 (no writes anywhere else).

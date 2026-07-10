@@ -71,6 +71,8 @@ import argparse
 import json
 import re
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -179,6 +181,16 @@ UNCOMMITTED_EXEMPT_GLOBS = [
     "**/docs/loop/dashboard.*",
 ]
 
+# Terminal/paused loops do not need a fresh subprocess on every dashboard poll.
+# Cache the raw porcelain result in-process for 20 seconds, invalidating early
+# when the git index mtime/size changes. Warning classification still runs on
+# every doctor pass, so this only changes the cadence of the expensive command.
+GIT_STATUS_CADENCE_SECONDS = 20.0
+_GIT_STATUS_CACHE: dict[
+    str, tuple[float, tuple[str, int, int], Optional[list[tuple[str, str]]]]
+] = {}
+_GIT_STATUS_CACHE_LOCK = threading.Lock()
+
 # G12 handoff sensitive-content scan (WARNING-only). Before a handoff/auto-chain
 # seed is trusted, obvious sensitive material in it is flagged so the human
 # references-not-quotes it. Pure stdlib regex, no new dependency.
@@ -267,8 +279,8 @@ def observed_tier_tag(current_text: str) -> str:
     return ""
 
 
-def parse_run_log_sorted(loop_dir: Path) -> list[dict[str, str]]:
-    """Parse ``loop-run-log.md`` rows and sort them by their timestamp.
+def _sort_run_log_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return run-log rows in stable timestamp order.
 
     G11(b): the run log is APPEND-ONLY, so a late-append honest recovery row can
     land out of chronological order (run 2 rows 37-39 were exactly this -- legal,
@@ -281,7 +293,6 @@ def parse_run_log_sorted(loop_dir: Path) -> list[dict[str, str]]:
     reconstructions (e.g. the human-QA hold) are already order-independent; this
     helper guarantees the ORDERED ones agree on a shuffled log too.
     """
-    rows = parse_table(loop_dir / "loop-run-log.md")
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def _key(indexed: tuple[int, dict[str, str]]) -> tuple[datetime, int]:
@@ -298,6 +309,11 @@ def parse_run_log_sorted(loop_dir: Path) -> list[dict[str, str]]:
         return (parsed or epoch, idx)
 
     return [row for _, row in sorted(enumerate(rows), key=_key)]
+
+
+def parse_run_log_sorted(loop_dir: Path) -> list[dict[str, str]]:
+    """Compatibility wrapper for callers outside one doctor summary run."""
+    return load_run_log_snapshot(loop_dir)["rows"]
 
 
 def find_checkboxes(text: str) -> list[dict[str, str]]:
@@ -384,17 +400,25 @@ def read_max_fix_cycles(policy_text: str) -> int:
         return DEFAULT_MAX_FIX_CYCLES
 
 
-def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
-    """Return WARNING-only diagnostics for malformed run-log data rows."""
+def load_run_log_snapshot(
+    loop_dir: Path,
+    text: Optional[str] = None,
+    source_present: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Read, parse, diagnose, and sort the run log exactly once."""
     path = loop_dir / "loop-run-log.md"
-    if not path.exists():
-        return []
-    text = read_text(path)
+    if source_present is None:
+        source_present = path.exists()
+    if text is None:
+        if not source_present:
+            return {"rows": [], "warnings": []}
+        text = read_text(path)
     if not text.strip():
-        return []
+        return {"rows": [], "warnings": []}
     headers: Optional[list[str]] = None
     header_line = 0
     delimiter_seen = False
+    rows: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.lstrip().startswith("|"):
@@ -412,6 +436,7 @@ def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
             continue
         padded = cells + [""] * max(0, len(headers) - len(cells))
         row = dict(zip(headers, padded[: len(headers)]))
+        rows.append(row)
         request_id = (
             row.get("request_id", "") or row.get("request", "") or row.get("req", "")
         ).strip()
@@ -501,7 +526,12 @@ def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
                     "{1}".format(header_line, ", ".join(missing)),
                 }
             )
-    return warnings
+    return {"rows": _sort_run_log_rows(rows), "warnings": warnings}
+
+
+def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
+    """Return WARNING-only diagnostics for malformed run-log data rows."""
+    return load_run_log_snapshot(loop_dir)["warnings"]
 
 
 _POLICY_KEY_RE = re.compile(r"^\s*(?:[-*]\s*)?max_fix_cycles\s*:", re.IGNORECASE)
@@ -571,7 +601,9 @@ def table_key_line_numbers(path: Path, key: str) -> dict[str, int]:
     return result
 
 
-def count_fix_cycles_from_log(loop_dir: Path) -> dict[str, int]:
+def count_fix_cycles_from_log(
+    loop_dir: Path, rows: Optional[list[dict[str, str]]] = None
+) -> dict[str, int]:
     """Count FIX_REQUESTED<->IMPLEMENTING transitions per request_id.
 
     The append-only ``loop-run-log.md`` is the durable transition log. We count
@@ -584,7 +616,8 @@ def count_fix_cycles_from_log(loop_dir: Path) -> dict[str, int]:
     counts: dict[str, int] = {}
     # G11(b): reconstruct from timestamp-ordered rows so a late-append recovery
     # row cannot change the reconstructed transition count on a shuffled log.
-    rows = parse_run_log_sorted(loop_dir)
+    if rows is None:
+        rows = parse_run_log_sorted(loop_dir)
     for row in rows:
         request_id = (
             row.get("request_id", "")
@@ -703,6 +736,7 @@ def check_decision_drift(loop_dir: Path) -> dict[str, Any]:
         # do not flag anything stale (fail open, never a false stale).
         return {"warnings": warnings, "decisions": counts}
 
+    source_hash_cache: dict[tuple[tuple[str, int, int], ...], str] = {}
     for obj in active:
         decision_id = str(obj.get("decision_id", "")).strip()
         source_docs = obj.get("source_docs", []) or []
@@ -710,7 +744,10 @@ def check_decision_drift(loop_dir: Path) -> dict[str, Any]:
             source_docs = []
         source_docs = [str(doc) for doc in source_docs]
 
-        missing_docs = [doc for doc in source_docs if not Path(loop_dir_join(loop_dir, doc)).exists()]
+        resolved_paths = [loop_dir_join(loop_dir, doc) for doc in source_docs]
+        missing_docs = [
+            doc for doc, path in zip(source_docs, resolved_paths) if not path.exists()
+        ]
         for doc in missing_docs:
             warnings.append(
                 {
@@ -720,8 +757,18 @@ def check_decision_drift(loop_dir: Path) -> dict[str, Any]:
                 }
             )
 
+        signature: list[tuple[str, int, int]] = []
+        for path in resolved_paths:
+            try:
+                stat = path.stat()
+                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                signature.append((str(path), -1, -1))
+        cache_key = tuple(signature)
+        if cache_key not in source_hash_cache:
+            source_hash_cache[cache_key] = normalize_then_hash(resolved_paths)
         stored_hash = str(obj.get("content_hash", "")).strip()
-        live_hash = normalize_then_hash([loop_dir_join(loop_dir, doc) for doc in source_docs])
+        live_hash = source_hash_cache[cache_key]
         if stored_hash and stored_hash != live_hash:
             counts["stale"] += 1
             changed = ", ".join(source_docs) if source_docs else "(no source docs listed)"
@@ -1125,6 +1172,44 @@ def _git_status_porcelain(git_root: Path) -> Optional[list[tuple[str, str]]]:
     return entries
 
 
+def _git_status_index_signature(git_root: Path) -> tuple[str, int, int]:
+    """Return the git-dir/index stat key used to invalidate cadence results."""
+    git_dir = find_git_dir(git_root)
+    if git_dir is None:
+        return ("", -1, -1)
+    index_path = git_dir / "index"
+    try:
+        stat = index_path.stat()
+        return (str(git_dir), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (str(git_dir), -1, -1)
+
+
+def _git_status_porcelain_cached(
+    git_root: Path,
+) -> Optional[list[tuple[str, str]]]:
+    """Reuse git status within the documented 20-second doctor cadence."""
+    try:
+        root_key = str(git_root.resolve())
+    except OSError:
+        root_key = str(git_root)
+    signature = _git_status_index_signature(git_root)
+    now = time.monotonic()
+    with _GIT_STATUS_CACHE_LOCK:
+        cached = _GIT_STATUS_CACHE.get(root_key)
+        if cached is not None:
+            checked_at, cached_signature, entries = cached
+            if (
+                cached_signature == signature
+                and now - checked_at < GIT_STATUS_CADENCE_SECONDS
+            ):
+                return None if entries is None else list(entries)
+        entries = _git_status_porcelain(git_root)
+        stored = None if entries is None else list(entries)
+        _GIT_STATUS_CACHE[root_key] = (now, signature, stored)
+        return None if stored is None else list(stored)
+
+
 def check_uncommitted_work(
     loop_dir: Path,
     lanes: list[dict[str, str]],
@@ -1150,7 +1235,7 @@ def check_uncommitted_work(
     # The working tree root is the parent of the .git dir (for a normal repo).
     # find_git_dir returns the .git directory itself; its parent is the worktree.
     git_root = git_dir.parent
-    entries = _git_status_porcelain(git_root)
+    entries = _git_status_porcelain_cached(git_root)
     if entries is None:
         # Fail silent-safe: could not determine status, so do not warn.
         return []
@@ -1391,7 +1476,9 @@ def blocked_recommended_answer(loop_dir: Path, request_id: str) -> str:
     return ""
 
 
-def requests_held_for_human_qa(loop_dir: Path) -> set[str]:
+def requests_held_for_human_qa(
+    loop_dir: Path, rows: Optional[list[dict[str, str]]] = None
+) -> set[str]:
     """G3: request_ids currently held awaiting a human-QA sign-off.
 
     A user-facing slice, after REVIEW_DONE, HOLDS at REVIEWING while product asks
@@ -1414,7 +1501,8 @@ def requests_held_for_human_qa(loop_dir: Path) -> set[str]:
     # G11(b): read timestamp-ordered rows. The requested/confirmed reconstruction
     # is already set-based (order-independent), but sorting keeps every run-log
     # reader on one ordering so a shuffled log yields identical conclusions.
-    rows = parse_run_log_sorted(loop_dir)
+    if rows is None:
+        rows = parse_run_log_sorted(loop_dir)
     for row in rows:
         request_id = (
             row.get("request_id", "")
@@ -1460,10 +1548,41 @@ def normalize_verify_command(command: str) -> str:
     return " ".join((command or "").strip().split())
 
 
+def load_evidence_manifests(loop_dir: Path) -> dict[str, dict[str, Any]]:
+    """Read every archived implementation manifest once and index by request."""
+    manifests: dict[str, dict[str, Any]] = {}
+    messages_dir = loop_dir / "messages"
+    if not messages_dir.is_dir():
+        return manifests
+    paths = sorted(
+        path
+        for path in messages_dir.glob("*/IMPLEMENTATION_REQUEST*.md")
+        if path.is_file()
+    )
+    for path in paths:
+        request_id = path.parent.name
+        entry = manifests.setdefault(
+            request_id, {"manifest_files": [], "expected_commands": set()}
+        )
+        entry["manifest_files"].append(
+            str(path.relative_to(loop_dir)).replace("\\", "/")
+        )
+        entry["expected_commands"].update(
+            normalize_verify_command(match.group("command"))
+            for match in VERIFY_COMMAND_RE.finditer(read_text(path))
+            if normalize_verify_command(match.group("command"))
+        )
+    for entry in manifests.values():
+        entry["expected_commands"] = sorted(entry["expected_commands"])
+    return manifests
+
+
 def check_evidence_manifest_coverage(
     loop_dir: Path,
     requests: list[dict[str, Any]],
     evidence_records: list[dict[str, Any]],
+    records_by_request: Optional[dict[str, list[dict[str, Any]]]] = None,
+    manifests_by_request: Optional[dict[str, dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Compare archived VERIFY manifests with recorded evidence commands.
 
@@ -1472,11 +1591,14 @@ def check_evidence_manifest_coverage(
     all explicit gaps. The caller exposes them as warnings; the completion gate
     remains independently strict.
     """
-    records_by_request: dict[str, list[dict[str, Any]]] = {}
-    for record in evidence_records:
-        request_id = str(record.get("request_id", "")).strip()
-        if request_id:
-            records_by_request.setdefault(request_id, []).append(record)
+    if records_by_request is None:
+        records_by_request = {}
+        for record in evidence_records:
+            request_id = str(record.get("request_id", "")).strip()
+            if request_id:
+                records_by_request.setdefault(request_id, []).append(record)
+    if manifests_by_request is None:
+        manifests_by_request = load_evidence_manifests(loop_dir)
 
     gaps: list[dict[str, Any]] = []
     for request in requests:
@@ -1487,23 +1609,9 @@ def check_evidence_manifest_coverage(
         if not request_id:
             continue
 
-        message_dir = loop_dir / "messages" / request_id
-        manifest_paths = (
-            sorted(path for path in message_dir.glob("IMPLEMENTATION_REQUEST*.md") if path.is_file())
-            if message_dir.is_dir()
-            else []
-        )
-        manifest_files = [
-            str(path.relative_to(loop_dir)).replace("\\", "/") for path in manifest_paths
-        ]
-        expected_commands = sorted(
-            {
-                normalize_verify_command(match.group("command"))
-                for path in manifest_paths
-                for match in VERIFY_COMMAND_RE.finditer(read_text(path))
-                if normalize_verify_command(match.group("command"))
-            }
-        )
+        manifest = manifests_by_request.get(request_id, {})
+        manifest_files = list(manifest.get("manifest_files", []))
+        expected_commands = list(manifest.get("expected_commands", []))
         request_records = records_by_request.get(request_id, [])
         evidence_commands = {
             normalize_verify_command(str(record.get("command", "")))
@@ -1515,7 +1623,7 @@ def check_evidence_manifest_coverage(
         ]
 
         reason = ""
-        if not manifest_paths:
+        if not manifest_files:
             reason = "missing_manifest"
         elif not expected_commands:
             reason = "empty_manifest"
@@ -1548,6 +1656,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     handoff_text = read_text(loop_dir / "handoff.md")
     policy_text = read_text(loop_dir / "loop-policy.md")
     budget_text = read_text(loop_dir / "loop-budget.md")
+    run_log_path = loop_dir / "loop-run-log.md"
+    run_log_text = read_text(run_log_path)
     all_loop_text = "\n".join(read_text(path) for path in paths.values())
     stale_scan_text = "\n".join(
         [
@@ -1562,7 +1672,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     blocked = [item for item in checkboxes if item["status"] == "!"]
 
     max_fix_cycles = read_max_fix_cycles(policy_text)
-    control_plane_warnings = diagnose_run_log(loop_dir)
+    run_log_snapshot = load_run_log_snapshot(
+        loop_dir, text=run_log_text, source_present=run_log_path.exists()
+    )
+    run_log_rows = run_log_snapshot["rows"]
+    control_plane_warnings = list(run_log_snapshot["warnings"])
     control_plane_warnings.extend(
         diagnose_policy(policy_text, (loop_dir / "loop-policy.md").exists())
     )
@@ -1633,7 +1747,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             }
         )
 
-    log_fix_counts = count_fix_cycles_from_log(loop_dir)
+    log_fix_counts = count_fix_cycles_from_log(loop_dir, run_log_rows)
 
     evidence_dir = loop_dir / "evidence"
     evidence_dir_present = evidence_dir.exists() and evidence_dir.is_dir()
@@ -1642,11 +1756,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     gate_load_errors: list[dict[str, str]] = []
     if gate_available:
         gate_records, gate_load_errors = completion_gate.load_evidence(evidence_dir)
-    evidence_request_ids = {
-        str(record.get("request_id", "")).strip()
-        for record in gate_records
-        if str(record.get("request_id", "")).strip()
-    }
+    records_by_request = (
+        completion_gate.index_records(gate_records) if gate_available else {}
+    )
+    evidence_request_ids = set(records_by_request)
 
     requests = parse_table(loop_dir / "requests.md")
     request_line_numbers = table_key_line_numbers(loop_dir / "requests.md", "request_id")
@@ -1838,7 +1951,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # manifest. Compare their command set with real JSON evidence records. This
     # is a warning-level cross-check; B3 separately blocks auto-chain on gaps.
     evidence_manifest_gaps = check_evidence_manifest_coverage(
-        loop_dir, request_summaries, gate_records
+        loop_dir,
+        request_summaries,
+        gate_records,
+        records_by_request=records_by_request,
+        manifests_by_request=load_evidence_manifests(loop_dir),
     )
 
     # completion_gate_ok: run the real deterministic gate in-process. Load the
@@ -1864,7 +1981,9 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             # all exit 0. Malformed files are fail-closed on their own via the
             # `not gate_load_errors` term below and the gate_malformed_evidence
             # issues, so they must not smear a failure across every request_id.
-            gate_result = completion_gate.evaluate(gate_records, [], request_id)
+            gate_result = completion_gate.evaluate(
+                gate_records, [], request_id, records_by_request
+            )
             if not gate_result["ok"]:
                 gate_failed_requests.append(request_id)
             else:
@@ -1888,7 +2007,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # review and machine evidence HOLDS at REVIEWING until the human operates it
     # and confirms; without this exclusion the done-by-review signal below would
     # misreport that legitimate hold as a lane to nudge.
-    held_for_human_qa = requests_held_for_human_qa(loop_dir)
+    held_for_human_qa = requests_held_for_human_qa(loop_dir, run_log_rows)
 
     # G20: an honest ``reason`` on each stall record + a grace window for the
     # REVIEWING case. The three cases and what the files actually PROVE:
