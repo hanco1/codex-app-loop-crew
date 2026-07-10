@@ -13,6 +13,8 @@
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-1A1A1A">
 </p>
 
+English | [简体中文](README.zh-CN.md)
+
 <p align="center">
   <a href="#quick-start">Quick Start</a>
   |
@@ -52,27 +54,6 @@ Do not invoke or add any other skill unless I explicitly request it.
 
 After the First Move, report the exact dashboard URL.
 ```
-
-<details>
-<summary>中文启动模板</summary>
-
-```text
-请使用 $codex-agent-loop-orchestrator 管理这个项目。
-
-完成：<用一句话写明目标、具体交付物和可检查的完成条件>。
-
-真实数据必须留在本地。不要上传、引用、记录、提交真实隐私数据，也不要把原始数据复制进 loop 文件或 handoff；只允许使用我批准的脱敏样本或字段结构说明。
-
-一次只问一个 intake 问题，并附上你的推荐答案；当目标和 Done-When 已经可以检查时，立即停止提问。
-
-创建任何对话之前，先提出满足目标所需的最小专业分工 lane 方案，确保写入范围两两不重叠，并等待我确认。
-
-除非我明确要求，否则不要调用或添加其他 skill。
-
-完成 First Move 后，告诉我 dashboard 的准确 URL。
-```
-
-</details>
 
 The orchestrator should first apply its task-size gate. If the work fits one focused session, expect it to recommend a direct session instead of building a loop.
 
@@ -281,14 +262,9 @@ multi-loops-agents/
 ├── install.ps1
 ├── install.sh
 ├── LICENSE
+├── README.zh-CN.md
 └── README.md
 ```
-
-## 中文摘要
-
-这个 skill 适合跨多次会话、需要隐私门、独立审查或可追溯恢复的开发项目。项目真相保存在仓库文件中；每个 lane 有明确职责和互不重叠的写入范围；每个 request 都必须有真实命令退出码证据，并经过独立 review。面向用户的功能还要等待人工实际操作确认。
-
-日常使用时始终留在原来的 `product` 对话里，新需求也在同一个对话中提出，再由 product 路由给现有 lane。不要为每个小改动临时新建对话。小型、单人、两小时内能完成且不需要审计恢复的任务，应直接使用一次 Codex 会话，而不是启动这套 loop。
 
 ## License
 
