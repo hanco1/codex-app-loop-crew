@@ -33,7 +33,7 @@ English | [简体中文](README.zh-CN.md)
 
 `codex-agent-loop-orchestrator` is a repo-local operating protocol for long-running Codex projects. It gives each ongoing agent job a named lane, keeps goals and requests in files instead of disposable chat history, requires machine-readable verification evidence, and routes every shipped slice through independent review.
 
-The image above is an explicitly labeled mock of a generic Codex-style desktop host. It contains no OpenAI or ChatGPT branding, account identity, or real project data.
+The image above is a mock of a generic Codex-style desktop host (disclosed here rather than on the image). It contains no OpenAI or ChatGPT branding, account identity, or real project data.
 
 ## Quick Start
 
@@ -61,7 +61,7 @@ The orchestrator should first apply its task-size gate. If the work fits one foc
 
 The skill conditionally solves ordinary developers' multi-agent coordination pain. It is a control and audit layer—not a promise that multiple agents become cheap, fully autonomous, or impossible to stall.
 
-- **Know when the agents need you.** The local dashboard raises a “Your turn” banner, moves the relevant lane to the top, and names the conversation to open.
+- **Know when the agents need you.** The local dashboard raises a "Ready for you" banner, moves the relevant lane to the top, and names the conversation to open.
 - **Keep project state out of disposable chat history.** Goals, requests, handoffs, messages, decisions, and verification evidence live in the repository, so another session can resume from files.
 - **Reduce agents stepping on the same files.** A lane is one ongoing agent job with an explicit write scope. The reference workflow requires pairwise-disjoint scopes and can reject out-of-scope commits.
 - **Leave a reconstructable history.** Lane-labelled commits, saved message envelopes, an append-only transition log, and per-command evidence record what moved and why.
@@ -93,7 +93,7 @@ It is also a poor fit when the work has no meaningful machine-checkable acceptan
 
 These light-theme images come from the real local dashboard served against an archived loop state. The public capture copy redacts local sample paths, account/usage identity, and conversation IDs. The dark image at the top of this README is the mock host UI; the HTML source is preserved at [`assets/mock-codex-ui.html`](assets/mock-codex-ui.html).
 
-### “Your turn” banner
+### "Ready for you" banner
 
 ![Dashboard banner telling the human that data-eng is ready for confirmation](assets/dashboard-your-turn.png)
 
@@ -257,6 +257,7 @@ multi-loops-agents/
 │   └── mock-codex-ui.png
 ├── skills/codex-agent-loop-orchestrator/
 │   ├── SKILL.md
+│   ├── agents/
 │   ├── references/
 │   └── scripts/
 ├── install.ps1
