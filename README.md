@@ -43,8 +43,9 @@ counts, and has a separate agent review it. A local dashboard watches all of it 
 time a human is needed.
 
 Under the hood it calls the Codex app's own `create_thread` tool to open each agent as a real conversation and
-auto-seed it with its role, write scope, and model tier — so the whole team assembles itself inside the app.
-You never leave it: no terminal, no logs to read, no commands to memorize.
+auto-seed it with its role, write scope, and — by default — the **highest model tier your host offers, at
+`xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole team assembles itself
+inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
 
 > The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
 > identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
@@ -204,8 +205,9 @@ own output too. The takeaway isn't "always use the loop," it's **match the machi
 Use a plain Codex session for a small, low-risk task one agent can finish in one sitting — roughly under two
 hours — when auditability, handoff recovery, sensitive-data gates, and real parallel lanes don't matter. The
 cost is real: in one same-spec `n=1` comparison the loop took **7.2× the wall time** and **36× the total
-tokens** of the direct session. This protocol buys traceability and independent verification; it does not make
-multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
+tokens** of the direct session — and by default every lane runs on the top model at `xhigh`, so a team is
+several premium sessions at once. This protocol buys traceability and independent verification; it does not
+make multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
 
 ## Grounded in prior work
 
