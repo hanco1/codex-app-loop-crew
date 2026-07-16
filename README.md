@@ -18,9 +18,11 @@ English | [简体中文](README.zh-CN.md)
 <p align="center">
   <a href="#quick-start">Quick Start</a>
   |
-  <a href="#screenshots">Screenshots</a>
+  <a href="#does-it-actually-help-a-public-ab-build">Does it help?</a>
   |
-  <a href="#how-it-works">How It Works</a>
+  <a href="#what-a-run-looks-like-visual-tour">Visual tour</a>
+  |
+  <a href="#the-core-ideas-in-plain-words">Core ideas</a>
   |
   <a href="#install">Install</a>
   |
@@ -89,21 +91,76 @@ The cost is real. In one same-spec, same-host `n=1` dogfood comparison, the loop
 
 It is also a poor fit when the work has no meaningful machine-checkable acceptance surface, or when you need hands-off multi-thread execution but the host cannot create or deliver to long-lived conversations. For recurring operations, prefer using the loop once to build a reusable tool instead of keeping a standing agent team alive.
 
-## Screenshots
+## Does it actually help? (a public A/B build)
 
-These light-theme images come from the real local dashboard served against an archived loop state. The public capture copy redacts local sample paths, account/usage identity, and conversation IDs. The dark image at the top of this README is the mock host UI; the HTML source is preserved at [`assets/mock-codex-ui.html`](assets/mock-codex-ui.html).
+To make the trade-off concrete, the same local expense-analysis app was built twice on the same model
+(`gpt-5.6-sol`, xhigh): once through this loop, once as a single plain Codex session with the skill removed.
+Both builds and the full method are public so you can read the code yourself.
 
-### "Ready for you" banner
+Both codebases were scored by the same 5-dimension rubric, and every serious finding was re-derived by an
+independent adversarial verifier before it counted:
 
-![Dashboard banner telling the human that data-eng is ready for confirmation](assets/dashboard-your-turn.png)
+| Dimension | Solo session | This loop |
+|---|:---:|:---:|
+| Correctness on edge input | 6 | 7 |
+| Invariant enforcement depth | 6 | **8** |
+| Security | 7 | **9** |
+| Test quality | 7 | 7 |
+| Maintainability | 8 | 8 |
+| **Average** | **6.8** | **7.8** |
 
-### Lane card
+The loop's margin lands exactly where a review-and-invariants process should put it: **security and
+defense-in-depth** (DB-enforced money/append-only constraints, an XSS/CSRF-airtight surface, frozen regression
+matrices). It cost far more to get there — roughly 8.5× the code and one-to-two orders of magnitude more time
+and tokens — and, honestly, **it is not magic**: the same review found real bugs in the loop's own output,
+including a PDF path that silently dropped lines (a violation of the very "no silent data loss" invariant the
+skill exists to protect). The takeaway is not "always use the loop" but **match the machinery to the stakes** —
+the same task-size lesson the [When Not to Use It](#when-not-to-use-it) section states.
+
+- **Full scored comparison:** [COMPARISON.md](COMPARISON.md)
+- **Loop build** (includes the complete `docs/loop/` decision ledger): [expense-app-loop-built](https://github.com/hanco1/expense-app-loop-built)
+- **Solo build** (the single-session baseline, with its full prompt + transcript): [expense-app-solo-session-built](https://github.com/hanco1/expense-app-solo-session-built)
+
+## What a run looks like (visual tour)
+
+You state a goal once. From there the agents do the work and the dashboard tells you the one moment you're
+needed. Here is the whole flow at a glance, then what each stage looks like on screen.
+
+```mermaid
+flowchart TD
+    A["You state one goal"] --> B["Product splits it into small requests"]
+    B --> C["An engineer lane builds one slice"]
+    C --> D{"Machine gate:<br/>does the recorded evidence pass?"}
+    D -- "no / missing" --> C
+    D -- "yes" --> E["Review lane checks it independently"]
+    E -- "finds problems" --> C
+    E -- "looks good" --> F{"Is it user-facing?"}
+    F -- "no" --> H["Accepted ✅"]
+    F -- "yes" --> G["READY FOR YOU:<br/>you open the app and confirm"]
+    G -- "you reply PASS" --> H
+    G -- "you report a problem" --> C
+```
+
+The screenshots below come from the real local dashboard (light theme), served against an archived loop
+state; the public copies redact local paths, account/usage identity, and conversation IDs. The dark image at
+the top of this README is the mock host UI ([HTML source](assets/mock-codex-ui.html)).
+
+**1. Progress — watch the slices land.** The tracker ticks off checkpoints as each request is accepted, so you
+always know how far along the work is without reading any chat.
+
+![Dashboard Progress section showing three of four checkpoints complete](assets/dashboard-progress.png)
+
+**2. Lane card — what one agent is doing.** Each lane is one agent's ongoing job. The card shows its
+responsibility, its latest result, when it last checked in (a heartbeat), and its model tier — the state you'd
+otherwise have to reconstruct from scattered chats.
 
 ![Dashboard close-up of the data-eng lane card](assets/dashboard-lane-card.png)
 
-### Progress
+**3. "Ready for you" — the one moment you're needed.** When a user-facing slice has passed the machine gate and
+independent review, the dashboard raises this banner, moves that lane to the top, and names the exact
+conversation to open. Until you see it, you can leave the agents alone.
 
-![Dashboard Progress section showing three of four checkpoints complete](assets/dashboard-progress.png)
+![Dashboard banner telling the human that data-eng is ready for confirmation](assets/dashboard-your-turn.png)
 
 <details>
 <summary>Open the full-page dashboard overview</summary>
@@ -112,40 +169,70 @@ These light-theme images come from the real local dashboard served against an ar
 
 </details>
 
-## How It Works
+## The core ideas (in plain words)
 
-### 1. Lanes split recurring responsibility
+Six ideas do all the work. Each one is stated plainly first, then with the mechanism underneath.
 
-The default team is `product`, one build lane, and `review`. Add `data-eng`, `frontend`, `security`, or another specialist only when it owns a recurring responsibility with clear input, output, routing, and a disjoint write scope. Lanes are disciplines, not personalities or product features.
+### 1. A "lane" is one agent's standing job
 
-Product owns the loop ledger under `docs/loop/**`. Build lanes own separate code and test subtrees. Every lane also owns its own `docs/loop/lanes/<lane>/**` worklog area.
+**In plain words:** instead of one AI doing everything, you give each *kind* of work its own worker — a
+backend worker, a frontend worker, a reviewer — and each one owns its files so they don't overwrite each
+other.
 
-### 2. Requests move through a durable lifecycle
+The default team is `product` (the manager), one build lane, and `review`. Add `data-eng`, `frontend`, or
+another specialist only when it owns a recurring responsibility with a clear input, output, and its own
+non-overlapping set of files. Lanes are job descriptions, not personalities. Product owns the ledger under
+`docs/loop/**`; build lanes own separate code and test folders.
 
-`requests.md` is the queue and recovery index. The same `request_id` is reused across a blocker fix cycle, while `iteration` increments:
+### 2. Work moves through a fixed set of stages (and can always resume)
+
+**In plain words:** every piece of work has a status you can read at a glance, so if a chat is lost, the next
+session picks up exactly where things were — nothing lives only in disposable chat history.
+
+`requests.md` is the to-do list and the recovery index. A single `request_id` follows one task through its
+whole life, even across fix rounds:
 
 ```text
 PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE
         -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED
 ```
 
-Typed messages are saved under `docs/loop/messages/<request_id>/` before cross-conversation delivery. If thread delivery is unavailable, an atomic file inbox preserves the message—but a file inbox is not an automatic worker.
+Every message between agents is saved as a file under `docs/loop/messages/<request_id>/` before it is
+delivered, so the trail survives even if a conversation doesn't.
 
-### 3. Completion is machine checked
+### 3. "Done" has to be proven, not claimed
 
-The implementation lane runs each acceptance command and writes a flat evidence record containing the request, checkpoint, command, exit code, and timestamp. `completion_gate.py` reads those records. Verification unavailable means `BLOCKED`, never “accepted with a caveat.”
+**In plain words:** an agent can't just *say* it finished — it has to run the tests and leave the results as a
+file. If the proof is missing or failing, the work is blocked, not "done with an asterisk."
 
-### 4. Review is independent
+The build lane runs each acceptance command and writes a small record with the command, its exit code, and a
+timestamp. `completion_gate.py` reads those records and only then emits `SHIP_CHECK_OK`. No readable proof
+means `BLOCKED` — never "accepted anyway."
 
-The review lane checks the request's declared criteria and scope rather than the implementer's intent. Blockers return to the owning build lane under the same request ID. Should-fix and nit findings can be recorded without forcing an endless fix loop.
+### 4. A different agent checks the work
 
-### 5. User-facing work waits for human QA
+**In plain words:** the agent that built something never gets to approve its own work. A separate `review`
+agent checks it against the requirements — including the sneaky "looks finished but is actually wrong" cases.
 
-After machine evidence and review pass, a UI request remains in `REVIEWING`. Product sends one URL and a short try-it instruction; only an explicit `human_qa: confirmed` record unlocks `ACCEPTED`.
+Review checks the request's declared criteria and scope, not the builder's intent. Real problems go back to the
+builder under the same `request_id`; smaller notes are recorded without forcing an endless loop.
 
-### 6. The dashboard routes human attention
+### 5. Anything you'll actually see waits for *you*
 
-The dashboard is a local viewer over repo files and the read-only health check. It shows Progress, the current human gate, lane ownership, requests, evidence, Git/hook health, usage availability, and the run log. The human stays in the product conversation until the banner says where to act.
+**In plain words:** for anything with a screen, passing the tests isn't enough — the work waits in review until
+*you* open it and say it's good. (This is what caught the real bugs in the public comparison above.)
+
+After machine evidence and review pass, a user-facing request stays in `REVIEWING`. Product sends you one URL
+and a short "try this" note; only your explicit confirmation unlocks `ACCEPTED`.
+
+### 6. The dashboard points you to the one thing that needs you
+
+**In plain words:** you don't babysit the agents. You keep one dashboard open, and it tells you when — and only
+when — a human is needed, and which conversation to open.
+
+The dashboard is a read-only viewer over the repository files and a health check. It shows progress, the
+current human gate, who owns what, the evidence, and Git health. You stay in the product conversation until the
+banner says where to act.
 
 ## Install
 
