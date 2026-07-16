@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Built for the Codex app, not the terminal.</strong> Install by pasting one message, then drive everything from ordinary chats plus a local dashboard. Approachable even if you're new to multi-agent work or would rather never touch a CLI.
+  <strong>Built for the Codex app — not the CLI.</strong> The terminal can already juggle agents; the hard part was doing it <em>inside the app</em>. This skill uses the app's own <code>create_thread</code> tool to spin up a whole team of agent conversations and auto-seed each one with its role, context, and model — so Codex-app users get real multi-agent orchestration without ever touching a terminal.
 </p>
 
 <p align="center">
@@ -30,7 +30,7 @@ English | [简体中文](README.zh-CN.md)
   |
   <a href="#does-it-actually-help">Does it help?</a>
   |
-  <a href="#when-not-to-use-it">When not to use it</a>
+  <a href="#grounded-in-prior-work">Grounded in</a>
 </p>
 
 ![A Codex-app conversation with product, data-eng, frontend, and review lanes, and a local dashboard link](assets/codex-app-session.png)
@@ -42,7 +42,9 @@ project state in files instead of disposable chat history, makes each agent **pr
 counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner the one
 time a human is needed.
 
-You never leave the Codex app. No terminal, no logs to read, no commands to memorize.
+Under the hood it calls the Codex app's own `create_thread` tool to open each agent as a real conversation and
+auto-seed it with its role, write scope, and model tier — so the whole team assembles itself inside the app.
+You never leave it: no terminal, no logs to read, no commands to memorize.
 
 > The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
 > identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
@@ -204,6 +206,20 @@ hours — when auditability, handoff recovery, sensitive-data gates, and real pa
 cost is real: in one same-spec `n=1` comparison the loop took **7.2× the wall time** and **36× the total
 tokens** of the direct session. This protocol buys traceability and independent verification; it does not make
 multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
+
+## Grounded in prior work
+
+This isn't invented from scratch — it fuses two lines of work and distills a broad survey of community practice:
+
+- **Codex "Loop Engineering"** — the app's own model for durable, long-horizon work (checkpoints, resumable
+  sessions, auto-chained continuations). This skill extends it from one agent to a reviewed multi-agent team.
+- **Multi-agent lane orchestration** — the app's cross-thread tools (`create_thread`, `send_message_to_thread`)
+  turned into a disciplined team with disjoint write scopes and independent review.
+- **A survey of ~38 community skills** ([Matt Pocock's skills collection](https://github.com/mattpocock/skills)) —
+  the acceptance-criteria and review discipline here (every criterion names a *red-capable* verify command) was
+  distilled from that ecosystem; **28 of 38 skills' top recommendation converged on the same idea.**
+- **[han-design-skill-v1](https://github.com/hanco1/han-design-skill-v1)** — the companion design skill used
+  for the dashboard's visual style.
 
 ## More
 

@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>专为 Codex app 打造，而不是命令行。</strong> 粘贴一段话即可安装，之后全程用普通对话加一个本地 dashboard 驱动。即使你是新手、或根本不想碰 CLI，也能上手多智能体开发。
+  <strong>专为 Codex app 打造 —— 不是 CLI。</strong> 终端本来就能开多个 agent；难的是在 <em>app 里</em>做到。这个 skill 调用 app 自己的 <code>create_thread</code> 工具，把一整队 agent 对话开出来，并自动给每个注入角色、上下文和模型 —— 让 Codex app 用户不碰终端也能获得真正的多智能体编排。
 </p>
 
 <p align="center">
@@ -30,7 +30,7 @@
   |
   <a href="#它真的有用吗">它真的有用吗？</a>
   |
-  <a href="#什么时候不该用">什么时候不该用</a>
+  <a href="#站在前人的工作之上">理论依据</a>
 </p>
 
 ![一个 Codex app 对话，包含 product、data-eng、frontend 和 review lane，以及一个本地 dashboard 链接](assets/codex-app-session.png)
@@ -39,7 +39,7 @@
 
 你描述一个目标。这个 skill 把工作拆给几个专职的 Codex agent（"lane"），把所有项目状态存进文件而不是随时会丢的聊天记录，让每个 agent 必须**证明**自己的活通过了才算数，再由另一个 agent 复查。一个本地 dashboard 盯着这一切，只在唯一需要人的那一刻亮起提示条。
 
-你全程不用离开 Codex app。没有终端、不用读日志、不用背命令。
+底层它调用 Codex app 自己的 `create_thread` 工具，把每个 agent 开成一个真实对话，并自动注入它的角色、写入范围和模型档位 —— 整队就在 app 里自己组建起来。你全程不用离开 app：没有终端、不用读日志、不用背命令。
 
 > 上图是通用 Codex 风格桌面端的模拟界面示意图（不含 OpenAI/ChatGPT 品牌、账户身份或真实数据）；HTML 源文件见 [`assets/codex-app-session.html`](assets/codex-app-session.html)。
 
@@ -180,6 +180,15 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 ## 什么时候不该用
 
 如果任务规模小、风险低，一个 agent 一次就能干完——大致不超过两小时——而且你不需要可审计性、handoff 恢复、敏感数据门槛或真正并行的 lane，就直接用普通 Codex 会话。成本是真的：在一次相同规格的 `n=1` 对比中，loop 的**耗时是直接会话的 7.2 倍**、**总 token 是 36 倍**。这套协议买到的是可追溯性和独立验证，不会让多智能体协作变免费。当没有任何有意义、可机器检查的东西时，它同样不合适。
+
+## 站在前人的工作之上
+
+它不是凭空造出来的 —— 它融合了两条工作线，并提炼了对社区实践的广泛调研：
+
+- **Codex "Loop Engineering"** —— app 自己的长任务持久化模型（检查点、可恢复会话、自动接续）。这个 skill 把它从单 agent 扩展到一个带评审的多智能体团队。
+- **多智能体 lane 编排** —— 把 app 的跨线程工具（`create_thread`、`send_message_to_thread`）变成一个纪律化的团队，写入范围不重叠、有独立评审。
+- **对约 38 个社区 skill 的调研**（[Matt Pocock 的 skills 合集](https://github.com/mattpocock/skills)）—— 这里的验收标准与评审纪律（每条标准都指定一条*可变红*的验证命令）就是从这个生态里提炼的；**38 个 skill 中有 28 个的首要建议都收敛到同一个想法。**
+- **[han-design-skill-v1](https://github.com/hanco1/han-design-skill-v1)** —— 用于 dashboard 视觉风格的配套设计 skill。
 
 ## 更多
 
