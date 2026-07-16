@@ -188,6 +188,7 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 - **Codex "Loop Engineering"** —— app 自己的长任务持久化模型（检查点、可恢复会话、自动接续）。这个 skill 把它从单 agent 扩展到一个带评审的多智能体团队。
 - **多智能体 lane 编排** —— 把 app 的跨线程工具（`create_thread`、`send_message_to_thread`）变成一个纪律化的团队，写入范围不重叠、有独立评审。
 - **对约 38 个社区 skill 的调研**（[Matt Pocock 的 skills 合集](https://github.com/mattpocock/skills)）—— 这里的验收标准与评审纪律（每条标准都指定一条*可变红*的验证命令）就是从这个生态里提炼的；**38 个 skill 中有 28 个的首要建议都收敛到同一个想法。**
+- **记忆层** —— 追加式决策日志（`decisions.jsonl`，用 `normalize_then_hash()` 对来源文档做内容寻址，从而能检测过期决策）借鉴了 [`Gentleman-Programming/engram`](https://github.com/Gentleman-Programming/engram)（一个 agent 记忆层）、[Cartridges 论文](https://arxiv.org/abs/2506.06266)（把上下文蒸馏成紧凑、可审计的产物，而不是回放原始洪流）和 [`deepseek-ai/Engram`](https://github.com/deepseek-ai/Engram)（内容寻址，类比借鉴）—— 实现为纯粹的仓库可读文件，而不是训练出来的缓存。
 - **[han-design-skill-v1](https://github.com/hanco1/han-design-skill-v1)** —— 用于 dashboard 视觉风格的配套设计 skill。
 
 ## 更多

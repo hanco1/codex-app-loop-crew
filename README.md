@@ -218,6 +218,12 @@ This isn't invented from scratch — it fuses two lines of work and distills a b
 - **A survey of ~38 community skills** ([Matt Pocock's skills collection](https://github.com/mattpocock/skills)) —
   the acceptance-criteria and review discipline here (every criterion names a *red-capable* verify command) was
   distilled from that ecosystem; **28 of 38 skills' top recommendation converged on the same idea.**
+- **The memory layer** — the append-only decision log (`decisions.jsonl`, content-addressed with a
+  `normalize_then_hash()` over its source docs so stale decisions are detectable) adapts ideas from
+  [`Gentleman-Programming/engram`](https://github.com/Gentleman-Programming/engram) (an agent memory layer),
+  the [Cartridges paper](https://arxiv.org/abs/2506.06266) (distill context into compact, auditable artifacts
+  instead of replaying the raw firehose), and [`deepseek-ai/Engram`](https://github.com/deepseek-ai/Engram)
+  (content-addressing, by analogy) — implemented as plain repo-readable files, not trained caches.
 - **[han-design-skill-v1](https://github.com/hanco1/han-design-skill-v1)** — the companion design skill used
   for the dashboard's visual style.
 
