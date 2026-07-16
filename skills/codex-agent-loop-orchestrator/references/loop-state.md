@@ -4,6 +4,25 @@ This file is the reference implementation of the handoff, lanes, coordinated-wri
 
 Use this reference to decide when to start loop engineering, when to hand off, and when to create or continue another Codex session.
 
+## Request Lifecycle
+
+**BLOCKED is a human-gate pause, not a terminal state.** It has exactly one
+legal edge back into work: `BLOCKED -> FIX_REQUESTED`, carrying a recorded human
+authorization in `loop-run-log.md`. The authorizing row note is exactly
+`human_authorization: approved` or starts with
+`human_authorization: approved | ` followed by an evidence pointer. No lane may
+resume a blocked request into another working state.
+
+**ACCEPTED is the success terminal.** `ABANDONED` is the explicit
+human-declared dead-end terminal. A request may move `BLOCKED -> ABANDONED` only
+on a recorded human decision; this is a terminal disposition rather than a
+resume edge, and `ABANDONED` rows keep their evidence.
+
+**loop-run-log.md is the authoritative transition history.** **requests.md is a
+coarse current-state snapshot at checkpoint granularity;** `PLANNED` and
+`IMPLEMENTATION_DONE` may never appear in it - that is legal. Recovery and
+audits reconstruct intermediate edges from the append-only run log.
+
 ## Loop Start Gate
 
 Start a repo-local loop only when all required conditions are true:
@@ -222,8 +241,21 @@ Send `REVIEW_REQUEST` only after implementation has:
 - completed a runnable or reviewable slice;
 - listed changed files and artifacts;
 - run the requested verification or explained why it could not run;
+- **from request 1**, written every per-command evidence JSON under
+  `docs/loop/lanes/<lane>/evidence/` and handed those exact bytes to product for
+  the flat `docs/loop/evidence/` mirror. Product confirms each pair is
+  **byte-for-byte** identical before routing review; equal filenames or parsed
+  values do not establish the mirror. This standing rule is independent of the
+  artifact type and applies to every project from its first request;
 - sent `IMPLEMENTATION_DONE`;
 - updated its worklog/current state.
+
+The root directory is the completion gate's canonical flat input; the lane
+directory preserves producer lineage. A root record for a request at
+`IMPLEMENTATION_DONE` or beyond without an identical implementing-lane copy is
+an `evidence_mirror_gap` warning, not a new lifecycle status or a change to gate
+verdict semantics. See `references/protocol.md` "Evidence Records" for the one
+record schema and dual-write contract.
 
 ## Review To Fix Gate
 
@@ -235,6 +267,16 @@ Send `FIX_REQUEST` only when review can state:
 - the same `request_id` with incremented `iteration`.
 
 Do not rewrite product scope during review. Send `BLOCKED` to product if criteria are ambiguous.
+
+### Pre-Implementation Contract Freeze Gate
+
+For a defect-class closure round, `FIX_REQUESTED` may be owned by review while
+review handles a `PRE_IMPLEMENTATION_TEST_REQUEST`. Review freezes the
+implementation-independent red-capable enumeration, records its artifact path
+and SHA-256, and demonstrates the contract can go red before implementation.
+Only then does review dispatch the `FIX_REQUEST` and transfer ownership to the
+implementation lane. A review-owned `FIX_REQUESTED` snapshot is therefore a
+first-class contract-freeze phase, not an ambiguous owner mismatch.
 
 ### Review checklist (three named categories)
 
@@ -356,17 +398,19 @@ status):
   message naming the URL/launch command + a 30-second try.
 - The request HOLDS: status stays `REVIEWING`, `next_action` reads
   `awaiting human sign-off: <try>`, and a run-log row records
-  `human_qa_requested: <try>`. The tracker checkpoint stays `[~]`, never `[x]`.
+  a note that starts with `human_qa_hold: <try>`. The tracker checkpoint stays
+  `[~]`, never `[x]`.
 - On the human's confirmation, product records a run-log row
   `human_qa: confirmed <who/when>` BEFORE moving the request to `ACCEPTED` and
   marking the checkpoint `[x]`.
 
 A request holding for human QA is **normal waiting, not a stall**. The doctor
-recognizes it by the `human_qa_requested` run-log row with no matching
-`human_qa: confirmed` row for that `request_id`, and suppresses `stalled_handoff`
-for it - the held request is the HUMAN's turn (the dashboard's
-result-awaiting-confirmation state), not a lane to nudge. See
-`references/protocol.md` "Human-QA gate for user-facing slices".
+recognizes it by the `human_qa_hold:` run-log row with no matching `human_qa:
+confirmed` row for that `request_id`, and suppresses `stalled_handoff` for it -
+the held request is the HUMAN's turn (the dashboard's
+result-awaiting-confirmation state), not a lane to nudge. Older free-text
+`human_qa_requested:` notes remain recognized as an additive compatibility
+path. See `references/protocol.md` "Human-QA gate for user-facing slices".
 
 ## Auto-Chain Gate
 
@@ -400,6 +444,17 @@ budget_exhausted: true -> stop, mark BLOCKED, report remaining work
 - When `budget_exhausted: true`, do not send new `IMPLEMENTATION_REQUEST`s, do not auto-chain, and do not open a continuation thread. Move the active request to `BLOCKED` and append the transition to the run log.
 - Report spent versus budget and the next action a human can authorize (raise budget, re-scope, or stop).
 - Treat budget exhaustion like any other human gate: it requires explicit approval to resume.
+
+### Cap-Raise Override History
+
+A cap raise is two-phase: product first appends the same-status
+`BLOCKED -> BLOCKED` human-authorization row with a
+`human_authorization: approved` note and an Active `max_fix_cycles` override in
+one checkpoint; the `BLOCKED -> FIX_REQUESTED` dispatch occurs in a separate
+later checkpoint. Each override state is append-only: append a new
+`Active`, `Superseded`, or `Completed` line and never rewrite an older override
+line in place. Every resumed-round `FIX_REQUEST` carries `cap_authorization:`
+pointing to the authorization row and Active override.
 
 ## Missing-Dependency Gate
 

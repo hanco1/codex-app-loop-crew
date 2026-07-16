@@ -192,6 +192,12 @@
       animation: pulse 2s infinite;
     }
     .pulse.stale .live-dot { background: var(--bad); animation: none; }
+    .pulse.completed { color: var(--ok); }
+    .pulse.completed .live-dot {
+      background: var(--ok);
+      animation: none;
+      box-shadow: 0 0 0 4px rgba(46, 107, 79, .16);
+    }
     @keyframes pulse {
       0%   { box-shadow: 0 0 0 0 rgba(46, 107, 79, .45); }
       70%  { box-shadow: 0 0 0 7px rgba(46, 107, 79, 0); }
@@ -1920,8 +1926,16 @@
   <script type="application/json" id="i18n-strings-g27" data-i18n-dict>
   {"strings":[
     {"key":"pagination_showing","en":"Showing N of N","zh":"当前显示 N / N 条","subtitle_en":"","subtitle_zh":""},
+    {"key":"pagination_showing_all","en":"Showing all N","zh":"已显示全部 N 条","subtitle_en":"","subtitle_zh":""},
     {"key":"pagination_load_more","en":"Load more","zh":"加载更多","subtitle_en":"","subtitle_zh":""},
+    {"key":"pagination_show_less","en":"Show less","zh":"收起","subtitle_en":"","subtitle_zh":""},
     {"key":"pagination_loading","en":"Loading...","zh":"正在加载...","subtitle_en":"","subtitle_zh":""}
+  ]}
+  </script>
+
+  <script type="application/json" id="i18n-strings-g30" data-i18n-dict>
+  {"strings":[
+    {"key":"pulse_completed","en":"All requests accepted - loop idle","zh":"所有请求均已验收，循环空闲","subtitle_en":"","subtitle_zh":""}
   ]}
   </script>
 
@@ -2164,9 +2178,11 @@
         var node = $("pulse-text");
         if (node) node.textContent = t(pulseStateKey);
       }
-      function setConn(connected, stale) {
+      function setConn(connected, stale, completed) {
         var pulse = $("pulse");
         var banner = $("conn-banner");
+        pulse.classList.remove("stale");
+        pulse.classList.remove("completed");
         if (!connected) {
           pulse.classList.add("stale");
           pulseStateKey = "pulse_data_stale";
@@ -2178,8 +2194,10 @@
         if (stale) {
           pulse.classList.add("stale");
           pulseStateKey = "pulse_heartbeat_stale";
+        } else if (completed) {
+          pulse.classList.add("completed");
+          pulseStateKey = "pulse_completed";
         } else {
-          pulse.classList.remove("stale");
           pulseStateKey = "pulse_live";
         }
         refreshPulseText();
@@ -2473,6 +2491,16 @@
         // REQUESTED / IMPLEMENTING / IMPLEMENTATION_DONE / REVIEWING /
         // FIX_REQUESTED all mean the request is in flight.
         return true;
+      }
+
+      function laneOwnsActiveRequest(lane) {
+        var current = lane.current_request || {};
+        return current.is_owner === true && isAdvancingStatus(current.status || "");
+      }
+
+      function laneHasStaleActiveOwnerHeartbeat(lane) {
+        var heartbeat = lane.heartbeat || {};
+        return laneOwnsActiveRequest(lane) && heartbeat.state === "stale";
       }
 
       function analyzeNeedsYou(state) {
@@ -2866,8 +2894,7 @@
       // note (it must not look healthier than a stale one). Returns {cls,text}.
       function heartbeatLabel(lane, gapOwnerNames) {
         var hb = lane.heartbeat || {};
-        var cr = lane.current_request || {};
-        var ownsActive = isAdvancingStatus(cr.status);
+        var ownsActive = laneOwnsActiveRequest(lane);
         if (hb.state === "none" || hb.age_mins == null) {
           // Never checked in. If the lane owns active work with no heartbeat the
           // doctor flags it (gapOwnerNames); render that as the honest overdue.
@@ -2879,7 +2906,7 @@
         }
         if (hb.state === "stale") {
           // Stale timestamp: overdue ONLY if it owns active work; else neutral.
-          if (ownsActive) {
+          if (laneHasStaleActiveOwnerHeartbeat(lane)) {
             return { cls: "hb-stale", text: tfmt("lane_meta_heartbeat_fresh", [hb.age_mins]) +
               " " + t("lane_meta_heartbeat_stale_suffix") };
           }
@@ -3260,15 +3287,28 @@
         var control = $(domName + "-pagination");
         if (!control) return;
         var truncated = meta.truncated === true;
-        control.style.display = truncated ? "flex" : "none";
-        if (!truncated) return;
-        $(domName + "-pagination-summary").textContent = tfmt(
-          "pagination_showing", [meta.shown || 0, meta.total || 0]
-        );
+        var requestedFull = fullCollections[collection] === true;
+        var expanded = requestedFull && !truncated;
+        control.style.display = (truncated || expanded) ? "flex" : "none";
+        if (!truncated && !expanded) return;
+        $(domName + "-pagination-summary").textContent = expanded
+          ? tfmt("pagination_showing_all", [meta.total || meta.shown || 0])
+          : tfmt("pagination_showing", [meta.shown || 0, meta.total || 0]);
         var button = control.querySelector("button[data-full-collection]");
         if (button) {
-          button.disabled = false;
-          button.textContent = t("pagination_load_more");
+          if (expanded) {
+            button.disabled = false;
+            button.setAttribute("data-pagination-mode", "less");
+            button.textContent = t("pagination_show_less");
+          } else if (requestedFull) {
+            button.disabled = true;
+            button.setAttribute("data-pagination-mode", "loading");
+            button.textContent = t("pagination_loading");
+          } else {
+            button.disabled = false;
+            button.setAttribute("data-pagination-mode", "more");
+            button.textContent = t("pagination_load_more");
+          }
         }
       }
 
@@ -3741,11 +3781,19 @@
       }
 
       function stateHasStaleData(state) {
-        var anyStale = (state.lanes || []).some(function (l) {
-          return l.heartbeat && l.heartbeat.state === "stale";
-        });
-        return anyStale || !!((state.read_errors || []).length)
+        var staleActiveOwner = (state.lanes || []).some(laneHasStaleActiveOwnerHeartbeat);
+        return staleActiveOwner || !!((state.read_errors || []).length)
           || !!((state.parse_errors || []).length) || state.refresh_degraded === true;
+      }
+
+      function stateIsCompleted(state) {
+        var requests = state.requests || [];
+        var doc = state.doctor || {};
+        var doctorClean = doc.available !== false
+          && !((doc.warnings || []).length) && !((doc.issues || []).length);
+        return requests.length > 0 && requests.every(function (request) {
+          return String(request.status || "").toUpperCase() === "ACCEPTED";
+        }) && doctorClean;
       }
 
       function render(state) {
@@ -3755,7 +3803,7 @@
         loopDirEl.textContent = shortenLoopDir(loopDirFull);
         loopDirEl.title = loopDirFull;
         var doc = state.doctor || {};
-        setConn(true, stateHasStaleData(state));
+        setConn(true, stateHasStaleData(state), stateIsCompleted(state));
         renderProject(state.project || {});
         renderDataDiagnostics(state);
         renderCapabilities(state);
@@ -3818,12 +3866,34 @@
         var button = control && control.querySelector("button[data-full-collection]");
         if (button) {
           button.disabled = true;
+          button.setAttribute("data-pagination-mode", "loading");
           button.textContent = t("pagination_loading");
         }
         requestPoll({ force: true,
           url: stateUrl(false),
           onError: function () {
             delete fullCollections[collection];
+            var meta = (((lastState || {}).pagination || {})[collection]) || {};
+            renderPagination(collection, meta);
+          }
+        });
+      }
+
+      function collapseFullCollection(collection) {
+        if (fullCollections[collection] !== true) return;
+        delete fullCollections[collection];
+        var domName = collection === "run_log" ? "run-log" : collection;
+        var control = $(domName + "-pagination");
+        var button = control && control.querySelector("button[data-full-collection]");
+        if (button) {
+          button.disabled = true;
+          button.setAttribute("data-pagination-mode", "loading");
+          button.textContent = t("pagination_loading");
+        }
+        requestPoll({ force: true,
+          url: stateUrl(false),
+          onError: function () {
+            fullCollections[collection] = true;
             var meta = (((lastState || {}).pagination || {})[collection]) || {};
             renderPagination(collection, meta);
           }
@@ -3873,7 +3943,7 @@
           .then(function (result) {
             if (request.generation !== pollGeneration) return;
             if (result.notModified) {
-              setConn(true, stateHasStaleData(lastState || {}));
+              setConn(true, stateHasStaleData(lastState || {}), stateIsCompleted(lastState || {}));
               return;
             }
             var state = result.state;
@@ -3882,7 +3952,7 @@
           })
           .catch(function (error) {
             if (request.generation !== pollGeneration) return;
-            setConn(false, false);
+            setConn(false, false, false);
             if (typeof request.onError === "function") request.onError(error);
           })
           .then(function () {
@@ -3930,7 +4000,12 @@
         var buttons = document.querySelectorAll("button[data-full-collection]");
         Array.prototype.forEach.call(buttons, function (button) {
           button.addEventListener("click", function () {
-            loadFullCollection(button.getAttribute("data-full-collection"));
+            var collection = button.getAttribute("data-full-collection");
+            if (button.getAttribute("data-pagination-mode") === "less") {
+              collapseFullCollection(collection);
+            } else {
+              loadFullCollection(collection);
+            }
           });
         });
       })();

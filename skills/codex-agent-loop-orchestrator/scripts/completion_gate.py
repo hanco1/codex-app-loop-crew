@@ -17,11 +17,18 @@ Each evidence file is a JSON object:
       "checkpoint": "mvp-color-match",
       "command": "npm test",
       "exit_code": 0,
-      "ran_at": "2026-06-23T11:00:00Z"
+      "ran_at": "2026-06-23T11:00:00Z",
+      "started_at": "2026-06-23T10:59:57Z",
+      "finished_at": "2026-06-23T11:00:00Z",
+      "result": "PASS"
     }
 
-The four string fields must be non-empty. ``ran_at`` must be a valid
-timezone-aware ISO-8601 timestamp.
+The existing five fields remain required. The four required string fields must
+be non-empty, and ``ran_at`` must be a valid timezone-aware ISO-8601 timestamp.
+``started_at`` and ``finished_at`` are OPTIONAL per-command execution-window
+timestamps, and ``result`` is OPTIONAL result metadata. Records that omit these
+optional fields remain valid. They are additive metadata: this gate already
+tolerates extra fields and does not add a new failure mode for an older record.
 
 Exit codes:
     0  SHIP_CHECK_OK   -- gate passed for the scoped request(s)

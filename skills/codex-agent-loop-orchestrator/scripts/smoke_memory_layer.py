@@ -1149,6 +1149,15 @@ def _check_g7_doctor(tmp_path: Path) -> None:
         if not any("src/core.py" in item["path"] for item in c_probe.get("uncommitted_work", [])):
             _fail("doctor result should expose uncommitted_work with the in-scope path")
 
+        # G31: BLOCKED is a human-gate pause. Preserve G7's paused-loop hygiene
+        # check even though BLOCKED is no longer a terminal request status.
+        _set_request_status(c_requests, "REQ-20260707-092222-data-eng", "BLOCKED")
+        blocked_probe = doctor.summarize(
+            loop_c, stale_heartbeat_mins=doctor.DEFAULT_STALE_HEARTBEAT_MINS
+        )
+        if not any(w["code"] == "uncommitted_work" for w in blocked_probe["warnings"]):
+            _fail("uncommitted_work should fire while every request is terminal or BLOCKED")
+
         # Negative: while a request is still NON-terminal (mid-flight), the same
         # dirty file must NOT warn -- work in progress is normal.
         _set_request_status(c_requests, "REQ-20260707-092222-data-eng", "IMPLEMENTING")
@@ -1167,6 +1176,977 @@ def _append_run_log_row(loop_dir: Path, request_id: str, from_status: str, to_st
     )
     with (loop_dir / "loop-run-log.md").open("a", encoding="utf-8") as handle:
         handle.write(row)
+
+
+def _check_g28(tmp_path: Path) -> None:
+    """G28: defect-class closure wording and FIX_REQUEST doctor warning."""
+    protocol_md = _read_doc(_PROTOCOL_MD)
+    protocol_lower = protocol_md.lower()
+    protocol_collapsed = " ".join(protocol_lower.split())
+
+    # The class is a positive invariant over the full domain, never a symptom
+    # list. The run-5 Decimal incident is retained only as an explicitly marked
+    # example of that project-agnostic rule.
+    for needle in (
+        "defect_class:",
+        "sibling_scan:",
+        "if and only if",
+        "invariant over inputs/states",
+        "list of named failure symptoms",
+        "catch every decimal exception",
+        "a nonblank raw token is valid if and only if its whole token matches the frozen decimal grammar",
+    ):
+        if needle not in protocol_collapsed:
+            _fail("G28 protocol wording is missing: {0!r}".format(needle))
+    if "illustrative run-5 example" not in protocol_collapsed:
+        _fail("G28 run-5 Decimal details must be marked as an illustrative example")
+
+    # The sibling enumeration is explicitly three-axis and project-agnostic.
+    for needle in (
+        "input domain defined positively",
+        "every public entry point",
+        "writer",
+        "alias",
+        "boundary and extreme values",
+        "simultaneous worst cases",
+        "unenumerated write door",
+        "unenumerated extreme values",
+    ):
+        if needle not in protocol_collapsed:
+            _fail("G28 three-axis sibling scan wording is missing: {0!r}".format(needle))
+
+    for needle in (
+        "defect class closure",
+        "implementation-independent",
+        "red-capable enumeration",
+        "sha-256",
+        "one centralized rule",
+        "scattered operation-specific patches do not satisfy this request.",
+        "second blocker with the same `defect_class`",
+        "without waiting for cap exhaustion",
+        "10-21h",
+        "16-25 min",
+    ):
+        if needle not in protocol_collapsed:
+            _fail("G28 class-closure/anti-thrash wording is missing: {0!r}".format(needle))
+
+    # Doctor positive/negative: archived FIX_REQUEST messages missing the flat
+    # defect_class line warn; adding that line clears only this warning.
+    loop = tmp_path / "g28_loop"
+    _bootstrap(loop)
+    request_id = "REQ-20260715-100000-implementation"
+    msg_dir = loop / "messages" / request_id
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    fix_path = msg_dir / "FIX_REQUEST-iter-2.md"
+    fix_path.write_text(
+        "# FIX_REQUEST\n\n"
+        "message_type: FIX_REQUEST\n"
+        "request_id: {0}\n"
+        "severity: blocker\n"
+        "sibling_scan:\n"
+        "- all known same-class paths\n".format(request_id),
+        encoding="utf-8",
+    )
+    missing = _doctor(loop)
+    missing_warnings = [
+        warning for warning in missing["warnings"]
+        if warning["code"] == "fix_request_class_missing"
+    ]
+    if not missing_warnings:
+        _fail("G28 doctor must warn fix_request_class_missing when defect_class: is absent")
+    if not any("FIX_REQUEST-iter-2.md" in warning["message"] for warning in missing_warnings):
+        _fail("G28 fix_request_class_missing must name the message file")
+    if any(issue["code"] == "fix_request_class_missing" for issue in missing["issues"]):
+        _fail("G28 fix_request_class_missing must be warning-only")
+
+    fix_path.write_text(
+        fix_path.read_text(encoding="utf-8")
+        + "defect_class: output is valid if and only if it satisfies the declared contract\n",
+        encoding="utf-8",
+    )
+    present = _doctor(loop)
+    if any(warning["code"] == "fix_request_class_missing" for warning in present["warnings"]):
+        _fail("G28 doctor must stay silent when a defect_class: line exists")
+
+
+def _check_g31(tmp_path: Path) -> None:
+    """G31: BLOCKED pause lifecycle and authorized-exit warning."""
+    docs = {
+        "SKILL.md": _read_doc(_SKILL_MD),
+        "protocol.md": _read_doc(_PROTOCOL_MD),
+        "loop-state.md": _read_doc(_LOOP_STATE_MD),
+    }
+    for name, text in docs.items():
+        collapsed = " ".join(text.lower().split())
+        for needle in (
+            "blocked is a human-gate pause",
+            "not a terminal",
+            "blocked -> fix_requested",
+            "recorded human authorization",
+            "human_authorization: approved",
+            "accepted is the success terminal",
+            "abandoned",
+            "blocked -> abandoned",
+            "rows keep their evidence",
+        ):
+            if needle not in collapsed:
+                _fail("G31 {0} lifecycle wording is missing: {1!r}".format(name, needle))
+        if "exactly one legal" not in collapsed:
+            _fail("G31 {0} must state BLOCKED has exactly one legal resume edge".format(name))
+
+    # The generated requests.md template must carry the same lifecycle, not the
+    # old contradictory statement that BLOCKED is terminal.
+    loop_template = tmp_path / "g31_template"
+    _bootstrap(loop_template)
+    requests_text = (loop_template / "requests.md").read_text(encoding="utf-8")
+    requests_collapsed = " ".join(requests_text.lower().split())
+    if "terminal states are accepted and blocked" in requests_collapsed:
+        _fail("G31 generated requests.md must not call BLOCKED terminal")
+    for needle in (
+        "blocked is a human-gate pause",
+        "blocked -> fix_requested",
+        "human_authorization: approved",
+        "accepted is the success terminal",
+        "abandoned",
+        "rows keep their evidence",
+    ):
+        if needle not in requests_collapsed:
+            _fail("G31 generated requests.md wording is missing: {0!r}".format(needle))
+
+    def _write_log(loop_dir: Path, rows) -> None:
+        text = (
+            "# Loop Run Log\n\n"
+            "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
+        )
+        text += "".join("| " + " | ".join(row) + " |\n" for row in rows)
+        (loop_dir / "loop-run-log.md").write_text(text, encoding="utf-8")
+
+    request_id = "REQ-20260715-110000-implementation"
+    unauthorized_loop = tmp_path / "g31_unauthorized"
+    _bootstrap(unauthorized_loop)
+    _write_log(
+        unauthorized_loop,
+        [
+            ("2026-07-15T11:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "retry dispatched"),
+        ],
+    )
+    unauthorized = _doctor(unauthorized_loop)
+    unauthorized_warnings = [
+        warning for warning in unauthorized["warnings"]
+        if warning["code"] == "blocked_exit_unauthorized"
+    ]
+    if not unauthorized_warnings:
+        _fail("G31 doctor must warn on BLOCKED -> FIX_REQUESTED without preceding human authorization")
+    if not any(request_id in warning["message"] for warning in unauthorized_warnings):
+        _fail("G31 blocked_exit_unauthorized must name the request_id")
+    if any(issue["code"] == "blocked_exit_unauthorized" for issue in unauthorized["issues"]):
+        _fail("G31 blocked_exit_unauthorized must be warning-only")
+
+    for suffix, note in (
+        ("denied", "human authorization denied"),
+        ("pending", "human approval needed"),
+        ("awaiting", "awaiting human authorization: resume"),
+        ("denied_suffix", "human authorization: resume denied"),
+        ("question", "human authorized? no"),
+        ("false", "human approved: false"),
+        ("record_pending", "human authorization recorded: pending"),
+    ):
+        negative_loop = tmp_path / ("g31_authorization_" + suffix)
+        _bootstrap(negative_loop)
+        _write_log(
+            negative_loop,
+            [
+                (
+                    "2026-07-15T11:01:00Z",
+                    request_id,
+                    "2",
+                    "BLOCKED",
+                    "FIX_REQUESTED",
+                    "product",
+                    note,
+                ),
+            ],
+        )
+        negative = _doctor(negative_loop)
+        if not any(
+            warning["code"] == "blocked_exit_unauthorized"
+            for warning in negative["warnings"]
+        ):
+            _fail(
+                "G31 doctor must not treat an ungranted human-gate note as authorization: "
+                + note
+            )
+
+    authorized_loop = tmp_path / "g31_authorized"
+    _bootstrap(authorized_loop)
+    _write_log(
+        authorized_loop,
+        [
+            ("2026-07-15T11:00:00Z", request_id, "2", "BLOCKED", "BLOCKED", "product", "human_authorization: approved | resume this request"),
+            ("2026-07-15T11:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "authorized retry dispatched"),
+        ],
+    )
+    authorized = _doctor(authorized_loop)
+    if any(warning["code"] == "blocked_exit_unauthorized" for warning in authorized["warnings"]):
+        _fail("G31 doctor must stay silent after a preceding BLOCKED -> BLOCKED authorization row")
+
+    same_row_loop = tmp_path / "g31_same_row_authorized"
+    _bootstrap(same_row_loop)
+    _write_log(
+        same_row_loop,
+        [
+            ("2026-07-15T11:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "human_authorization: approved | resume and dispatch"),
+        ],
+    )
+    same_row = _doctor(same_row_loop)
+    if any(warning["code"] == "blocked_exit_unauthorized" for warning in same_row["warnings"]):
+        _fail("G31 doctor must allow a BLOCKED exit whose own note records human authorization")
+
+
+def _check_g28_order_trust_closure(tmp_path: Path) -> None:
+    """G28 closure: malformed run-log time never grants or consumes trust."""
+    header = (
+        "# Loop Run Log\n\n"
+        "| timestamp | request_id | iteration | from_status | to_status | lane | note |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+    )
+
+    def _write_log(loop_dir: Path, rows) -> None:
+        text = header + "".join("| " + " | ".join(row) + " |\n" for row in rows)
+        (loop_dir / "loop-run-log.md").write_text(text, encoding="utf-8")
+
+    request_id = "REQ-20260716-090000-implementation"
+
+    # A blank-timestamp approval look-alike is not a preceding grant. The
+    # unauthorized, validly timestamped exit must remain visible, and the
+    # malformed-row warning must explain why the apparent grant was skipped.
+    phantom_loop = tmp_path / "g28_phantom_authorization"
+    _bootstrap(phantom_loop)
+    _write_log(
+        phantom_loop,
+        [
+            ("", request_id, "2", "BLOCKED", "BLOCKED", "product", "human_authorization: approved | appended late"),
+            ("2026-07-16T09:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "retry dispatched"),
+        ],
+    )
+    phantom = _doctor(phantom_loop)
+    if not any(w["code"] == "blocked_exit_unauthorized" for w in phantom["warnings"]):
+        _fail("G28 blank-timestamp authorization look-alike must not authorize a BLOCKED exit")
+    malformed_authorization = [
+        w for w in phantom["warnings"]
+        if w["code"] == "malformed_run_log" and request_id in w["message"]
+    ]
+    if not any(
+        "authorization" in w["message"].lower() and "skipped" in w["message"].lower()
+        for w in malformed_authorization
+    ):
+        _fail("G28 malformed authorization look-alike warning must say it was skipped")
+
+    # The valid form remains authorizing.
+    valid_loop = tmp_path / "g28_valid_authorization"
+    _bootstrap(valid_loop)
+    _write_log(
+        valid_loop,
+        [
+            ("2026-07-16T09:00:00Z", request_id, "2", "BLOCKED", "BLOCKED", "product", "human_authorization: approved | resume"),
+            ("2026-07-16T09:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "retry dispatched"),
+        ],
+    )
+    valid = _doctor(valid_loop)
+    if any(w["code"] == "blocked_exit_unauthorized" for w in valid["warnings"]):
+        _fail("G28 valid timestamped authorization must still authorize the later BLOCKED exit")
+
+    # A malformed exit cannot consume a valid one-shot grant. The later valid
+    # exit uses it, while the malformed row is covered only by malformed_run_log.
+    nonconsuming_loop = tmp_path / "g28_malformed_exit_nonconsuming"
+    _bootstrap(nonconsuming_loop)
+    _write_log(
+        nonconsuming_loop,
+        [
+            ("2026-07-16T09:00:00Z", request_id, "2", "BLOCKED", "BLOCKED", "product", "human_authorization: approved | resume"),
+            ("", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "malformed retry row"),
+            ("2026-07-16T09:01:00Z", request_id, "2", "BLOCKED", "FIX_REQUESTED", "product", "valid retry dispatched"),
+        ],
+    )
+    nonconsuming = _doctor(nonconsuming_loop)
+    if any(w["code"] == "blocked_exit_unauthorized" for w in nonconsuming["warnings"]):
+        _fail("G28 malformed BLOCKED exit must not consume a valid authorization grant")
+
+    print(
+        "PROBE_G28_BLOCKED blank_auth=warn+skipped valid_auth=silent "
+        "blank_exit=nonconsuming"
+    )
+
+    # A malformed hold cannot suppress stalled_handoff. A valid hold still can.
+    hold_request = "REQ-20260716-091000-frontend"
+    hold_loop = tmp_path / "g28_human_qa_hold"
+    _bootstrap(hold_loop)
+    _append_request_row(hold_loop / "requests.md", hold_request, "product", "awaiting human QA")
+    _set_request_status(hold_loop / "requests.md", hold_request, "REVIEWING")
+    review_dir = hold_loop / "messages" / hold_request
+    review_dir.mkdir(parents=True, exist_ok=True)
+    (review_dir / "REVIEW_DONE-iter-1.md").write_text(
+        "# REVIEW_DONE\n\npass\n", encoding="utf-8"
+    )
+    blank_hold = ("", hold_request, "1", "REVIEWING", "REVIEWING", "product", "human_qa_hold: blank timestamp")
+    _write_log(hold_loop, [blank_hold])
+    malformed_hold = _doctor(hold_loop)
+    if hold_request in malformed_hold.get("held_for_human_qa", []):
+        _fail("G28 malformed human-QA hold must not enter held_for_human_qa")
+    if not any(
+        w["code"] == "stalled_handoff" and hold_request in w["message"]
+        for w in malformed_hold["warnings"]
+    ):
+        _fail("G28 malformed human-QA hold must not silence stalled_handoff")
+
+    valid_hold = (
+        "2026-07-16T09:10:00Z", hold_request, "1", "REVIEWING", "REVIEWING",
+        "product", "human_qa_hold: valid timestamp",
+    )
+    _write_log(hold_loop, [valid_hold])
+    timestamped_hold = _doctor(hold_loop)
+    if hold_request not in timestamped_hold.get("held_for_human_qa", []):
+        _fail("G28 valid timestamped human-QA hold must remain effective")
+    if any(
+        w["code"] == "stalled_handoff" and hold_request in w["message"]
+        for w in timestamped_hold["warnings"]
+    ):
+        _fail("G28 valid human-QA hold must still suppress stalled_handoff")
+
+    # A malformed hold must not consume the one durable human message that
+    # belongs to a valid hold round. Removing that message must expose the valid
+    # round as missing, proving the valid row was not skipped with the malformed.
+    message_loop = tmp_path / "g28_human_qa_message_consumption"
+    _bootstrap(message_loop)
+    message_request = "REQ-20260716-092000-frontend"
+    _write_log(
+        message_loop,
+        [
+            ("", message_request, "1", "REVIEWING", "REVIEWING", "product", "human_qa_hold: malformed duplicate"),
+            ("2026-07-16T09:20:00Z", message_request, "1", "REVIEWING", "REVIEWING", "product", "human_qa_hold: valid round"),
+        ],
+    )
+    human_dir = message_loop / "messages" / message_request
+    human_dir.mkdir(parents=True, exist_ok=True)
+    human_message = human_dir / "HUMAN_QA_REQUEST-iter-1.md"
+    human_message.write_text(
+        "# HUMAN_QA_REQUEST\n\niteration: 1\nto_lane: human\n",
+        encoding="utf-8",
+    )
+    durable = _doctor(message_loop)
+    if any(
+        w["code"] == "human_qa_message_missing" and message_request in w["message"]
+        for w in durable["warnings"]
+    ):
+        _fail("G28 malformed hold must not consume the valid round's human-QA message")
+    human_message.unlink()
+    missing = _doctor(message_loop)
+    if not any(
+        w["code"] == "human_qa_message_missing" and message_request in w["message"]
+        for w in missing["warnings"]
+    ):
+        _fail("G28 valid timestamped hold without a human-QA message must still warn")
+
+    print(
+        "PROBE_G28_HUMAN_QA blank_hold=stall valid_hold=held "
+        "blank_hold_message=nonconsuming valid_hold_missing=warn"
+    )
+
+
+def _check_g35(tmp_path: Path) -> None:
+    """G35: lifecycle markers, authority, holds, and override history."""
+    protocol_md = _read_doc(_PROTOCOL_MD)
+    loop_state_md = _read_doc(_LOOP_STATE_MD)
+    skill_md = _read_doc(_SKILL_MD)
+    protocol_collapsed = " ".join(protocol_md.lower().split())
+    loop_state_collapsed = " ".join(loop_state_md.lower().split())
+    skill_collapsed = " ".join(skill_md.lower().split())
+
+    for needle in (
+        "run_complete",
+        "| <ts> | - | - | run_complete | run_complete | product |",
+        "every request is terminal",
+        "done-when holds",
+        "two-phase cap raises",
+        "blocked -> blocked",
+        "separate later checkpoint",
+        "cap_authorization:",
+        "the lane that performed the transition",
+        "acting lane, not the new owner",
+        "human-gate transitions are always recorded by product",
+        "fix_requested may be owned by review",
+        "pre_implementation_test_request",
+        "implementation-independent red-capable enumeration",
+        "human_qa_hold:",
+        "note starts with",
+        "human_qa_requested:",
+    ):
+        if needle not in protocol_collapsed:
+            _fail("G35 protocol wording is missing: {0!r}".format(needle))
+
+    authority_sentence = "loop-run-log.md is the authoritative transition history"
+    snapshot_sentence = "requests.md is a coarse current-state snapshot at checkpoint granularity"
+    for name, collapsed in (
+        ("protocol.md", protocol_collapsed),
+        ("loop-state.md", loop_state_collapsed),
+    ):
+        for needle in (
+            authority_sentence,
+            snapshot_sentence,
+            "planned",
+            "implementation_done",
+            "may never appear",
+            "that is legal",
+        ):
+            if needle not in collapsed:
+                _fail("G35 {0} authority wording is missing: {1!r}".format(name, needle))
+    if "pre_implementation_test_request" not in skill_collapsed:
+        _fail("G35 SKILL.md message vocabulary must include PRE_IMPLEMENTATION_TEST_REQUEST")
+
+    loop = tmp_path / "g35_loop"
+    _bootstrap(loop)
+    requests_text = (loop / "requests.md").read_text(encoding="utf-8")
+    requests_collapsed = " ".join(requests_text.lower().split())
+    for needle in (authority_sentence, snapshot_sentence, "may never appear", "that is legal"):
+        if needle not in requests_collapsed:
+            _fail("G35 generated requests.md authority wording is missing: {0!r}".format(needle))
+
+    policy_text = (loop / "loop-policy.md").read_text(encoding="utf-8")
+    policy_collapsed = " ".join(policy_text.lower().split())
+    for needle in (
+        "## overrides",
+        "append-only",
+        "active -> superseded/completed",
+        "never rewritten in place",
+        "override: max_fix_cycles",
+        "status: active",
+    ):
+        if needle not in policy_collapsed:
+            _fail("G35 generated loop-policy.md Overrides wording is missing: {0!r}".format(needle))
+
+    run_log_text = (loop / "loop-run-log.md").read_text(encoding="utf-8")
+    run_log_collapsed = " ".join(run_log_text.lower().split())
+    for needle in (
+        "lane that performed the transition",
+        "acting lane, not the new owner",
+        "human-gate transitions are always recorded by product",
+    ):
+        if needle not in run_log_collapsed:
+            _fail("G35 generated loop-run-log.md wording is missing: {0!r}".format(needle))
+
+    # RUN_COMPLETE is a parseable non-request marker with an exact row shape.
+    with (loop / "loop-run-log.md").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "| 2026-07-15T12:00:00Z | - | - | RUN_COMPLETE | RUN_COMPLETE | product | "
+            "every request terminal; goal Done-When holds |\n"
+        )
+    run_snapshot = doctor.load_run_log_snapshot(loop)
+    run_complete_rows = [
+        row for row in run_snapshot["rows"]
+        if row.get("to_status") == "RUN_COMPLETE"
+    ]
+    if len(run_complete_rows) != 1:
+        _fail("G35 RUN_COMPLETE row must parse exactly once")
+    marker = run_complete_rows[0]
+    expected_shape = {
+        "request_id": "-",
+        "iteration": "-",
+        "from_status": "RUN_COMPLETE",
+        "to_status": "RUN_COMPLETE",
+        "lane": "product",
+    }
+    for key, expected in expected_shape.items():
+        if marker.get(key) != expected:
+            _fail("G35 RUN_COMPLETE row has wrong {0}: {1!r}".format(key, marker.get(key)))
+    if run_snapshot["warnings"]:
+        _fail("G35 RUN_COMPLETE row must parse without malformed_run_log warnings: {0!r}".format(
+            run_snapshot["warnings"]
+        ))
+
+    # The new greppable hold marker suppresses stalls; the legacy prose marker
+    # remains covered by _check_g3_doctor and therefore stays additive.
+    hold_request = "REQ-20260715-120100-frontend"
+    _append_request_row(loop / "requests.md", hold_request, "product", "awaiting human QA")
+    _set_request_status(loop / "requests.md", hold_request, "REVIEWING")
+    review_dir = loop / "messages" / hold_request
+    review_dir.mkdir(parents=True, exist_ok=True)
+    (review_dir / "REVIEW_DONE-iter-1.md").write_text("# REVIEW_DONE\n\npass\n", encoding="utf-8")
+    _append_run_log_row(
+        loop, hold_request, "REVIEWING", "REVIEWING", "product",
+        "human_qa_hold: operator must judge the interaction",
+    )
+    held = _doctor(loop)
+    if hold_request not in held.get("held_for_human_qa", []):
+        _fail("G35 doctor must recognize a note starting human_qa_hold:")
+    if any(w["code"] == "stalled_handoff" and hold_request in w["message"] for w in held["warnings"]):
+        _fail("G35 human_qa_hold: must suppress stalled_handoff")
+
+    _append_run_log_row(
+        loop, hold_request, "REVIEWING", "REVIEWING", "product",
+        "human_qa: confirmed by operator",
+    )
+    released = _doctor(loop)
+    if hold_request in released.get("held_for_human_qa", []):
+        _fail("G35 human-QA confirmation must release the current hold")
+    _append_run_log_row(
+        loop, hold_request, "REVIEWING", "REVIEWING", "product",
+        "human_qa_hold: a later round needs a new operator judgment",
+    )
+    held_again = _doctor(loop)
+    if hold_request not in held_again.get("held_for_human_qa", []):
+        _fail("G35 a later human_qa_hold: must take effect after an earlier confirmation")
+
+    # override_history_gap both ways: non-default cap without an Active record
+    # warns; appending the Active override line clears the warning.
+    policy_path = loop / "loop-policy.md"
+    policy_path.write_text(
+        policy_path.read_text(encoding="utf-8").replace("max_fix_cycles: 3", "max_fix_cycles: 5"),
+        encoding="utf-8",
+    )
+    gap = _doctor(loop)
+    gap_warnings = [w for w in gap["warnings"] if w["code"] == "override_history_gap"]
+    if not gap_warnings:
+        _fail("G35 doctor must warn override_history_gap for a non-default cap without Active override")
+    if any(issue["code"] == "override_history_gap" for issue in gap["issues"]):
+        _fail("G35 override_history_gap must be warning-only")
+    with policy_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "- override: max_fix_cycles | value: 5 | status: Active | "
+            "authorized_at: 2026-07-15T12:05:00Z | decision: human authorization recorded\n"
+        )
+    active = _doctor(loop)
+    if any(w["code"] == "override_history_gap" for w in active["warnings"]):
+        _fail("G35 doctor must stay silent when a non-default cap has an Active override line")
+
+    # A resumed-round FIX_REQUEST carries cap_authorization. The doctor reports
+    # a missing line and clears once the flat field is added.
+    resume_request = "REQ-20260715-120200-implementation"
+    _append_run_log_row(
+        loop, resume_request, "BLOCKED", "BLOCKED", "product",
+        "human_authorization: approved | raise cap for this request",
+    )
+    _append_run_log_row(
+        loop, resume_request, "BLOCKED", "FIX_REQUESTED", "product",
+        "authorized resumed round",
+    )
+    fix_dir = loop / "messages" / resume_request
+    fix_dir.mkdir(parents=True, exist_ok=True)
+    resumed_fix = fix_dir / "FIX_REQUEST-iter-1.md"
+    resumed_fix.write_text(
+        "# FIX_REQUEST\n\n"
+        "request_id: {0}\n"
+        "iteration: 1\n"
+        "defect_class: an outcome is valid if and only if the contract holds\n"
+        "sibling_scan:\n- complete domain\n".format(resume_request),
+        encoding="utf-8",
+    )
+    cap_gap = _doctor(loop)
+    if not any(w["code"] == "fix_request_cap_authorization_missing" for w in cap_gap["warnings"]):
+        _fail("G35 doctor must warn when a resumed-round FIX_REQUEST lacks cap_authorization:")
+    resumed_fix.write_text(
+        resumed_fix.read_text(encoding="utf-8")
+        + "cap_authorization: loop-run-log.md 2026-07-15T10:00:00Z\n",
+        encoding="utf-8",
+    )
+    cap_present = _doctor(loop)
+    if any(w["code"] == "fix_request_cap_authorization_missing" for w in cap_present["warnings"]):
+        _fail("G35 doctor must stay silent when resumed FIX_REQUEST has cap_authorization:")
+
+
+def _check_g32(tmp_path: Path) -> None:
+    """G32: evidence mirrors, scoped gate records, freeze hashes, schema widening."""
+    protocol_md = _read_doc(_PROTOCOL_MD)
+    loop_state_md = _read_doc(_LOOP_STATE_MD)
+    gate_source = Path(completion_gate.__file__).read_text(encoding="utf-8")
+    protocol_collapsed = " ".join(protocol_md.lower().split())
+    loop_state_collapsed = " ".join(loop_state_md.lower().split())
+    gate_collapsed = " ".join(gate_source.lower().split())
+
+    for name, collapsed in (
+        ("protocol.md", protocol_collapsed),
+        ("loop-state.md", loop_state_collapsed),
+    ):
+        for needle in (
+            "docs/loop/lanes/<lane>/evidence/",
+            "docs/loop/evidence/",
+            "byte-for-byte",
+            "from request 1",
+        ):
+            if needle not in collapsed:
+                _fail("G32 {0} dual-write wording is missing: {1!r}".format(name, needle))
+
+    pinned_gate = (
+        "python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop "
+        "--request-id <request_id>"
+    )
+    if pinned_gate not in protocol_collapsed:
+        _fail("G32 protocol.md must pin the request-scoped completion-gate invocation")
+    for needle in (
+        "frozen-artifact ritual",
+        "both the review document",
+        "review-lane evidence json",
+        "at freeze time",
+        "re-hashes",
+        "before pass",
+    ):
+        if needle not in protocol_collapsed:
+            _fail("G32 frozen-artifact wording is missing: {0!r}".format(needle))
+    for needle in ("started_at", "finished_at", "result", "optional"):
+        if needle not in protocol_collapsed or needle not in gate_collapsed:
+            _fail("G32 additive evidence schema wording is missing: {0!r}".format(needle))
+    if "all five fields are required" not in protocol_collapsed:
+        _fail("G32 must keep all five existing evidence fields required")
+    if "records that omit" not in protocol_collapsed or "remain valid" not in protocol_collapsed:
+        _fail("G32 must state old records without optional fields remain valid")
+
+    # Old five-field records and widened records must have identical passing
+    # verdicts. Optional fields are additive metadata, never new requirements.
+    schema_dir = tmp_path / "g32_schema"
+    schema_dir.mkdir()
+    old_id = "REQ-20260715-130000-implementation"
+    new_id = "REQ-20260715-130001-implementation"
+    old_record = {
+        "request_id": old_id,
+        "checkpoint": "schema-old",
+        "command": "python -m unittest",
+        "exit_code": 0,
+        "ran_at": "2026-07-15T13:00:00Z",
+    }
+    new_record = dict(old_record)
+    new_record.update(
+        {
+            "request_id": new_id,
+            "checkpoint": "schema-new",
+            "started_at": "2026-07-15T13:00:00Z",
+            "finished_at": "2026-07-15T13:00:02Z",
+            "result": "PASS",
+        }
+    )
+    (schema_dir / "old.json").write_text(json.dumps(old_record), encoding="utf-8")
+    (schema_dir / "new.json").write_text(json.dumps(new_record), encoding="utf-8")
+    schema_records, schema_errors = completion_gate.load_evidence(schema_dir)
+    for request_id in (old_id, new_id):
+        verdict = completion_gate.evaluate(schema_records, schema_errors, request_id)
+        if not verdict["ok"]:
+            _fail("G32 additive schema changed a passing fixture verdict: {0}".format(request_id))
+
+    loop = tmp_path / "g32_loop"
+    _bootstrap(loop)
+    request_id = "REQ-20260715-131000-implementation"
+    requests_path = loop / "requests.md"
+    _append_request_row(requests_path, request_id, "product", "accepted evidence")
+    _set_request_status(requests_path, request_id, "ACCEPTED")
+    msg_dir = loop / "messages" / request_id
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    (msg_dir / "IMPLEMENTATION_DONE-iter-1.md").write_text(
+        "# IMPLEMENTATION_DONE\n\n"
+        "message_type: IMPLEMENTATION_DONE\n"
+        "request_id: {0}\n"
+        "iteration: 1\n"
+        "from_lane: implementation\n"
+        "to_lane: product\n".format(request_id),
+        encoding="utf-8",
+    )
+
+    evidence_dir = loop / "evidence"
+    _write_evidence(evidence_dir, request_id, 1, "python -m unittest", 0)
+    missing = _doctor(loop)
+    mirror_warnings = [w for w in missing["warnings"] if w["code"] == "evidence_mirror_gap"]
+    if not mirror_warnings or not any(request_id in w["message"] for w in mirror_warnings):
+        _fail("G32 doctor must warn evidence_mirror_gap when the implementing lane has no twin")
+    if any(issue["code"] == "evidence_mirror_gap" for issue in missing["issues"]):
+        _fail("G32 evidence_mirror_gap must be warning-only")
+
+    lane_evidence = loop / "lanes" / "implementation" / "evidence"
+    lane_evidence.mkdir()
+    root_test = next(evidence_dir.glob("{0}-iter-1-python-m-unittest.json".format(request_id)))
+    # A byte-identical twin with a DIFFERENT name proves matching is by content,
+    # not by filename.
+    lane_twin = lane_evidence / "content-addressed-copy.json"
+    lane_twin.write_bytes(root_test.read_bytes())
+    paired = _doctor(loop)
+    if any(w["code"] == "evidence_mirror_gap" for w in paired["warnings"]):
+        _fail("G32 doctor must stay silent for a byte-identical lane/root evidence pair")
+
+    lane_twin.write_bytes(root_test.read_bytes() + b"\n")
+    differing = _doctor(loop)
+    if not any(w["code"] == "evidence_mirror_gap" for w in differing["warnings"]):
+        _fail("G32 doctor must warn when the only lane twin differs by one byte")
+    lane_twin.write_bytes(root_test.read_bytes())
+
+    no_gate = _doctor(loop)
+    if not any(w["code"] == "gate_evidence_missing" for w in no_gate["warnings"]):
+        _fail("G32 doctor must warn gate_evidence_missing when ACCEPTED has no gate record")
+    if any(issue["code"] == "gate_evidence_missing" for issue in no_gate["issues"]):
+        _fail("G32 gate_evidence_missing must be warning-only")
+
+    def _probe_gate_command(label: str, command: str, expect_missing: bool) -> None:
+        _write_evidence(evidence_dir, request_id, 1, command, 0)
+        root = next(
+            path
+            for path in evidence_dir.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("command") == command
+        )
+        twin = lane_evidence / (label + "-gate-copy.json")
+        twin.write_bytes(root.read_bytes())
+        result = _doctor(loop)
+        missing_warning = any(
+            w["code"] == "gate_evidence_missing" for w in result["warnings"]
+        )
+        if missing_warning != expect_missing:
+            _fail(
+                "G32 gate command probe {0} expected gate_evidence_missing={1}, got {2}".format(
+                    label, expect_missing, missing_warning
+                )
+            )
+        if any(w["code"] == "evidence_mirror_gap" for w in result["warnings"]):
+            _fail("G32 gate command probe must keep every root record mirrored: " + label)
+        root.unlink()
+        twin.unlink()
+
+    unscoped = "python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop"
+    wrong = (
+        "python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop "
+        "--request-id={0}-wrong".format(request_id)
+    )
+    equals_scoped = (
+        "python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop "
+        "--request-id={0}".format(request_id)
+    )
+    whitespace_scoped = (
+        "python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop "
+        "--request-id {0}".format(request_id)
+    )
+    _probe_gate_command("unscoped", unscoped, True)
+    _probe_gate_command("wrong-prefix", wrong, True)
+    _probe_gate_command("equals", equals_scoped, False)
+    _probe_gate_command("whitespace", whitespace_scoped, False)
+    print(
+        "PROBE_G28_CLI unscoped=warn wrong_prefix=warn "
+        "equals=silent whitespace=silent"
+    )
+
+
+def _check_g33(tmp_path: Path) -> None:
+    """G33: durable, self-probed, human-focused QA requests."""
+    protocol_md = _read_doc(_PROTOCOL_MD)
+    collapsed = " ".join(protocol_md.lower().split())
+
+    # The invariant precedes artifact-specific examples, and the fixed message
+    # template carries all five required elements.
+    for needle in (
+        "# human_qa_request",
+        "message_type: human_qa_request",
+        "to_lane: human",
+        "self-probe",
+        "never advertise an entry point to the human that you have not just proven live yourself",
+        "exact artifact or entry point being advertised",
+        "first steps the human is being asked to take",
+        "real evidence",
+        "what only you can judge",
+        "charts",
+        "layout",
+        "focus behavior",
+        "never spend the human on machine-verifiable facts",
+        "reply pass, or the first concrete problem.",
+        "cache-control: no-store",
+        "ctrl+f5",
+        "needed_from_human:",
+        "recommended_answer:",
+    ):
+        if needle not in collapsed:
+            _fail("G33 HUMAN_QA_REQUEST wording is missing: {0!r}".format(needle))
+
+    for needle in (
+        "served-app example",
+        "http status",
+        "page title",
+        "app-identifying endpoint",
+        "listener pid",
+        "second bind attempt fails",
+        "cli-deliverable example",
+        "run the advertised command verbatim",
+        "exit code",
+        "first output lines",
+        "file/library-deliverable example",
+        "open, validate, or import the exact advertised path",
+    ):
+        if needle not in collapsed:
+            _fail("G33 artifact example wording is missing: {0!r}".format(needle))
+    if "illustrative run-5 example" not in collapsed or "~10h" not in collapsed:
+        _fail("G33 run-5 rationale must be clearly marked illustrative and retain the measured delay")
+    for needle in (
+        "every human-addressed message type",
+        "cap raise",
+        "qa request",
+        "intake question",
+        "one decision",
+    ):
+        if needle not in collapsed:
+            _fail("G33 all-human-message mandate is missing: {0!r}".format(needle))
+
+    # Doctor positive/negative for both the structured G35 marker and legacy
+    # prose. A file addressed to another lane does not satisfy the durable human
+    # message contract; changing that exact file to to_lane: human clears it.
+    for suffix, note in (
+        ("structured", "human_qa_hold: judge the interaction"),
+        ("legacy", "human_qa_requested: judge the interaction"),
+    ):
+        loop = tmp_path / ("g33_" + suffix)
+        _bootstrap(loop)
+        request_id = "REQ-20260715-14{0}-frontend".format(
+            "0000" if suffix == "structured" else "0100"
+        )
+        _append_run_log_row(
+            loop, request_id, "REVIEWING", "REVIEWING", "product", note
+        )
+        missing = _doctor(loop)
+        warnings = [
+            warning for warning in missing["warnings"]
+            if warning["code"] == "human_qa_message_missing"
+        ]
+        if not warnings or not any(request_id in warning["message"] for warning in warnings):
+            _fail("G33 doctor must warn for {0} hold without a human message".format(suffix))
+        if any(issue["code"] == "human_qa_message_missing" for issue in missing["issues"]):
+            _fail("G33 human_qa_message_missing must be warning-only")
+
+        msg_dir = loop / "messages" / request_id
+        msg_dir.mkdir(parents=True, exist_ok=True)
+        qa_path = msg_dir / "HUMAN_QA_REQUEST-iter-1.md"
+        qa_path.write_text(
+            "# HUMAN_QA_REQUEST\n\n"
+            "message_type: HUMAN_QA_REQUEST\n"
+            "request_id: {0}\n"
+            "iteration: 1\n"
+            "from_lane: product\n"
+            "to_lane: review\n".format(request_id),
+            encoding="utf-8",
+        )
+        wrong_lane = _doctor(loop)
+        if not any(
+            warning["code"] == "human_qa_message_missing"
+            for warning in wrong_lane["warnings"]
+        ):
+            _fail("G33 a durable message not addressed to human must not satisfy the hold")
+
+        qa_path.write_text(
+            qa_path.read_text(encoding="utf-8").replace(
+                "to_lane: review", "to_lane: human"
+            ),
+            encoding="utf-8",
+        )
+        present = _doctor(loop)
+        if any(
+            warning["code"] == "human_qa_message_missing"
+            for warning in present["warnings"]
+        ):
+            _fail("G33 doctor must stay silent for {0} hold with a durable human message".format(suffix))
+
+
+def _check_g34(tmp_path: Path) -> None:
+    """G34: reserved infrastructure ports and exclusive lane-server binds."""
+    protocol_md = _read_doc(_PROTOCOL_MD)
+    collapsed = " ".join(protocol_md.lower().split())
+    for needle in (
+        "shared runtime resource",
+        "reserved infrastructure identifier",
+        "lane-launched server",
+        "must not default to a reserved port",
+        "bind exclusively",
+        "fail loudly at startup when the port is occupied",
+        "so_reuseaddr-style co-binds are forbidden",
+    ):
+        if needle not in collapsed:
+            _fail("G34 exclusive-bind wording is missing: {0!r}".format(needle))
+    if "illustrative run-5 example" not in collapsed:
+        _fail("G34 port-collision rationale must be marked as an illustrative example")
+    for needle in ("8765", "silently co-bound", "served the wrong application"):
+        if needle not in collapsed:
+            _fail("G34 illustrative run-5 rationale is missing: {0!r}".format(needle))
+
+    project = tmp_path / "g34_project"
+    loop = project / "docs" / "loop"
+    _bootstrap(loop)
+    constraints_path = loop / "constraints.md"
+    constraints = constraints_path.read_text(encoding="utf-8")
+    if "Reserved loop infrastructure ports: 8765" not in constraints:
+        _fail("G34 bootstrap must write the dashboard default reserved-ports line")
+    if "append" not in constraints.lower() or "manual dashboard port" not in constraints.lower():
+        _fail("G34 reserved-ports line must allow later manual dashboard ports to be appended")
+
+    # Reserved URL in goal warns; an ordinary unreserved product URL does not.
+    (loop / "goal.md").write_text(
+        "# Goal\n\nUse http://127.0.0.1:8765/app for human QA.\n",
+        encoding="utf-8",
+    )
+    product_dir = project / "docs" / "product"
+    product_dir.mkdir(parents=True)
+    product_doc = product_dir / "spec.md"
+    product_doc.write_text(
+        "# Product\n\nUse http://127.0.0.1:8123/app.\n",
+        encoding="utf-8",
+    )
+    goal_reserved = _doctor(loop)
+    warnings = [
+        warning for warning in goal_reserved["warnings"]
+        if warning["code"] == "reserved_port_advertised"
+    ]
+    if not warnings or not any("goal.md" in w["message"] and "8765" in w["message"] for w in warnings):
+        _fail("G34 doctor must warn when goal.md advertises a reserved port")
+    if any(issue["code"] == "reserved_port_advertised" for issue in goal_reserved["issues"]):
+        _fail("G34 reserved_port_advertised must be warning-only")
+
+    # A manually selected dashboard port appended to the same line is also
+    # reserved, and product docs are part of the scan surface.
+    constraints_path.write_text(
+        constraints.replace(
+            "Reserved loop infrastructure ports: 8765",
+            "Reserved loop infrastructure ports: 8765, 9001",
+        ),
+        encoding="utf-8",
+    )
+    (loop / "goal.md").write_text(
+        "# Goal\n\nUse http://127.0.0.1:8123/app.\n",
+        encoding="utf-8",
+    )
+    product_doc.write_text(
+        "# Product\n\nUse http://localhost:9001/app.\n",
+        encoding="utf-8",
+    )
+    product_reserved = _doctor(loop)
+    product_warnings = [
+        warning for warning in product_reserved["warnings"]
+        if warning["code"] == "reserved_port_advertised"
+    ]
+    if not product_warnings or not any("product/spec.md" in w["message"] and "9001" in w["message"] for w in product_warnings):
+        _fail("G34 doctor must scan docs/product/*.md for appended reserved ports")
+
+    product_doc.write_text(
+        "# Product\n\nUse http://localhost:8123/app.\n",
+        encoding="utf-8",
+    )
+    clean = _doctor(loop)
+    if any(w["code"] == "reserved_port_advertised" for w in clean["warnings"]):
+        _fail("G34 doctor must stay silent when advertised URLs avoid reserved ports")
+
+    # Old loops have no parseable reserved-ports line. They skip cleanly even if
+    # a legacy goal happens to use today's dashboard default.
+    old_constraints = "\n".join(
+        line
+        for line in constraints_path.read_text(encoding="utf-8").splitlines()
+        if "Reserved loop infrastructure ports:" not in line
+    ) + "\n"
+    constraints_path.write_text(old_constraints, encoding="utf-8")
+    (loop / "goal.md").write_text(
+        "# Goal\n\nLegacy URL http://127.0.0.1:8765/app.\n",
+        encoding="utf-8",
+    )
+    old_loop = _doctor(loop)
+    if old_loop.get("reserved_port_advertised"):
+        _fail("G34 old loops without a reserved-ports line must return an empty finding list")
+    if any(w["code"] == "reserved_port_advertised" for w in old_loop["warnings"]):
+        _fail("G34 old loops without a reserved-ports line must skip without a warning")
 
 
 def _check_g14(tmp_path: Path) -> None:
@@ -3553,6 +4533,27 @@ def main() -> int:
 
         # ---- G3: doctor stalled_handoff exclusion (synthetic loop) ----------
         _check_g3_doctor(tmp_path)
+
+        # ---- G28: defect-class closure + FIX_REQUEST schema warning ---------
+        _check_g28(tmp_path)
+
+        # ---- G31: BLOCKED pause lifecycle + authorized-exit warning ---------
+        _check_g31(tmp_path)
+
+        # ---- G28 review closure: timestamp trust + CLI syntax parity --------
+        _check_g28_order_trust_closure(tmp_path)
+
+        # ---- G32: evidence mirrors + scoped gate evidence + schema ----------
+        _check_g32(tmp_path)
+
+        # ---- G33: durable self-probed human-QA requests ---------------------
+        _check_g33(tmp_path)
+
+        # ---- G34: reserved infrastructure ports + exclusive bind -----------
+        _check_g34(tmp_path)
+
+        # ---- G35: lifecycle bookkeeping + override history -----------------
+        _check_g35(tmp_path)
 
         # ---- G20: honest, grace-gated stall detection for REVIEWING ---------
         _check_g20_doctor(tmp_path)

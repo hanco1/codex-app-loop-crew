@@ -313,10 +313,23 @@ codex_app.create_thread(prompt=<lane kickoff>, target=..., model=<model for the 
 Lifecycle:
 
 ```text
-PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED
+PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING
+REVIEWING -> FIX_REQUESTED | ACCEPTED | BLOCKED
+FIX_REQUESTED -> IMPLEMENTING
+BLOCKED -> FIX_REQUESTED | ABANDONED
 ```
 
 Reuse the same `request_id` across fix cycles and increment `iteration`. Review returns a pass/fail `verdict`; product alone performs the `ACCEPTED` transition and decides whether to mark tracker checkpoints complete. For user-facing requests, product performs that transition only after the Human-QA Gate passes.
+
+**BLOCKED is a human-gate pause, not a terminal state.** It has exactly one
+legal edge back into work: `BLOCKED -> FIX_REQUESTED`, carrying a recorded human
+authorization. The authorizing run-log note is exactly
+`human_authorization: approved` or begins
+`human_authorization: approved | ` followed by an evidence pointer. **ACCEPTED
+is the success terminal.** `ABANDONED` is the explicit human-declared dead-end
+terminal: `BLOCKED -> ABANDONED` requires a recorded human decision, is a
+terminal disposition rather than a resume edge, and its rows keep their
+evidence.
 
 ## Message Protocol
 
@@ -325,6 +338,7 @@ Read `references/protocol.md` when composing or validating cross-agent messages.
 Use these message types:
 
 - `IMPLEMENTATION_REQUEST`: product -> implementation
+- `PRE_IMPLEMENTATION_TEST_REQUEST`: product -> review to freeze an implementation-independent red-capable enumeration before a class-closure fix
 - `IMPLEMENTATION_DONE`: implementation -> product or review
 - `REVIEW_REQUEST`: product or implementation -> review
 - `REVIEW_DONE`: review -> product; carries a pass/fail `verdict`, never an acceptance transition
@@ -460,7 +474,7 @@ verification cannot run -> BLOCKED, never ACCEPTED
 - "Tests not run", "could not build", or "unverified" are blockers, not acceptances. Review must send `FIX_REQUEST` or `BLOCKED`, never `REVIEW_DONE`, when evidence is absent.
 - Record the exact command, exit code, and output location in the message and the lane worklog so the next lane can re-run it.
 - Passing the gate does not end your turn. A green `SHIP_CHECK_OK` with no reply sent, no `requests.md` transition, and no run-log row is a stalled handoff, not a completed one: **close the turn** (the ritual in `references/protocol.md`) in the SAME turn, or the loop does not advance.
-- **User-facing slices need a human-QA sign-off before `ACCEPTED`.** A request marked `user_facing: true` (a UI slice, dashboard, or interactive tool - anything a person operates) does not reach `ACCEPTED` on machine evidence alone. Machine evidence still comes FIRST and is unchanged; then, after `REVIEW_DONE`, product asks the human to operate the feature (one message: URL + a 30-second try), the request HOLDS at `REVIEWING` with `next_action: awaiting human sign-off` and a `human_qa_requested` run-log row, and only a `human_qa: confirmed` run-log row unlocks the `ACCEPTED` transition. The tracker checkpoint stays `[~]` while it holds. This hold is normal waiting, not a stall (see `references/loop-state.md` "Human-QA Gate").
+- **User-facing slices need a human-QA sign-off before `ACCEPTED`.** A request marked `user_facing: true` (a UI slice, dashboard, or interactive tool - anything a person operates) does not reach `ACCEPTED` on machine evidence alone. Machine evidence still comes FIRST and is unchanged; then, after `REVIEW_DONE`, product asks the human to operate the feature (one message: URL + a 30-second try), and the request HOLDS at `REVIEWING` with `next_action: awaiting human sign-off`. Product records a `REVIEWING -> REVIEWING` row whose note starts with `human_qa_hold:`; only a later `human_qa: confirmed` row unlocks the `ACCEPTED` transition. Older free-text `human_qa_requested:` notes remain recognized. The tracker checkpoint stays `[~]` while it holds. This hold is normal waiting, not a stall (see `references/loop-state.md` "Human-QA Gate").
 
 ## Continuation And Auto-Chain
 

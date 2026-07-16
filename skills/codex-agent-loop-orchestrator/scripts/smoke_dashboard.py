@@ -790,7 +790,7 @@ def _check_poll_coordinator(html_full: str) -> None:
     # coordinator. Direct state fetches are the old double-chain escape hatch.
     if re.search(r"fetch\s*\(\s*['\"]\/api\/state", script):
         _fail("G27: state fetch bypasses the poll coordinator")
-    if script.count("requestPoll({ force: true") != 7:
+    if script.count("requestPoll({ force: true") != 8:
         _fail("G27: refresh, load-more, and visibility work must route through requestPoll")
 
     # Conditional polling must reuse the last ETag, treat 304 as connectivity
@@ -801,7 +801,7 @@ def _check_poll_coordinator(html_full: str) -> None:
         "if (r.status === 304)",
         'stateEtag = r.headers.get("ETag")',
         "if (result.notModified) {",
-        "setConn(true, stateHasStaleData(lastState || {}))",
+        "setConn(true, stateHasStaleData(lastState || {}), stateIsCompleted(lastState || {}))",
     ):
         if needle not in script:
             _fail("G27: conditional polling is missing {0!r}".format(needle))
@@ -838,23 +838,105 @@ def _check_poll_coordinator(html_full: str) -> None:
 
 
 def _check_g27_pagination_markup(html_full: str, rows: list) -> None:
-    """G27 C: every bounded collection has an honest visible-more control."""
+    """G27/G29: bounded collections expand and collapse honestly."""
     for collection in ("requests", "evidence", "run-log"):
         if 'id="{0}-pagination"'.format(collection) not in html_full:
             _fail("G27 pagination control missing for {0}".format(collection))
     keys = {row.get("key"): row for row in rows}
-    for key in ("pagination_showing", "pagination_load_more", "pagination_loading"):
+    for key in (
+        "pagination_showing",
+        "pagination_showing_all",
+        "pagination_load_more",
+        "pagination_show_less",
+        "pagination_loading",
+    ):
         row = keys.get(key) or {}
         if not str(row.get("en", "")).strip() or not str(row.get("zh", "")).strip():
-            _fail("G27 pagination i18n key {0!r} needs non-empty EN/ZH".format(key))
+            _fail("G27/G29 pagination i18n key {0!r} needs non-empty EN/ZH".format(key))
     for needle in (
         "function renderPagination(collection, meta)",
         "function loadFullCollection(collection)",
+        "function collapseFullCollection(collection)",
         'fullCollections[collection] = true',
+        "delete fullCollections[collection]",
         'encodeURIComponent(full.join(","))',
     ):
         if needle not in html_full:
-            _fail("G27 pagination wiring missing {0!r}".format(needle))
+            _fail("G27/G29 pagination wiring missing {0!r}".format(needle))
+
+    script = next((part for part in re.findall(
+        r"<script(?:\s[^>]*)?>(.*?)</script>", html_full, re.S
+    ) if "POLL_MS" in part), "")
+    collapse_start = script.find("function collapseFullCollection(collection)")
+    collapse_end = script.find("function scheduleNext", collapse_start)
+    collapse_body = script[collapse_start:collapse_end]
+    if "delete fullCollections[collection]" not in collapse_body:
+        _fail("G29: collapse handler must delete the collection from fullCollections")
+    if "requestPoll({ force: true" not in collapse_body:
+        _fail("G29: collapse must route its paginated refresh through requestPoll")
+    if re.search(r"setTimeout\s*\(\s*(?:poll|requestPoll|runPoll)\s*,", script):
+        _fail("G29: collapse introduced a bare polling setTimeout")
+
+
+def _check_g30_pulse_markup(html_full: str, rows: list) -> None:
+    """G30: the header pulse shares the active-owner heartbeat predicate."""
+    keys = {row.get("key"): row for row in rows}
+    completed = keys.get("pulse_completed") or {}
+    if completed.get("en") != "All requests accepted - loop idle":
+        _fail("G30: pulse_completed needs the exact English completed-state copy")
+    if not str(completed.get("zh", "")).strip():
+        _fail("G30: pulse_completed needs a non-empty ZH value")
+    if ".pulse.completed" not in html_full:
+        _fail("G30: completed pulse needs distinct calm styling")
+
+    scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html_full, re.S)
+    script = next((part for part in scripts if "POLL_MS" in part), "")
+    stale_start = script.find("function stateHasStaleData(state)")
+    stale_end = script.find("function stateIsCompleted(state)", stale_start)
+    stale_body = script[stale_start:stale_end]
+    if stale_start < 0 or stale_end < 0:
+        _fail("G30: stale/completed pulse predicates are missing")
+    if "laneHasStaleActiveOwnerHeartbeat" not in stale_body:
+        _fail("G30: header staleness must use the shared active-owner predicate")
+    if re.search(r"state\.lanes[\s\S]*?heartbeat[\s\S]*?state\s*===\s*['\"]stale", stale_body):
+        _fail("G30: stateHasStaleData still contains the blunt any-lane stale pattern")
+    for needle in ("state.read_errors", "state.parse_errors", "state.refresh_degraded === true"):
+        if needle not in stale_body:
+            _fail("G30: diagnostic warning forcing lost {0!r}".format(needle))
+
+    helper_start = script.find("function laneHasStaleActiveOwnerHeartbeat(lane)")
+    helper_end = script.find("function analyzeNeedsYou", helper_start)
+    helper_body = script[helper_start:helper_end]
+    owner_start = script.find("function laneOwnsActiveRequest(lane)")
+    owner_end = helper_start
+    owner_body = script[owner_start:owner_end]
+    heartbeat_start = script.find("function heartbeatLabel(lane, gapOwnerNames)")
+    heartbeat_end = script.find("// G21:", heartbeat_start)
+    heartbeat_body = script[heartbeat_start:heartbeat_end]
+    if helper_start < 0 or "laneOwnsActiveRequest" not in helper_body:
+        _fail("G30: active-owner heartbeat helper is missing its ownership check")
+    if owner_start < 0 or "is_owner === true" not in owner_body:
+        _fail("G30: active-owner predicate must require current_request.is_owner")
+    if "laneHasStaleActiveOwnerHeartbeat" not in heartbeat_body:
+        _fail("G30: lane cards and header must share the same stale-heartbeat helper")
+
+    completed_start = stale_end
+    completed_end = script.find("function render(state)", completed_start)
+    completed_body = script[completed_start:completed_end]
+    for needle in (
+        "requests.length > 0",
+        'status || ""',
+        'toUpperCase() === "ACCEPTED"',
+        "doc.warnings",
+    ):
+        if needle not in completed_body:
+            _fail("G30: completed predicate is missing {0!r}".format(needle))
+    set_conn_start = script.find("function setConn(connected, stale, completed)")
+    set_conn_end = script.find("function diagnosticSources", set_conn_start)
+    set_conn_body = script[set_conn_start:set_conn_end]
+    for needle in ('classList.add("completed")', 'pulseStateKey = "pulse_completed"'):
+        if needle not in set_conn_body:
+            _fail("G30: completed pulse rendering is missing {0!r}".format(needle))
 
 
 def _check_g18_progress_collapse(html_full: str, rows: list) -> None:
@@ -2219,6 +2301,201 @@ def _check_g26_chunk3_state(tmp_path: Path) -> None:
         _fail("G26 C19: degraded refresh must carry a sanitized reason")
 
 
+def _set_g30_lane_row(loop: Path, lane_name: str, heartbeat: str) -> None:
+    """Register one synthetic lane and give it a deterministic heartbeat."""
+    path = loop / "agent-lanes.md"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    header = []
+    for line in lines:
+        if line.startswith("| lane |"):
+            header = [cell.strip() for cell in line.split("|")[1:-1]]
+            break
+    if not header:
+        _fail("G30 fixture: agent-lanes.md header is missing")
+    indexes = {name: i for i, name in enumerate(header)}
+    changed = False
+    for i, line in enumerate(lines):
+        if not line.startswith("|") or line.startswith("| ---"):
+            continue
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) != len(header) or cells[indexes["lane"]] != lane_name:
+            continue
+        cells[indexes["thread_id"]] = "thread-g30-{0}".format(lane_name)
+        cells[indexes["status"]] = "registered"
+        cells[indexes["heartbeat"]] = heartbeat
+        lines[i] = "| " + " | ".join(cells) + " |"
+        changed = True
+        break
+    if not changed:
+        _fail("G30 fixture: lane {0!r} was not found".format(lane_name))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _seed_g30_loop(loop: Path, request_status: str) -> str:
+    """Create one request whose owner heartbeat is intentionally stale."""
+    _bootstrap(loop)
+    rid = "REQ-20260715-120000-implementation"
+    (loop / "requests.md").write_text(
+        "# Requests\n\n## Queue\n\n"
+        "| request_id | status | owner_lane | iteration | source_docs | "
+        "last_message | next_action | updated_at |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "| {rid} | {status} | implementation | 1 | goal.md | fixture | "
+        "fixture next action | 2026-07-15T12:00:00Z |\n".format(
+            rid=rid, status=request_status
+        ),
+        encoding="utf-8",
+    )
+    owner_heartbeat = "2000-01-01T00:00:00Z"
+    _set_g30_lane_row(loop, "implementation", owner_heartbeat)
+    (loop / "lanes" / "implementation" / "current.md").write_text(
+        "# Implementation Current State\n\n"
+        "current_request_id: {rid}\n"
+        "status: {status}\n"
+        "iteration: 1\n"
+        "last_updated: {heartbeat}\n"
+        "heartbeat: {heartbeat}\n\n"
+        "## Current Checkpoint\n\n- G30 fixture.\n\n"
+        "## Next Action\n\n- Fixture next action.\n\n"
+        "## Blockers\n\n- None.\n".format(
+            rid=rid, status=request_status.lower(), heartbeat=owner_heartbeat
+        ),
+        encoding="utf-8",
+    )
+    return rid
+
+
+def _serve_g30_state(loop: Path, doctor_clean_fixture: bool = False) -> dict:
+    """Serve one fixture through the real dashboard HTTP state endpoint."""
+    original_snapshot = loop_dashboard._doctor_snapshot
+    if doctor_clean_fixture:
+        def clean_snapshot(loop_dir: Path) -> dict:
+            snapshot = dict(original_snapshot(loop_dir))
+            # A stale registered lane necessarily produces orphan_suspect in the
+            # real doctor. Isolate the client-side completed predicate with an
+            # explicitly synthetic doctor-clean response, after the unmodified
+            # response has proved that the stale heartbeat itself is calm.
+            snapshot["warnings"] = []
+            snapshot["issues"] = []
+            snapshot["available"] = True
+            return snapshot
+
+        loop_dashboard._doctor_snapshot = clean_snapshot
+    loop_dashboard._clear_state_snapshot_cache(loop)
+    server = loop_dashboard.make_server(loop, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = "http://127.0.0.1:{0}/api/state".format(server.server_address[1])
+        status, body = _http_get(base)
+        if status != 200:
+            _fail("G30 fixture state request failed with {0}".format(status))
+        return json.loads(body.decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        loop_dashboard._doctor_snapshot = original_snapshot
+        loop_dashboard._clear_state_snapshot_cache(loop)
+
+
+def _g30_pulse_inputs(state: dict) -> tuple:
+    """Evaluate the documented pulse inputs over a served payload."""
+    def owns_active(lane: dict) -> bool:
+        current = lane.get("current_request") or {}
+        status = str(current.get("status") or "").upper()
+        return current.get("is_owner") is True \
+            and status not in {"", "PLANNED", "ACCEPTED", "BLOCKED"}
+
+    stale_active_owner = any(
+        (lane.get("heartbeat") or {}).get("state") == "stale" and owns_active(lane)
+        for lane in state.get("lanes", [])
+    )
+    requests = state.get("requests") or []
+    doctor = state.get("doctor") or {}
+    completed = bool(requests) and all(
+        str(request.get("status") or "").upper() == "ACCEPTED"
+        for request in requests
+    ) and doctor.get("available") is not False \
+        and not (doctor.get("warnings") or []) and not (doctor.get("issues") or [])
+    return stale_active_owner, completed
+
+
+def _check_g30_pulse_truthfulness(tmp: Path) -> None:
+    """G30: only a stale lane that actually owns active work warns."""
+    accepted_loop = tmp / "g30_all_accepted"
+    active_loop = tmp / "g30_active_owner"
+    accepted_rid = _seed_g30_loop(accepted_loop, "ACCEPTED")
+    active_rid = _seed_g30_loop(active_loop, "IMPLEMENTING")
+    accepted_raw = _serve_g30_state(accepted_loop)
+    accepted = _serve_g30_state(accepted_loop, doctor_clean_fixture=True)
+    active = _serve_g30_state(active_loop)
+
+    accepted_stale = [
+        lane.get("lane") for lane in accepted_raw.get("lanes", [])
+        if (lane.get("heartbeat") or {}).get("state") == "stale"
+    ]
+    if "implementation" not in accepted_stale:
+        _fail("G30 accepted fixture must contain a stale lane heartbeat")
+    if (accepted_raw.get("doctor") or {}).get("non_terminal_requests"):
+        _fail("G30 accepted fixture must have no non-terminal request")
+    raw_warning, _raw_completed = _g30_pulse_inputs(accepted_raw)
+    if raw_warning:
+        _fail("G30 unmodified accepted fixture must not reach the stale-data warning")
+    accepted_warning, accepted_completed = _g30_pulse_inputs(accepted)
+    if accepted_warning or not accepted_completed:
+        _fail("G30 doctor-clean accepted fixture must reach completed, not warning")
+
+    active_warning, active_completed = _g30_pulse_inputs(active)
+    if not active_warning or active_completed:
+        _fail("G30 active-owner fixture must reach warning, not completed: {0!r}/{1!r}".format(
+            active_warning, active_completed
+        ))
+    gaps = (active.get("doctor") or {}).get("heartbeat_gap_owners") or []
+    if not any(gap.get("request_id") == active_rid for gap in gaps):
+        _fail("G30 active fixture must expose the doctor's active-owner heartbeat gap")
+
+    _set_g30_lane_row(active_loop, "implementation", "2999-01-01T00:00:00Z")
+    _set_g30_lane_row(active_loop, "product", "2000-01-01T00:00:00Z")
+    (active_loop / "lanes" / "product" / "current.md").write_text(
+        "# Tracking Current State\n\n"
+        "current_request_id: {rid}\n"
+        "status: implementing\n"
+        "iteration: 1\n"
+        "last_updated: 2000-01-01T00:00:00Z\n"
+        "heartbeat: 2000-01-01T00:00:00Z\n\n"
+        "## Current Checkpoint\n\n- G30 non-owner fixture.\n\n"
+        "## Next Action\n\n- Observe the owner.\n\n"
+        "## Blockers\n\n- None.\n".format(rid=active_rid),
+        encoding="utf-8",
+    )
+    non_owner = _serve_g30_state(active_loop)
+    non_owner_warning, non_owner_completed = _g30_pulse_inputs(non_owner)
+    if non_owner_warning or non_owner_completed:
+        _fail("G30 stale non-owner fixture must not reach warning/completed: {0!r}/{1!r}".format(
+            non_owner_warning, non_owner_completed
+        ))
+    lanes = {lane.get("lane"): lane for lane in non_owner.get("lanes", [])}
+    owner_current = (lanes.get("implementation") or {}).get("current_request") or {}
+    tracking_current = (lanes.get("product") or {}).get("current_request") or {}
+    if owner_current.get("is_owner") is not True:
+        _fail("G30 non-owner fixture must retain the actual owner")
+    if tracking_current.get("is_owner") is not False:
+        _fail("G30 tracking lane must be marked current_request.is_owner False")
+    if not any(
+        (lane.get("heartbeat") or {}).get("state") == "stale"
+        and (lane.get("current_request") or {}).get("is_owner") is False
+        for lane in non_owner.get("lanes", [])
+    ):
+        _fail("G30 non-owner fixture must contain a stale non-owning lane")
+    print(
+        "PULSE_PROBE accepted={0}:no-warning active={1}:warning "
+        "non-owner={2}:no-warning".format(
+            accepted_rid, active_rid, active_rid
+        )
+    )
+
+
 def _check_g27_pagination(tmp: Path) -> None:
     """G27 C: active+recent defaults are bounded, counted, and expandable."""
     loop = tmp / "g27_pagination"
@@ -2329,9 +2606,29 @@ def _check_g27_pagination(tmp: Path) -> None:
         if any((full.get("pagination", {}).get(name) or {}).get("truncated")
                for name in full_lengths):
             _fail("G27 full pagination must mark every requested collection untruncated")
+
+        # G29 collapse path: after an expanded ?full= read, the client's Show
+        # less action drops the full query and the next coordinated poll uses
+        # the default URL again. The server must return the bounded snapshot.
+        status_collapsed, body_collapsed = _http_get(base)
+        if status_collapsed != 200:
+            _fail("G29 collapsed pagination request failed with {0}".format(status_collapsed))
+        collapsed = json.loads(body_collapsed.decode("utf-8"))
+        collapsed_lengths = {
+            "requests": len(collapsed.get("requests") or []),
+            "evidence": len((collapsed.get("evidence") or {}).get("records") or []),
+            "run_log": len(collapsed.get("run_log_tail") or []),
+        }
+        if collapsed_lengths != {"requests": 52, "evidence": 102, "run_log": 52}:
+            _fail("G29 collapse did not return to bounded collections: {0!r}".format(
+                collapsed_lengths
+            ))
+        if any(not (collapsed.get("pagination", {}).get(name) or {}).get("truncated")
+               for name in collapsed_lengths):
+            _fail("G29 collapsed pagination must mark each collection truncated")
         print(
             "PAGINATION_PROBE requests=52/62 evidence=102/107 run_log=52/62 "
-            "full=62,107,62"
+            "full=62,107,62 collapsed=52,102,52"
         )
     finally:
         server.shutdown()
@@ -2449,6 +2746,7 @@ def main() -> int:
 
         _check_g27_snapshot_cache_and_etag(base, loop_dir)
         _check_g27_pagination(Path(tmp))
+        _check_g30_pulse_truthfulness(Path(tmp))
         try:
             # Snapshot the whole tree BEFORE any read, to prove GETs don't write.
             snap_before = _snapshot_tree(loop_dir)
@@ -2495,6 +2793,7 @@ def main() -> int:
             _b2_rows = _extract_i18n_rows(html_full)
             _check_batch2_i18n(_b2_rows)
             _check_g27_pagination_markup(html_full, _b2_rows)
+            _check_g30_pulse_markup(html_full, _b2_rows)
             # (G26 chunk 3) Honest stale/degraded controls, checker reasons,
             # malformed-evidence notice, and all new EN/ZH strings.
             _check_g26_chunk3_markup(html_full, _b2_rows)

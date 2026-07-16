@@ -36,9 +36,9 @@ It also enforces the hardened loop engineering invariants:
   or ``auto_chain_ready``: the memory cache is fail-open, the completion gate is
   fail-closed. An absent ``decisions.jsonl`` degrades gracefully to zero
   warnings; ``decisions`` reports ``{total, active, stale, malformed}``.
-- G3 human-QA hold: a user-facing slice held awaiting a human sign-off (a
-  ``human_qa_requested`` run-log note with no matching ``human_qa: confirmed``
-  note for the same request_id) is NORMAL WAITING, so ``stalled_handoff`` is
+- G3/G35 human-QA hold: a user-facing slice held awaiting a human sign-off (a
+  ``human_qa_hold:`` run-log note, or legacy ``human_qa_requested:`` prose, with
+  no matching ``human_qa: confirmed`` note for the same request_id) is NORMAL WAITING, so ``stalled_handoff`` is
   suppressed for it. The hold is read from the append-only ``loop-run-log.md``
   (durable), not from the mutable ``next_action`` cell. Exposed as
   ``held_for_human_qa``.
@@ -46,9 +46,9 @@ It also enforces the hardened loop engineering invariants:
   ``orphan_evidence`` (an evidence file naming a request_id with no row in
   requests.md; SETUP-* records are legitimate), ``evidence_naming`` (an evidence
   filename matching neither the flat REQ contract nor SETUP-*), and
-  ``uncommitted_work`` (when git is present AND every request is terminal, a
-  non-exempt dirty/untracked file under a lane's write_scope, named with the
-  owning lane). ``uncommitted_work`` is the one check that shells out to
+  ``uncommitted_work`` (when git is present AND every request is terminal or
+  BLOCKED, a non-exempt dirty/untracked file under a lane's write_scope, named
+  with the owning lane). ``uncommitted_work`` is the one check that shells out to
   ``git status --porcelain``; that call is isolated, timed out, and fails
   silent-safe (any failure -> no warning). It is skipped entirely when git is
   absent.
@@ -63,6 +63,31 @@ It also enforces the hardened loop engineering invariants:
   by-design nesting under product's ``docs/loop/**`` ledger, mirroring the G19
   ritual-write carve-out) and ``product_scope_gap`` (a lane named ``product``
   whose scope does not cover ``docs/loop/**``, the ledger it must commit).
+- G28 defect-class schema: every archived ``FIX_REQUEST*.md`` should carry a
+  ``defect_class:`` line. Older archived loops predate the field, so a missing
+  line emits ``fix_request_class_missing`` as a WARNING only.
+- G31 BLOCKED lifecycle: ``BLOCKED`` is a pause, while ``ACCEPTED`` and
+  ``ABANDONED`` are terminal. A ``BLOCKED -> FIX_REQUESTED`` run-log exit with
+  no recorded human authorization emits ``blocked_exit_unauthorized`` as a
+  WARNING only.
+- G35 lifecycle bookkeeping: the structured ``human_qa_hold:`` marker and the
+  legacy ``human_qa_requested:`` prose both suppress false stalls; a non-default
+  fix cap without an Active append-only override emits ``override_history_gap``;
+  and a resumed-round FIX_REQUEST without ``cap_authorization:`` emits
+  ``fix_request_cap_authorization_missing``. All are file-level checks.
+- G32 evidence-chain checks are WARNING-only: ``evidence_mirror_gap`` names a
+  root evidence record at IMPLEMENTATION_DONE or beyond that has no
+  byte-identical copy in the implementing lane's evidence directory, and
+  ``gate_evidence_missing`` names an ACCEPTED iteration with no recorded,
+  request-scoped completion-gate invocation.
+- G33 human-QA durability: each structured ``human_qa_hold:`` row and legacy
+  ``human_qa_requested:`` row needs a matching durable message addressed with
+  ``to_lane: human``. Missing round messages emit
+  ``human_qa_message_missing`` as a WARNING only.
+- G34 reserved infrastructure ports: when constraints.md declares them, a URL
+  on one of those ports in goal.md or docs/product/*.md emits
+  ``reserved_port_advertised`` as a WARNING. Older loops with no declaration
+  skip the check cleanly.
 """
 
 from __future__ import annotations
@@ -116,7 +141,9 @@ REQUIRED_FILES = [
     "loop-policy.md",
 ]
 LANE_FILES = ["inbox.md", "outbox.md", "current.md", "worklog.md"]
-TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "BLOCKED"}
+TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "ABANDONED"}
+PAUSED_REQUEST_STATUSES = {"BLOCKED"}
+SETTLED_REQUEST_STATUSES = TERMINAL_REQUEST_STATUSES | PAUSED_REQUEST_STATUSES
 COMPLETION_GATE_REQUIRED_STATUSES = {
     "IMPLEMENTATION_DONE",
     "REVIEWING",
@@ -132,6 +159,7 @@ EVIDENCE_MANIFEST_REQUIRED_STATUSES = {
     "FIX_REQUESTED",
     "ACCEPTED",
     "BLOCKED",
+    "ABANDONED",
 }
 UNVERIFIED_THREAD_VALUES = {"", "UNVERIFIED", "TBD", "NONE", "NULL", "-"}
 EMPTY_CELL_VALUES = {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}
@@ -147,6 +175,27 @@ STALE_RE = re.compile(r"(?i)\b(stale|pending re-creation|unreadable|unopenable|n
 MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*max_fix_cycles\s*:\s*(\d+)\b")
 BUDGET_EXHAUSTED_RE = re.compile(r"(?im)^\s*budget_exhausted\s*:\s*true\b")
 VERIFY_COMMAND_RE = re.compile(r"(?i)\bVERIFY\s+`(?P<command>[^`\r\n]+)`")
+DEFECT_CLASS_LINE_RE = re.compile(r"(?im)^\s*defect_class\s*:")
+HUMAN_AUTHORIZATION_RE = re.compile(
+    r"(?i)^\s*human_authorization\s*:\s*approved"
+    r"(?:\s*\|[^\r\n]*)?\s*$"
+)
+CAP_AUTHORIZATION_LINE_RE = re.compile(r"(?im)^\s*cap_authorization\s*:\s*\S")
+TO_HUMAN_LINE_RE = re.compile(r"(?im)^\s*to_lane\s*:\s*human\s*(?:#.*)?$")
+MESSAGE_ITERATION_RE = re.compile(r"(?im)^\s*iteration\s*:\s*([^\s#]+)")
+FILENAME_ITERATION_RE = re.compile(r"(?i)iter-([^\s.]+)")
+EVIDENCE_ITERATION_RE = re.compile(r"(?i)-iter-(?P<iteration>\d+)-")
+RESERVED_PORTS_LINE_RE = re.compile(
+    r"(?im)^\s*(?:-\s*)?reserved loop infrastructure ports\s*:\s*(?P<value>[^\r\n]*)$"
+)
+URL_WITH_PORT_RE = re.compile(
+    r"(?i)\bhttps?://(?:\[[0-9a-f:.]+\]|[a-z0-9._-]+):(?P<port>\d{1,5})"
+    r"(?:[/][^\s<>'\"`)]*)?"
+)
+ACTIVE_MAX_FIX_OVERRIDE_RE = re.compile(
+    r"(?im)^\s*-\s*override\s*:\s*max_fix_cycles\s*\|\s*"
+    r"value\s*:\s*(\d+)\s*\|[^\r\n]*\bstatus\s*:\s*active\b"
+)
 
 # G7 evidence-lineage naming contract (references/protocol.md "Evidence
 # Records"). An evidence filename is either:
@@ -181,7 +230,7 @@ UNCOMMITTED_EXEMPT_GLOBS = [
     "**/docs/loop/dashboard.*",
 ]
 
-# Terminal/paused loops do not need a fresh subprocess on every dashboard poll.
+# Settled (terminal or paused) loops do not need a fresh subprocess on every dashboard poll.
 # Cache the raw porcelain result in-process for 20 seconds, invalidating early
 # when the git index mtime/size changes. Warning classification still runs on
 # every doctor pass, so this only changes the cadence of the expensive command.
@@ -279,6 +328,46 @@ def observed_tier_tag(current_text: str) -> str:
     return ""
 
 
+def _run_log_timestamp(row: dict[str, str]) -> str:
+    """Return the run-log timestamp cell through its supported aliases."""
+    return (
+        row.get("timestamp", "")
+        or row.get("at", "")
+        or row.get("delivered_at", "")
+        or row.get("time", "")
+    ).strip()
+
+
+def _run_log_row_has_parseable_timestamp(row: dict[str, str]) -> bool:
+    """True only when a row may participate in ordered trust decisions."""
+    return parse_timestamp(_run_log_timestamp(row)) is not None
+
+
+def _looks_like_run_log_authorization(row: dict[str, str]) -> bool:
+    """True for a BLOCKED authorization shape carrying an approved note."""
+    from_status = status_key(
+        row.get("from_status", "") or row.get("old_status", "")
+    )
+    to_status = status_key(
+        row.get("to_status", "")
+        or row.get("status", "")
+        or row.get("new_status", "")
+    )
+    note = (row.get("note", "") or "").strip()
+    return bool(
+        from_status == "BLOCKED"
+        and to_status in {"BLOCKED", "FIX_REQUESTED"}
+        and HUMAN_AUTHORIZATION_RE.search(note)
+    )
+
+
+# G28 order-trust audit (consumer -> malformed-timestamp rule):
+# - blocked-exit authorization, human-QA hold/stall exclusion, and human-QA
+#   message consumption are ordered trust/consumption ledgers: skip the row.
+# - fix-cap authorization and fix-cycle counting are conservative set/count
+#   diagnostics: keep the row so malformed data can add, never silence, a warning.
+# - RUN_COMPLETE recognition and parse/display callers are diagnostic only: keep
+#   the row and the existing epoch ordering. Stall grace has no other log input.
 def _sort_run_log_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Return run-log rows in stable timestamp order.
 
@@ -288,22 +377,16 @@ def _sort_run_log_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     of transitions must order by the ``timestamp`` cell, not by file/row order.
 
     The sort is STABLE: rows whose timestamp is blank or unparseable keep their
-    original relative position (and sort as the epoch so they never jump ahead of
-    real timestamps), so a malformed row never reorders the rest. Set-based
-    reconstructions (e.g. the human-QA hold) are already order-independent; this
-    helper guarantees the ORDERED ones agree on a shuffled log too.
+    original relative position and retain the historical epoch fallback. This is
+    useful for display/diagnostics only. Ordered trust consumers independently
+    reject those rows, so epoch placement can never make malformed data precede
+    an authorization or consume a one-shot grant.
     """
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def _key(indexed: tuple[int, dict[str, str]]) -> tuple[datetime, int]:
         idx, row = indexed
-        raw = (
-            row.get("timestamp", "")
-            or row.get("at", "")
-            or row.get("delivered_at", "")
-            or row.get("time", "")
-        )
-        parsed = parse_timestamp(raw)
+        parsed = parse_timestamp(_run_log_timestamp(row))
         # Fall back to epoch (keeps unparseable rows first, in original order via
         # the tie-breaking original index) so a bad cell never scrambles order.
         return (parsed or epoch, idx)
@@ -400,6 +483,14 @@ def read_max_fix_cycles(policy_text: str) -> int:
         return DEFAULT_MAX_FIX_CYCLES
 
 
+def has_active_max_fix_override(policy_text: str, value: int) -> bool:
+    """True when append-only policy history has an Active matching cap."""
+    return any(
+        int(match.group(1)) == value
+        for match in ACTIVE_MAX_FIX_OVERRIDE_RE.finditer(policy_text or "")
+    )
+
+
 def load_run_log_snapshot(
     loop_dir: Path,
     text: Optional[str] = None,
@@ -441,19 +532,22 @@ def load_run_log_snapshot(
             row.get("request_id", "") or row.get("request", "") or row.get("req", "")
         ).strip()
         suffix = " (request {0})".format(request_id) if request_id else ""
-        raw_time = (
-            row.get("timestamp", "")
-            or row.get("at", "")
-            or row.get("delivered_at", "")
-            or row.get("time", "")
-        ).strip()
+        raw_time = _run_log_timestamp(row)
         if not raw_time or parse_timestamp(raw_time) is None:
+            trust_note = (
+                " it looked like an authorization row and was skipped for "
+                "authorization decisions"
+                if _looks_like_run_log_authorization(row)
+                else " order-dependent trust and consumption skip the row"
+            )
             warnings.append(
                 {
                     "severity": "warning",
                     "code": "malformed_run_log",
                     "message": "loop-run-log.md line {0}{1}: timestamp is blank or invalid; "
-                    "ordering keeps the existing epoch fallback".format(lineno, suffix),
+                    "pure ordering keeps the existing epoch fallback;{2}".format(
+                        lineno, suffix, trust_note
+                    ),
                 }
             )
         if not request_id:
@@ -1127,6 +1221,168 @@ def check_evidence_lineage(loop_dir: Path, request_ids: set[str]) -> dict[str, A
     return {"orphan_evidence": orphan_evidence, "evidence_naming": evidence_naming}
 
 
+def _message_field(text: str, field: str) -> str:
+    """Return the first non-empty flat Markdown-envelope field value."""
+    match = re.search(
+        r"(?im)^\s*{0}\s*:\s*(?P<value>[^\r\n#]+?)\s*$".format(
+            re.escape(field)
+        ),
+        text,
+    )
+    return match.group("value").strip() if match is not None else ""
+
+
+def _implementing_lane(
+    loop_dir: Path,
+    request: dict[str, Any],
+    lane_names: set[str],
+) -> str:
+    """Resolve the lane that implemented a request from durable envelopes.
+
+    IMPLEMENTATION_DONE.from_lane is the strongest signal. The original
+    IMPLEMENTATION_REQUEST.to_lane is the fallback. A request-id suffix is used
+    only for older archives whose envelope omitted both fields.
+    """
+    request_id = str(request.get("request_id", "")).strip()
+    message_dir = loop_dir / "messages" / request_id
+    for pattern, field in (
+        ("IMPLEMENTATION_DONE*.md", "from_lane"),
+        ("IMPLEMENTATION_REQUEST*.md", "to_lane"),
+    ):
+        if not message_dir.is_dir():
+            break
+        for path in sorted(message_dir.glob(pattern), reverse=True):
+            if not path.is_file():
+                continue
+            lane = _message_field(read_text(path), field)
+            if lane and (not lane_names or lane in lane_names):
+                return lane
+
+    # The stable request-id contract ends in the implementation lane name.
+    # Longest-first avoids choosing "eng" when "data-eng" is registered.
+    lowered = request_id.lower()
+    for lane in sorted(lane_names, key=lambda value: (-len(value), value)):
+        if lowered.endswith("-" + lane.lower()):
+            return lane
+
+    # At IMPLEMENTATION_DONE the current owner is normally still the
+    # implementing lane. Do not use later owners (product/review) as a guess.
+    if status_key(str(request.get("status", ""))) == "IMPLEMENTATION_DONE":
+        owner = str(request.get("owner_lane", "")).strip()
+        if owner in lane_names:
+            return owner
+    return ""
+
+
+def check_evidence_mirrors(
+    loop_dir: Path,
+    requests: list[dict[str, Any]],
+    records_by_request: dict[str, list[dict[str, Any]]],
+    lane_names: set[str],
+) -> list[dict[str, str]]:
+    """Find root evidence records without a byte-identical lane twin.
+
+    Only real flat files in ``docs/loop/evidence`` are checked. This keeps the
+    function honest when a caller supplies pre-parsed in-memory records for a
+    performance probe: an in-memory record is not a root evidence artifact.
+    Filenames deliberately do not participate in matching; exact bytes do.
+    """
+    lane_content_cache: dict[str, set[bytes]] = {}
+    findings: list[dict[str, str]] = []
+    for request in requests:
+        request_id = str(request.get("request_id", "")).strip()
+        if status_key(str(request.get("status", ""))) not in COMPLETION_GATE_REQUIRED_STATUSES:
+            continue
+        lane = _implementing_lane(loop_dir, request, lane_names)
+        if not lane:
+            # Without a durable implementing-lane identity there is no safe
+            # directory to compare. Other lineage diagnostics cover malformed
+            # lifecycle archives; never guess product/review here.
+            continue
+        for record in records_by_request.get(request_id, []):
+            source_text = str(record.get("_source", "")).strip()
+            if not source_text:
+                continue
+            source = Path(source_text)
+            try:
+                source = source.resolve()
+                evidence_root = (loop_dir / "evidence").resolve()
+                source.relative_to(evidence_root)
+            except (OSError, ValueError):
+                continue
+            if source.parent != evidence_root or not source.is_file():
+                continue
+
+            if lane not in lane_content_cache:
+                contents: set[bytes] = set()
+                lane_dir = loop_dir / "lanes" / lane / "evidence"
+                if lane_dir.is_dir():
+                    for twin in sorted(lane_dir.glob("*.json")):
+                        if not twin.is_file():
+                            continue
+                        try:
+                            contents.add(twin.read_bytes())
+                        except OSError:
+                            continue
+                lane_content_cache[lane] = contents
+            try:
+                root_bytes = source.read_bytes()
+            except OSError:
+                continue
+            if root_bytes in lane_content_cache[lane]:
+                continue
+            findings.append(
+                {
+                    "request_id": request_id,
+                    "lane": lane,
+                    "file": source.name,
+                }
+            )
+    return findings
+
+
+def check_gate_evidence(
+    requests: list[dict[str, Any]],
+    records_by_request: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, str]]:
+    """Find ACCEPTED iterations lacking request-scoped gate evidence."""
+    findings: list[dict[str, str]] = []
+    for request in requests:
+        if status_key(str(request.get("status", ""))) != "ACCEPTED":
+            continue
+        request_id = str(request.get("request_id", "")).strip()
+        iteration = str(request.get("iteration", "")).strip()
+        if not request_id:
+            continue
+        # This is the only recorded-command flag-value parser in the doctor.
+        # Match both argparse spellings while keeping the value token exact, so
+        # ``<request_id>-suffix`` cannot satisfy the request-scoped evidence gate.
+        scoped_request_re = re.compile(
+            r"(?:^|\s)--request-id(?:=|\s+){0}(?=$|\s)".format(
+                re.escape(request_id)
+            )
+        )
+        found = False
+        for record in records_by_request.get(request_id, []):
+            command = normalize_verify_command(str(record.get("command", "")))
+            if "completion_gate.py" not in command or not scoped_request_re.search(command):
+                continue
+            source = Path(str(record.get("_source", ""))).name
+            match = EVIDENCE_ITERATION_RE.search(source)
+            if match is None or match.group("iteration") != iteration:
+                continue
+            found = True
+            break
+        if not found:
+            findings.append(
+                {
+                    "request_id": request_id,
+                    "iteration": iteration,
+                }
+            )
+    return findings
+
+
 def _git_status_porcelain(git_root: Path) -> Optional[list[tuple[str, str]]]:
     """Return ``[(xy, path), ...]`` from ``git status --porcelain``, or None.
 
@@ -1213,13 +1469,13 @@ def _git_status_porcelain_cached(
 def check_uncommitted_work(
     loop_dir: Path,
     lanes: list[dict[str, str]],
-    all_requests_terminal: bool,
+    all_requests_settled: bool,
     git_present: bool,
 ) -> list[dict[str, Any]]:
     """G7 (c): warn on uncommitted in-scope work when the loop is paused/idle.
 
-    Only runs when git is present AND every request is terminal (a paused or idle
-    loop): mid-flight dirty files are normal work-in-progress, not a hygiene
+    Only runs when git is present AND every request is settled (terminal or
+    BLOCKED): mid-flight dirty files are normal work-in-progress, not a hygiene
     problem. When git is absent the check is skipped entirely and silently.
 
     For each non-exempt dirty/untracked path reported by ``git status
@@ -1227,7 +1483,7 @@ def check_uncommitted_work(
     emit an ``uncommitted_work`` finding naming that lane. Exempt paths (data/DB
     artifacts, dashboard logs) are dropped. WARNING-only; never a gate.
     """
-    if not git_present or not all_requests_terminal:
+    if not git_present or not all_requests_settled:
         return []
     git_dir = find_git_dir(loop_dir)
     if git_dir is None:
@@ -1355,6 +1611,62 @@ def check_handoff_sensitive_content(loop_dir: Path) -> list[dict[str, str]]:
     return findings
 
 
+def reserved_loop_ports(constraints_text: str) -> set[int]:
+    """Parse explicit port numbers from the reserved-infrastructure line."""
+    ports: set[int] = set()
+    for match in RESERVED_PORTS_LINE_RE.finditer(constraints_text or ""):
+        for token in re.findall(r"\b\d{1,5}\b", match.group("value")):
+            port = int(token)
+            if 1 <= port <= 65535:
+                ports.add(port)
+    return ports
+
+
+def check_reserved_port_advertisements(
+    loop_dir: Path, constraints_text: str
+) -> list[dict[str, str]]:
+    """Find goal/product URLs that advertise a reserved infrastructure port.
+
+    No declaration means no inferred defaults and no warning. This is the
+    compatibility path for loops bootstrapped before the reserved-ports line
+    existed.
+    """
+    reserved = reserved_loop_ports(constraints_text)
+    if not reserved:
+        return []
+
+    docs: list[tuple[Path, str]] = [(loop_dir / "goal.md", "goal.md")]
+    product_dir = loop_dir.parent / "product"
+    if product_dir.is_dir():
+        docs.extend(
+            (path, str(path.relative_to(loop_dir.parent)).replace("\\", "/"))
+            for path in sorted(product_dir.glob("*.md"))
+            if path.is_file()
+        )
+
+    findings: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for path, label in docs:
+        if not path.is_file():
+            continue
+        for match in URL_WITH_PORT_RE.finditer(read_text(path)):
+            port = int(match.group("port"))
+            if port not in reserved:
+                continue
+            item = (label, str(port), match.group(0))
+            if item in seen:
+                continue
+            seen.add(item)
+            findings.append(
+                {
+                    "file": label,
+                    "port": str(port),
+                    "url": match.group(0),
+                }
+            )
+    return findings
+
+
 def _pending_inbox_count(loop_dir: Path, lane: str) -> int:
     """Count undelivered messages in ``lane``'s Maildir inbox (inbox/new/*.md).
 
@@ -1476,6 +1788,143 @@ def blocked_recommended_answer(loop_dir: Path, request_id: str) -> str:
     return ""
 
 
+def check_fix_request_defect_classes(loop_dir: Path) -> list[dict[str, str]]:
+    """Return archived FIX_REQUEST messages missing ``defect_class:``.
+
+    The check is intentionally file-level and warning-only. Existing archived
+    loops can predate G28, so a missing field must be visible without changing
+    handoff, auto-chain, or completion-gate semantics.
+    """
+    messages_dir = loop_dir / "messages"
+    if not messages_dir.is_dir():
+        return []
+    missing: list[dict[str, str]] = []
+    for path in sorted(messages_dir.glob("**/FIX_REQUEST*.md")):
+        if not path.is_file():
+            continue
+        if DEFECT_CLASS_LINE_RE.search(read_text(path)):
+            continue
+        missing.append(
+            {
+                "file": str(path.relative_to(loop_dir)).replace("\\", "/"),
+                "request_id": path.parent.name,
+            }
+        )
+    return missing
+
+
+def check_fix_request_cap_authorizations(
+    loop_dir: Path, rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Find resumed-round FIX_REQUEST files missing ``cap_authorization:``."""
+    resumed_rounds: set[tuple[str, str]] = set()
+    for row in rows:
+        request_id = (
+            row.get("request_id", "")
+            or row.get("request", "")
+            or row.get("req", "")
+        ).strip()
+        from_status = status_key(
+            row.get("from_status", "") or row.get("old_status", "")
+        )
+        to_status = status_key(
+            row.get("to_status", "")
+            or row.get("status", "")
+            or row.get("new_status", "")
+        )
+        iteration = (row.get("iteration", "") or "").strip()
+        if request_id and iteration and from_status == "BLOCKED" and to_status == "FIX_REQUESTED":
+            resumed_rounds.add((request_id, iteration))
+
+    messages_dir = loop_dir / "messages"
+    if not resumed_rounds or not messages_dir.is_dir():
+        return []
+    missing: list[dict[str, str]] = []
+    for path in sorted(messages_dir.glob("**/FIX_REQUEST*.md")):
+        if not path.is_file():
+            continue
+        text = read_text(path)
+        iteration_match = MESSAGE_ITERATION_RE.search(text)
+        filename_match = FILENAME_ITERATION_RE.search(path.name)
+        iteration = (
+            iteration_match.group(1).strip()
+            if iteration_match is not None
+            else (filename_match.group(1).strip() if filename_match is not None else "")
+        )
+        request_id = path.parent.name
+        if (request_id, iteration) not in resumed_rounds:
+            continue
+        if CAP_AUTHORIZATION_LINE_RE.search(text):
+            continue
+        missing.append(
+            {
+                "file": str(path.relative_to(loop_dir)).replace("\\", "/"),
+                "request_id": request_id,
+                "iteration": iteration,
+            }
+        )
+    return missing
+
+
+def check_blocked_exit_authorization(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Find BLOCKED -> FIX_REQUESTED exits without human authorization.
+
+    A preceding same-request BLOCKED -> BLOCKED authorization row grants one
+    later dispatch. The exit row may instead carry the authorization itself.
+    Authorizations are consumed so one old decision cannot silently reopen
+    every later pause for the same request.
+    """
+    authorization_ready: dict[str, bool] = {}
+    findings: list[dict[str, str]] = []
+    for row in rows:
+        if not _run_log_row_has_parseable_timestamp(row):
+            # A malformed row cannot grant authorization, consume a prior grant,
+            # or reset the ledger. load_run_log_snapshot reports it separately.
+            continue
+        request_id = (
+            row.get("request_id", "")
+            or row.get("request", "")
+            or row.get("req", "")
+        ).strip()
+        if not request_id:
+            continue
+        from_status = status_key(
+            row.get("from_status", "") or row.get("old_status", "")
+        )
+        to_status = status_key(
+            row.get("to_status", "")
+            or row.get("status", "")
+            or row.get("new_status", "")
+        )
+        note = (row.get("note", "") or "").strip()
+        note_authorized = bool(HUMAN_AUTHORIZATION_RE.search(note))
+
+        if from_status == "BLOCKED" and to_status == "BLOCKED":
+            if note_authorized:
+                authorization_ready[request_id] = True
+            continue
+        if from_status == "BLOCKED" and to_status == "FIX_REQUESTED":
+            if note_authorized or authorization_ready.get(request_id, False):
+                authorization_ready[request_id] = False
+                continue
+            findings.append(
+                {
+                    "request_id": request_id,
+                    "timestamp": (
+                        row.get("timestamp", "")
+                        or row.get("at", "")
+                        or row.get("time", "")
+                    ).strip(),
+                }
+            )
+            continue
+        if to_status == "BLOCKED" and from_status != "BLOCKED":
+            authorization_ready[request_id] = False
+    return findings
+
+
 def requests_held_for_human_qa(
     loop_dir: Path, rows: Optional[list[dict[str, str]]] = None
 ) -> set[str]:
@@ -1484,26 +1933,29 @@ def requests_held_for_human_qa(
     A user-facing slice, after REVIEW_DONE, HOLDS at REVIEWING while product asks
     the human to operate the feature (see references/protocol.md "Human-QA gate
     for user-facing slices"). The hold is recorded durably in the append-only
-    ``loop-run-log.md`` as a ``human_qa_requested`` note; the sign-off that
+    ``loop-run-log.md`` as a note starting ``human_qa_hold:``; the sign-off that
     releases the hold is a later ``human_qa: confirmed`` note for the same
-    request_id.
+    request_id. Older free-text ``human_qa_requested:`` notes remain recognized.
 
     We detect the hold from the RUN LOG rather than the mutable ``next_action``
     cell because the run log is append-only and timestamp-durable: a
     ``next_action`` marker is overwritten on every transition and would silently
-    lose the hold, whereas the ``human_qa_requested`` row survives. A request is
-    "held" when it has at least one ``human_qa_requested`` note and NO matching
-    ``human_qa: confirmed`` note. Once confirmed, it is no longer held (and
-    proceeds to ACCEPTED). Absent a run log, no request is held.
+    lose the hold, whereas the run-log marker survives. A hold note activates the
+    request's hold state and a later ``human_qa: confirmed`` note releases it. A
+    still-later hold note activates it again for a new QA round. Absent a run log,
+    no request is held.
     """
-    requested: set[str] = set()
-    confirmed: set[str] = set()
-    # G11(b): read timestamp-ordered rows. The requested/confirmed reconstruction
-    # is already set-based (order-independent), but sorting keeps every run-log
-    # reader on one ordering so a shuffled log yields identical conclusions.
+    held: set[str] = set()
+    # G11(b): reconstruct each request's current state from timestamp-ordered
+    # rows. Ordering is essential because a request can have repeated hold and
+    # confirmation rounds.
     if rows is None:
         rows = parse_run_log_sorted(loop_dir)
     for row in rows:
+        if not _run_log_row_has_parseable_timestamp(row):
+            # A malformed hold cannot suppress stalled_handoff, and a malformed
+            # confirmation cannot release a valid timestamped hold.
+            continue
         request_id = (
             row.get("request_id", "")
             or row.get("request", "")
@@ -1517,10 +1969,100 @@ def requests_held_for_human_qa(
         # "human_qa: confirmed ..." must be checked before the substring
         # "human_qa_requested" so a confirmation is never miscounted as a request.
         if "human_qa: confirmed" in note or "human_qa_confirmed" in note:
-            confirmed.add(request_id)
-        elif "human_qa_requested" in note:
-            requested.add(request_id)
-    return {rid for rid in requested if rid not in confirmed}
+            held.discard(request_id)
+        elif note.startswith("human_qa_hold:") or "human_qa_requested:" in note:
+            held.add(request_id)
+    return held
+
+
+def check_human_qa_messages(
+    loop_dir: Path, rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Find human-QA hold rounds without a durable human-addressed message.
+
+    Matching is per request and iteration. Each file is consumed at most once,
+    so two QA rounds cannot be made durable by one old message. A legacy message
+    with no iteration may satisfy one round for its request, preserving useful
+    compatibility without weakening the one-file-per-round rule.
+    """
+    holds: list[dict[str, str]] = []
+    for row in rows:
+        if not _run_log_row_has_parseable_timestamp(row):
+            # Do not let a malformed hold consume the one durable human message
+            # that belongs to a valid timestamped QA round.
+            continue
+        request_id = (
+            row.get("request_id", "")
+            or row.get("request", "")
+            or row.get("req", "")
+        ).strip()
+        if not request_id:
+            continue
+        note = (row.get("note", "") or "").strip().lower()
+        if not (
+            note.startswith("human_qa_hold:")
+            or "human_qa_requested:" in note
+        ):
+            continue
+        holds.append(
+            {
+                "request_id": request_id,
+                "iteration": (row.get("iteration", "") or "").strip(),
+                "timestamp": (
+                    row.get("timestamp", "")
+                    or row.get("at", "")
+                    or row.get("time", "")
+                ).strip(),
+            }
+        )
+
+    available: dict[str, list[dict[str, str]]] = {}
+    for request_id in sorted({hold["request_id"] for hold in holds}):
+        message_dir = loop_dir / "messages" / request_id
+        if not message_dir.is_dir():
+            continue
+        for path in sorted(message_dir.glob("*.md")):
+            if not path.is_file():
+                continue
+            text = read_text(path)
+            if not TO_HUMAN_LINE_RE.search(text):
+                continue
+            iteration_match = MESSAGE_ITERATION_RE.search(text)
+            filename_match = FILENAME_ITERATION_RE.search(path.name)
+            iteration = (
+                iteration_match.group(1).strip()
+                if iteration_match is not None
+                else (
+                    filename_match.group(1).strip()
+                    if filename_match is not None
+                    else ""
+                )
+            )
+            available.setdefault(request_id, []).append(
+                {
+                    "iteration": iteration,
+                    "file": str(path.relative_to(loop_dir)).replace("\\", "/"),
+                }
+            )
+
+    findings: list[dict[str, str]] = []
+    for hold in holds:
+        messages = available.get(hold["request_id"], [])
+        match_index: Optional[int] = None
+        for index, message in enumerate(messages):
+            if message["iteration"] == hold["iteration"]:
+                match_index = index
+                break
+        if match_index is None:
+            for index, message in enumerate(messages):
+                if not message["iteration"] or not hold["iteration"]:
+                    match_index = index
+                    break
+        if match_index is not None:
+            messages.pop(match_index)
+            continue
+        findings.append(hold)
+    return findings
 
 
 def _has_archived_review_done(loop_dir: Path, request_id: str) -> bool:
@@ -1654,6 +2196,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
 
     tracker_text = read_text(loop_dir / "tracker.md")
     handoff_text = read_text(loop_dir / "handoff.md")
+    constraints_text = read_text(loop_dir / "constraints.md")
     policy_text = read_text(loop_dir / "loop-policy.md")
     budget_text = read_text(loop_dir / "loop-budget.md")
     run_log_path = loop_dir / "loop-run-log.md"
@@ -1672,6 +2215,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     blocked = [item for item in checkboxes if item["status"] == "!"]
 
     max_fix_cycles = read_max_fix_cycles(policy_text)
+    override_history_gap = bool(
+        max_fix_cycles != DEFAULT_MAX_FIX_CYCLES
+        and not has_active_max_fix_override(policy_text, max_fix_cycles)
+    )
     run_log_snapshot = load_run_log_snapshot(
         loop_dir, text=run_log_text, source_present=run_log_path.exists()
     )
@@ -1680,6 +2227,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     control_plane_warnings.extend(
         diagnose_policy(policy_text, (loop_dir / "loop-policy.md").exists())
     )
+    blocked_exit_unauthorized = check_blocked_exit_authorization(run_log_rows)
+    human_qa_message_missing = check_human_qa_messages(loop_dir, run_log_rows)
 
     lanes = parse_table(loop_dir / "agent-lanes.md")
     lane_names = [row.get("lane", "") for row in lanes if row.get("lane")]
@@ -1770,9 +2319,9 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     missing_evidence_requests: list[str] = []
     malformed_iteration_warnings: list[dict[str, str]] = []
     # G13: request_id -> recommended_answer for BLOCKED requests (the raising
-    # lane's proposed resolution). BLOCKED is terminal, so this map -- not
-    # non_terminal_requests -- is how the dashboard reaches a blocked request's
-    # recommendation.
+    # lane's proposed resolution). BLOCKED is a human-gate pause, and the map
+    # gives consumers a direct request_id -> proposal lookup in addition to the
+    # value on the non-terminal request summary.
     recommended_answers: dict[str, str] = {}
     for row in requests:
         request_id = row.get("request_id", "").strip()
@@ -1820,8 +2369,8 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         # (from its archived BLOCKED envelope) so the dashboard can render the
         # proposed resolution inline on the your-turn item. Read only for BLOCKED
         # requests to avoid touching the message store for every row. BLOCKED is
-        # a TERMINAL status (so it is not in non_terminal_requests); the value is
-        # therefore also surfaced in the request_id -> answer map below.
+        # a non-terminal human-gate pause; the value is also surfaced in the
+        # request_id -> answer map below for direct consumer lookup.
         recommended_answer = (
             blocked_recommended_answer(loop_dir, request_id)
             if status == "BLOCKED" else ""
@@ -1855,11 +2404,14 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             )
 
     # The set of request_ids that actually have a row in requests.md, used by the
-    # G7 orphan_evidence lineage check. A loop is "paused/idle" (all terminal)
-    # for the G7 uncommitted_work check when there are requests and none is
-    # non-terminal; an empty queue is treated as not-yet-started, not paused.
+    # G7 orphan_evidence lineage check. A loop is "paused/idle" for the G7
+    # uncommitted_work check when every request is settled (terminal or BLOCKED);
+    # an empty queue is treated as not-yet-started, not paused.
     registered_request_ids = {s["request_id"] for s in request_summaries}
-    all_requests_terminal = bool(request_summaries) and not non_terminal_requests
+    all_requests_settled = bool(request_summaries) and all(
+        request["status"] in SETTLED_REQUEST_STATUSES
+        for request in request_summaries
+    )
 
     stale_markers = [
         line.strip()
@@ -1887,18 +2439,39 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     orphan_evidence = lineage["orphan_evidence"]
     evidence_naming = lineage["evidence_naming"]
 
+    # G32 evidence-chain hardening (WARNING-only): every root record for work at
+    # IMPLEMENTATION_DONE or beyond has an exact-content implementing-lane twin,
+    # and every ACCEPTED iteration records the pinned request-scoped gate run.
+    evidence_mirror_gaps = check_evidence_mirrors(
+        loop_dir, request_summaries, records_by_request, set(lane_names)
+    )
+    gate_evidence_missing = check_gate_evidence(request_summaries, records_by_request)
+
     # G7 uncommitted_work: when git is present AND the loop is paused/idle (every
-    # request terminal), non-exempt dirty/untracked files under a lane's
+    # request terminal or BLOCKED), non-exempt dirty/untracked files under a lane's
     # write_scope get a warning naming the owning lane. Skipped silently when git
     # is absent. WARNING-only.
     uncommitted_work = check_uncommitted_work(
-        loop_dir, lanes, all_requests_terminal, git_present
+        loop_dir, lanes, all_requests_settled, git_present
     )
 
     # G12 handoff redaction: scan the durable handoff/auto-chain seed text for
     # obvious sensitive content (account-number-like digit runs, full paths into
     # a constraint-marked sensitive dir). WARNING-only; never a gate.
     handoff_sensitive = check_handoff_sensitive_content(loop_dir)
+
+    # G34 reserved infrastructure identifiers: scan only when constraints.md
+    # has the explicit line. Old loops do not inherit a guessed default.
+    reserved_port_advertised = check_reserved_port_advertisements(
+        loop_dir, constraints_text
+    )
+
+    # G28: old archived loops may predate defect_class, so this is a warning
+    # only. It never changes handoff_ready, auto_chain_ready, or gate semantics.
+    fix_request_class_missing = check_fix_request_defect_classes(loop_dir)
+    fix_request_cap_authorization_missing = check_fix_request_cap_authorizations(
+        loop_dir, run_log_rows
+    )
 
     # G22 write-scope discipline (both WARNING-only, never a gate): lane write
     # scopes must be pairwise disjoint (an overlap leaves the precommit guard
@@ -2132,6 +2705,21 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     warnings.extend(control_plane_warnings)
     warnings.extend(malformed_iteration_warnings)
 
+    for item in blocked_exit_unauthorized:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "blocked_exit_unauthorized",
+                "message": "request {request_id} exited BLOCKED -> FIX_REQUESTED "
+                "at {timestamp} without a preceding same-request BLOCKED -> "
+                "BLOCKED row (or same-row note) starting with "
+                "human_authorization: approved".format(
+                    request_id=item["request_id"],
+                    timestamp=item["timestamp"] or "an unrecorded time",
+                ),
+            }
+        )
+
     for path in missing_files:
         issues.append({"severity": "error", "code": "missing_file", "message": path})
     for lane, missing in lane_file_missing.items():
@@ -2296,6 +2884,83 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
                 "code": "evidence_manifest_gap",
                 "message": "request {0} {1} (expected {2} command(s), found {3} evidence record(s))".format(
                     gap["request_id"], detail, gap["expected_count"], gap["evidence_count"]
+                ),
+            }
+        )
+
+    for item in human_qa_message_missing:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "human_qa_message_missing",
+                "message": "human-QA hold for request {request_id} iteration "
+                "{iteration} at {timestamp} has no matching durable message "
+                "under messages/{request_id}/ containing to_lane: human".format(
+                    request_id=item["request_id"],
+                    iteration=item["iteration"] or "(unknown)",
+                    timestamp=item["timestamp"] or "(unknown time)",
+                ),
+            }
+        )
+    for item in reserved_port_advertised:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "reserved_port_advertised",
+                "message": "{file} advertises {url} on reserved loop "
+                "infrastructure port {port}; choose an unreserved exclusive "
+                "bind for the lane-launched server".format(**item),
+            }
+        )
+    for item in evidence_mirror_gaps:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "evidence_mirror_gap",
+                "message": "root evidence file {file} for request {request_id} "
+                "has no byte-identical twin under implementing lane {lane}'s "
+                "lanes/{lane}/evidence directory".format(**item),
+            }
+        )
+    for item in gate_evidence_missing:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "gate_evidence_missing",
+                "message": "ACCEPTED request {request_id} iteration {iteration} "
+                "has no completion-gate evidence record whose command contains "
+                "--request-id {request_id}".format(**item),
+            }
+        )
+    for item in fix_request_class_missing:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "fix_request_class_missing",
+                "message": "archived FIX_REQUEST {file} has no defect_class: line; "
+                "older loops may predate the mandatory field, so this is "
+                "warning-only".format(file=item["file"]),
+            }
+        )
+    for item in fix_request_cap_authorization_missing:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "fix_request_cap_authorization_missing",
+                "message": "resumed-round FIX_REQUEST {file} for request "
+                "{request_id} iteration {iteration} has no non-empty "
+                "cap_authorization: line".format(**item),
+            }
+        )
+    if override_history_gap:
+        warnings.append(
+            {
+                "severity": "warning",
+                "code": "override_history_gap",
+                "message": "loop-policy.md sets max_fix_cycles to {0}, which "
+                "differs from the standing default {1}, but has no matching "
+                "Active append-only override line".format(
+                    max_fix_cycles, DEFAULT_MAX_FIX_CYCLES
                 ),
             }
         )
@@ -2495,6 +3160,9 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "heartbeat_gap_owners": heartbeat_gap_owners,
         "stalled_handoffs": stalled_handoff_requests,
         "held_for_human_qa": sorted(held_for_human_qa),
+        "blocked_exit_unauthorized": blocked_exit_unauthorized,
+        "human_qa_message_missing": human_qa_message_missing,
+        "reserved_port_advertised": reserved_port_advertised,
         "workerless_dependencies": workerless_dependencies,
         "missing_dependency_blockers": missing_dependency_blockers,
         "stale_heartbeat_mins": stale_heartbeat_mins,
@@ -2525,6 +3193,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "tier_mismatches": tier_mismatches,
         "evidence_recorded_ok": evidence_recorded_ok,
         "evidence_manifest_gaps": evidence_manifest_gaps,
+        "evidence_mirror_gaps": evidence_mirror_gaps,
+        "gate_evidence_missing": gate_evidence_missing,
+        "fix_request_class_missing": fix_request_class_missing,
+        "fix_request_cap_authorization_missing": fix_request_cap_authorization_missing,
+        "override_history_gap": override_history_gap,
         "gate_available": gate_available,
         "completion_gate_ok": completion_gate_ok,
         "gate_failed_requests": gate_failed_requests,

@@ -84,12 +84,16 @@ source_docs, last_message, next_action, updated_at.
 Rules:
 
 - request_id is stable across fix cycles: REQ-YYYYMMDD-HHMMSS-<lane>.
-- status lifecycle: PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED.
-- Terminal states are ACCEPTED and BLOCKED.
+- status lifecycle: PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING; REVIEWING -> FIX_REQUESTED | ACCEPTED | BLOCKED; FIX_REQUESTED -> IMPLEMENTING; BLOCKED -> FIX_REQUESTED | ABANDONED.
+- BLOCKED is a human-gate pause, not a terminal state. It has exactly one legal edge back into work: BLOCKED -> FIX_REQUESTED, carrying a recorded human authorization. The authorizing run-log note is exactly `human_authorization: approved` or starts with `human_authorization: approved | ` followed by an evidence pointer.
+- ACCEPTED is the success terminal. ABANDONED is the explicit human-declared dead-end terminal. BLOCKED -> ABANDONED requires a recorded human decision; this terminal disposition is not a resume edge, and ABANDONED rows keep their evidence.
 - Only the current owner_lane moves a request forward.
 - Increment iteration when a request returns to implementation after review.
 - next_action must let any lane resume after compaction or a new session.
 - updated_at is ISO-8601 UTC, e.g. 2026-06-23T11:00:00Z.
+- loop-run-log.md is the authoritative transition history.
+- requests.md is a coarse current-state snapshot at checkpoint granularity.
+  PLANNED and IMPLEMENTATION_DONE may never appear in it - that is legal.
 
 This file must contain exactly one Markdown table (the queue below). Keep the
 schema described as prose above so recovery tooling reads only real rows.
@@ -124,6 +128,14 @@ dependency_install: ask
 - Cap consecutive FIX_REQUESTED <-> IMPLEMENTING cycles for one request at `max_fix_cycles`.
 - When the cap is reached, stop the fix loop and escalate the request to product as BLOCKED.
 - Do not reopen an ACCEPTED request without a new request_id.
+
+## Overrides
+
+Overrides are append-only from the first change. Record each state change as a
+new line: Active -> Superseded/Completed; older lines are never rewritten in
+place. The record format is `override: max_fix_cycles | value: <n> | status:
+Active | authorized_at: <UTC timestamp> | decision: <evidence pointer>`. A
+non-default `max_fix_cycles` value requires one matching Active record.
 
 ## Completion Token
 
@@ -217,6 +229,7 @@ Boundaries every lane must respect. Read before implementing or reviewing.
 ## Technical Constraints
 
 - Record language, framework, runtime, and version pins the work must honor.
+- Reserved loop infrastructure ports: 8765 (dashboard default; append any later manual dashboard port choice to this line).
 
 ## Process Constraints
 
@@ -334,6 +347,9 @@ LOOP_RUN_LOG_TEMPLATE = """# Loop Run Log
 Append-only transition log. Add one row per state transition; never edit or
 delete prior rows. Use this to reconstruct loop history after compaction.
 
+The `lane` column is the lane that performed the transition - the acting lane,
+not the new owner. Human-gate transitions are always recorded by product.
+
 | timestamp | request_id | iteration | from_status | to_status | lane | note |
 | --- | --- | --- | --- | --- | --- | --- |
 """
@@ -417,7 +433,8 @@ docs/loop/evidence/<request_id>-iter-<n>-<command>.json
 characters with a single `-` (for example `npm test` -> `npm-test`,
 `pytest -q` -> `pytest-q`). `<n>` is the request's current iteration.
 
-Each file is a single JSON object with exactly these five fields:
+Each file is a single JSON object with these five required fields and optional
+per-command metadata:
 
 ```json
 {
@@ -425,13 +442,22 @@ Each file is a single JSON object with exactly these five fields:
   "checkpoint": "mvp-color-match",
   "command": "npm test",
   "exit_code": 0,
-  "ran_at": "2026-06-23T11:00:00Z"
+  "ran_at": "2026-06-23T11:00:00Z",
+  "started_at": "2026-06-23T10:59:57Z",
+  "finished_at": "2026-06-23T11:00:00Z",
+  "result": "PASS"
 }
 ```
 
-All five fields are required. Record the real process exit code; never
-normalize a non-zero exit to `0`. A checkpoint is only verified when every
-record for the request reports `exit_code` 0.
+All five original fields are required. `started_at`, `finished_at`, and
+`result` are OPTIONAL; records that omit them remain valid. Record the real
+process exit code; never normalize a non-zero exit to `0`. A checkpoint is only
+verified when every record for the request reports `exit_code` 0.
+
+The implementing lane first writes the record under
+`docs/loop/lanes/<lane>/evidence/`; product mirrors the exact bytes into this
+directory. Both copies are byte-for-byte identical. The lane copy preserves
+producer lineage and this flat root copy is the completion gate's input.
 
 ## Warning: the gate reads this directory with a NON-RECURSIVE glob
 
