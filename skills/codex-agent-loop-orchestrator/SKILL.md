@@ -16,7 +16,7 @@ This is a **software-development orchestrator**. Its native job is building and 
 
 ### Task-Size Gate (do not over-build the loop)
 
-Before spinning up a loop at all, size the task. The loop's process machinery (evidence trail, independent review, durable handoff state) only pays for itself on work that is multi-day, multi-agent, sensitive-data-gated, or must survive compaction/handoff. Measured on a real one-shot MVP, a single direct session delivered *more* product for roughly one-eighth the tokens and one-fifteenth the wall time of the loop.
+Before spinning up a loop at all, size the task. The loop's process machinery (evidence trail, independent review, durable handoff state) only pays for itself on work that is multi-day, multi-agent, sensitive-data-gated, or must survive compaction/handoff. One n=1 dogfood comparison measured the loop at roughly 7x the active wall time and 36x the total tokens of a direct session.
 
 So, during intake, **if the work plausibly fits one session** - about **under two hours, one agent, low audit/recoverability need, and no sensitive-data gates** - say so plainly and **recommend a direct session instead of a loop**. Spinning up a loop anyway, for a task that does not need it, is the skill making the task more complicated than it is. Only build the loop when at least one of these is true: the work spans multiple sessions/days, needs genuine parallel lanes, touches credentials or private/financial data behind a human gate, or must be reconstructable and independently re-verifiable by an outsider from files alone.
 

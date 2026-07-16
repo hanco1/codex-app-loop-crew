@@ -105,17 +105,19 @@ import loop_dashboard  # noqa: E402
 
 
 def _find_repo_tool(rel: str):
-    """Walk upward from this file to find a repo tool by relative path.
+    """Find a dev-repo tool without walking past a repository boundary.
 
-    Returns the first existing ``<ancestor>/<rel>``, or ``None`` when absent.
-    Used to locate optional dev-repo tools without hard-coding the depth from
-    scripts/ to the repo root.
+    A tool is accepted only from a dev repo root that also contains the skill
+    source directory. After checking an ancestor with ``.git``, stop ascending.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / rel
-        if candidate.exists():
+        skill_source = parent / "skill" / "codex-agent-loop-orchestrator"
+        if candidate.is_file() and skill_source.is_dir():
             return candidate
+        if (parent / ".git").is_dir():
+            break
     return None
 
 
