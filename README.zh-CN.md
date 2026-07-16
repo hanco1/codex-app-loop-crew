@@ -52,7 +52,7 @@
 打开一个新文件夹，在里面启动一个 Codex 对话，粘贴这段话：
 
 ```text
-请把 https://github.com/hanco1/multi-loops-agents 中的 Codex skill 安装到我的个人 Codex skills 目录。请将仓库克隆到这个新文件夹，运行适合我操作系统的仓库安装脚本（Windows 使用 install.ps1，macOS/Linux 使用 install.sh），确认 codex-agent-loop-orchestrator 已出现在我的 Codex skills 目录下，并提醒我打开新的 Codex 会话，让 Codex 重新发现这个 skill。不要修改或 push 克隆下来的仓库。
+请把 https://github.com/hanco1/codex-app-loop-crew 中的 Codex skill 安装到我的个人 Codex skills 目录。请将仓库克隆到这个新文件夹，运行适合我操作系统的仓库安装脚本（Windows 使用 install.ps1，macOS/Linux 使用 install.sh），确认 codex-agent-loop-orchestrator 已出现在我的 Codex skills 目录下，并提醒我打开新的 Codex 会话，让 Codex 重新发现这个 skill。不要修改或 push 克隆下来的仓库。
 ```
 
 然后打开一个新的 Codex 会话让 skill 被重新发现。就这样 —— 你自己不用敲任何 CLI。
@@ -65,8 +65,8 @@
 Windows PowerShell：
 
 ```powershell
-git clone https://github.com/hanco1/multi-loops-agents.git
-cd .\multi-loops-agents
+git clone https://github.com/hanco1/codex-app-loop-crew.git
+cd .\codex-app-loop-crew
 .\install.ps1
 ```
 
@@ -75,8 +75,8 @@ cd .\multi-loops-agents
 macOS / Linux：
 
 ```bash
-git clone https://github.com/hanco1/multi-loops-agents.git
-cd multi-loops-agents
+git clone https://github.com/hanco1/codex-app-loop-crew.git
+cd codex-app-loop-crew
 chmod +x install.sh
 ./install.sh
 ```
@@ -87,8 +87,8 @@ chmod +x install.sh
 插件市场：
 
 ```bash
-codex plugin marketplace add hanco1/multi-loops-agents
-codex plugin add codex-agent-loop-orchestrator@multi-loops-agents
+codex plugin marketplace add hanco1/codex-app-loop-crew
+codex plugin add codex-agent-loop-orchestrator@codex-app-loop-crew
 ```
 
 </details>

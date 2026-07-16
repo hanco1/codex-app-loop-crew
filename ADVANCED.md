@@ -138,7 +138,7 @@ the replacement into the existing lane row.
 ## Repository layout
 
 ```text
-multi-loops-agents/
+codex-app-loop-crew/
 ├── .agents/plugins/marketplace.json
 ├── .codex-plugin/plugin.json
 ├── assets/

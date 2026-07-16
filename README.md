@@ -55,7 +55,7 @@ team assembles itself inside the app. You never leave it: no terminal, no logs t
 Open a fresh folder, start one Codex conversation in it, and paste this:
 
 ```text
-Install the Codex skill from https://github.com/hanco1/multi-loops-agents into my personal Codex skills directory. Clone the repository into this fresh folder, run the repository's installer for my operating system (install.ps1 on Windows or install.sh on macOS/Linux), verify that codex-agent-loop-orchestrator is present under my Codex skills directory, and tell me to open a new Codex session so the skill can be rediscovered. Do not modify or push the cloned repository.
+Install the Codex skill from https://github.com/hanco1/codex-app-loop-crew into my personal Codex skills directory. Clone the repository into this fresh folder, run the repository's installer for my operating system (install.ps1 on Windows or install.sh on macOS/Linux), verify that codex-agent-loop-orchestrator is present under my Codex skills directory, and tell me to open a new Codex session so the skill can be rediscovered. Do not modify or push the cloned repository.
 ```
 
 Then open a new Codex session so the skill is rediscovered. That's it — no CLI steps of your own.
@@ -68,8 +68,8 @@ Both scripts locate `skills/codex-agent-loop-orchestrator` relative to the repo 
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/hanco1/multi-loops-agents.git
-cd .\multi-loops-agents
+git clone https://github.com/hanco1/codex-app-loop-crew.git
+cd .\codex-app-loop-crew
 .\install.ps1
 ```
 
@@ -78,8 +78,8 @@ If script execution is blocked: `powershell -ExecutionPolicy Bypass -File .\inst
 macOS / Linux:
 
 ```bash
-git clone https://github.com/hanco1/multi-loops-agents.git
-cd multi-loops-agents
+git clone https://github.com/hanco1/codex-app-loop-crew.git
+cd codex-app-loop-crew
 chmod +x install.sh
 ./install.sh
 ```
@@ -90,8 +90,8 @@ Override with `-SkillsDir <path>` (PowerShell) or `CODEX_SKILLS_DIR=<path>` (bas
 Plugin marketplace:
 
 ```bash
-codex plugin marketplace add hanco1/multi-loops-agents
-codex plugin add codex-agent-loop-orchestrator@multi-loops-agents
+codex plugin marketplace add hanco1/codex-app-loop-crew
+codex plugin add codex-agent-loop-orchestrator@codex-app-loop-crew
 ```
 
 </details>

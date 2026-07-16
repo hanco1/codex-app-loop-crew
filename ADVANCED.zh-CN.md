@@ -93,7 +93,7 @@ git commit -m 'frontend: finish request REQ-004'
 ## 仓库结构
 
 ```text
-multi-loops-agents/
+codex-app-loop-crew/
 ├── .agents/plugins/marketplace.json
 ├── .codex-plugin/plugin.json
 ├── assets/
