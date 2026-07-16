@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you the one moment a human is needed.<br>
-  <sub>package: <code>codex-agent-loop-orchestrator</code></sub>
+  <sub>package: <code>codex-agent-loop-orchestrator</code> · <a href="#more">why three names?</a></sub>
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-1A1A1A">
 </p>
 
-English | [简体中文](README.zh-CN.md)
+<p align="center">English | <a href="README.zh-CN.md">简体中文</a></p>
 
 <p align="center">
   <a href="#install-2-minutes">Install</a>
@@ -26,6 +26,8 @@ English | [简体中文](README.zh-CN.md)
   <a href="#the-core-ideas-in-plain-words">Core ideas</a>
   |
   <a href="#does-it-actually-help">Does it help?</a>
+  |
+  <a href="#when-not-to-use-it">When not to</a>
   |
   <a href="#grounded-in-prior-work">Grounded in</a>
 </p>
@@ -51,6 +53,9 @@ team assembles itself inside the app. You never leave it: no terminal, no logs t
 > identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
 
 ## Install (2 minutes)
+
+> Needs: the Codex app (with skills enabled), `git`, and Python 3 on `PATH` — the dashboard and the
+> verification gates are small local Python scripts.
 
 Open a fresh folder, start one Codex conversation in it, and paste this:
 
@@ -98,6 +103,9 @@ codex plugin add codex-agent-loop-orchestrator@codex-app-loop-crew
 
 ## Your first run
 
+> Prerequisite: the install above, then a **new** Codex session (skills are discovered at session start).
+> Run this in your actual project folder — not the folder you installed from.
+
 In your project folder, paste this into one Codex conversation:
 
 ```text
@@ -109,6 +117,10 @@ Real data stays local. Never upload, quote, log, commit, or copy raw private dat
 
 Ask one intake question at a time with your recommended answer, and stop once the objective and done condition are checkable. Then propose the smallest useful lane team and wait for my approval. After the First Move, tell me the dashboard URL.
 ```
+
+*"First Move" is the skill's one-time setup: it writes the loop files, opens the lane conversations, and
+**starts the dashboard itself** — a small local web server on `127.0.0.1` — then posts the URL in the product
+conversation. You just open that URL in your browser.*
 
 The skill first checks the task size. **If the job fits one focused session, expect it to recommend a plain
 Codex session instead of a loop** — this machinery is overkill for small work (see [When not to use it](#when-not-to-use-it)).
@@ -178,7 +190,7 @@ Six ideas do all the work.
    when — and only when — a human is needed, and which conversation to open.
 
 The mechanisms behind these, and their limits, are in [ADVANCED.md](ADVANCED.md) and the
-[skill reference](skills/codex-agent-loop-orchestrator/).
+[skill reference](skills/codex-agent-loop-orchestrator/SKILL.md).
 
 ## Does it actually help?
 
@@ -188,7 +200,7 @@ codebases were scored by the same rubric with every serious finding independentl
 
 | Dimension | Solo session | This loop |
 |---|:---:|:---:|
-| Correctness on edge input | 6 | 7 |
+| Correctness on edge input | 6 | **7** |
 | Invariant enforcement depth | 6 | **8** |
 | Security | 7 | **9** |
 | Test quality | 7 | 7 |
@@ -207,8 +219,10 @@ own output too. The takeaway isn't "always use the loop," it's **match the machi
 
 Use a plain Codex session for a small, low-risk task one agent can finish in one sitting — roughly under two
 hours — when auditability, handoff recovery, sensitive-data gates, and real parallel lanes don't matter. The
-cost is real: in one same-spec `n=1` comparison the loop took **7.2× the wall time** and **36× the total
-tokens** of the direct session — and by default every lane runs on the top model at `xhigh`, so a team is
+cost is real. In an earlier, smaller `n=1` dogfood run (a one-day MVP — a separate, earlier measurement from
+the expense-app comparison above) the loop took **7.2× the active wall time** and **36× the total tokens** of
+the direct session; in the larger expense-app comparison it was **~10 minutes vs multiple days** and one-to-two
+orders of magnitude more tokens. And by default every lane runs on the top model at `xhigh`, so a team is
 several premium sessions at once. This protocol buys traceability and independent verification; it does not
 make multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
 
@@ -217,12 +231,14 @@ make multi-agent work free. It is also a poor fit when there's nothing meaningfu
 This isn't invented from scratch — it fuses two lines of work and distills a broad survey of community practice:
 
 - **Codex "Loop Engineering"** — the app's own model for durable, long-horizon work (checkpoints, resumable
-  sessions, auto-chained continuations). This skill extends it from one agent to a reviewed multi-agent team.
+  sessions, auto-chained continuations); there is no standalone public doc — see this skill's
+  [SKILL.md](skills/codex-agent-loop-orchestrator/SKILL.md) for how it drives continuation and auto-chain.
+  This skill extends it from one agent to a reviewed multi-agent team.
 - **Multi-agent lane orchestration** — the app's cross-thread tools (`create_thread`, `send_message_to_thread`)
   turned into a disciplined team with disjoint write scopes and independent review.
-- **A survey of ~38 community skills** ([Matt Pocock's skills collection](https://github.com/mattpocock/skills)) —
+- **A survey of 38 community skills** ([Matt Pocock's skills collection](https://github.com/mattpocock/skills)) —
   the acceptance-criteria and review discipline here (every criterion names a *red-capable* verify command) was
-  distilled from that ecosystem; **28 of 38 skills' top recommendation converged on the same idea.**
+  distilled from that ecosystem; **28 of the 38 skills' top recommendation converged on the same idea** (survey notes are internal).
 - **The memory layer** — the append-only decision log (`decisions.jsonl`, content-addressed with a
   `normalize_then_hash()` over its source docs so stale decisions are detectable) adapts ideas from
   [`Gentleman-Programming/engram`](https://github.com/Gentleman-Programming/engram) (an agent memory layer),

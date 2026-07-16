@@ -4,11 +4,7 @@
 
 <p align="center">
   <strong>Loop Crew</strong> —— 一小队 Codex agent，带内置的评审 loop，全程在 Codex app 里运行（不用 CLI）。它会在唯一需要人的那个时刻提醒你。<br>
-  <sub>安装包名：<code>codex-agent-loop-orchestrator</code></sub>
-</p>
-
-<p align="center">
-  <strong>专为 Codex app 打造 —— 不是 CLI。</strong> 终端本来就能开多个 agent；难的是在 <em>app 里</em>做到。这个 skill 调用 app 自己的 <code>create_thread</code> 工具，把一整队 agent 对话开出来，并自动给每个注入角色、上下文和模型 —— 让 Codex app 用户不碰终端也能获得真正的多智能体编排。
+  <sub>安装包名：<code>codex-agent-loop-orchestrator</code> · <a href="#更多">为什么有三个名字？</a></sub>
 </p>
 
 <p align="center">
@@ -18,7 +14,7 @@
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-1A1A1A">
 </p>
 
-[English](README.md) | 简体中文
+<p align="center"><a href="README.md">English</a> | 简体中文</p>
 
 <p align="center">
   <a href="#安装2-分钟">安装</a>
@@ -30,6 +26,8 @@
   <a href="#核心思路用人话讲">核心思路</a>
   |
   <a href="#它真的有用吗">它真的有用吗？</a>
+  |
+  <a href="#什么时候不该用">何时别用</a>
   |
   <a href="#站在前人的工作之上">理论依据</a>
 </p>
@@ -48,6 +46,8 @@
 > 上图是通用 Codex 风格桌面端的模拟界面示意图（不含 OpenAI/ChatGPT 品牌、账户身份或真实数据）；HTML 源文件见 [`assets/codex-app-session.html`](assets/codex-app-session.html)。
 
 ## 安装（2 分钟）
+
+> 需要：Codex app（启用 skills）、`git`，以及 `PATH` 上的 Python 3 —— dashboard 和验证门槛都是小型本地 Python 脚本。
 
 打开一个新文件夹，在里面启动一个 Codex 对话，粘贴这段话：
 
@@ -95,6 +95,8 @@ codex plugin add codex-agent-loop-orchestrator@codex-app-loop-crew
 
 ## 第一次运行
 
+> 前提：完成上面的安装，然后开一个**新的** Codex 会话（skill 在会话启动时被发现）。在你实际的项目文件夹里运行 —— 不是刚才安装用的那个文件夹。
+
 在你的项目文件夹里，把这段话粘贴进一个 Codex 对话：
 
 ```text
@@ -106,6 +108,8 @@ codex plugin add codex-agent-loop-orchestrator@codex-app-loop-crew
 
 一次只问一个 intake 问题并附上你的推荐答案，当目标和完成条件可检查时立即停止。然后提出满足需要的最小 lane 团队并等我确认。完成 First Move 后，告诉我 dashboard 的 URL。
 ```
+
+"First Move" 是 skill 的一次性初始化：写好 loop 文件、开出各 lane 对话，并**自己启动 dashboard**——一个 `127.0.0.1` 上的小型本地 web 服务——然后把 URL 发在 product 对话里。你只需要在浏览器里打开那个 URL。
 
 skill 会先判断任务规模。**如果这活一次专注会话就能干完，它应该建议你直接用普通 Codex 会话，而不是搭 loop** —— 对小活来说这套机制是杀鸡用牛刀（见[什么时候不该用](#什么时候不该用)）。
 
@@ -163,7 +167,7 @@ flowchart LR
 5. **任何你会亲眼看到的东西都要等你点头。** 只要有界面，光过测试不够 —— 得等你打开说没问题。（下面对比里的真 bug 就是这步抓到的。）
 6. **dashboard 只把你指向那件需要你的事。** 你只开一个 dashboard，它告诉你什么时候（也仅在那时）需要人、该打开哪个对话。
 
-这些背后的机制和它们的限制，见 [ADVANCED.md](ADVANCED.md) 和 [skill 参考](skills/codex-agent-loop-orchestrator/)。
+这些背后的机制和它们的限制，见 [ADVANCED.zh-CN.md](ADVANCED.zh-CN.md) 和 [skill 参考](skills/codex-agent-loop-orchestrator/SKILL.md)。
 
 ## 它真的有用吗？
 
@@ -171,7 +175,7 @@ flowchart LR
 
 | 维度 | 单会话 | 本 loop |
 |---|:---:|:---:|
-| 边缘输入正确性 | 6 | 7 |
+| 边缘输入正确性 | 6 | **7** |
 | 不变量强制深度 | 6 | **8** |
 | 安全 | 7 | **9** |
 | 测试质量 | 7 | 7 |
@@ -186,15 +190,15 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 
 ## 什么时候不该用
 
-如果任务规模小、风险低，一个 agent 一次就能干完——大致不超过两小时——而且你不需要可审计性、handoff 恢复、敏感数据门槛或真正并行的 lane，就直接用普通 Codex 会话。成本是真的：在一次相同规格的 `n=1` 对比中，loop 的**耗时是直接会话的 7.2 倍**、**总 token 是 36 倍**——而且默认每个 lane 都跑最高档模型 + `xhigh`，所以一队 agent 相当于同时开好几个顶配会话。这套协议买到的是可追溯性和独立验证，不会让多智能体协作变免费。当没有任何有意义、可机器检查的东西时，它同样不合适。
+如果任务规模小、风险低，一个 agent 一次就能干完——大致不超过两小时——而且你不需要可审计性、handoff 恢复、敏感数据门槛或真正并行的 lane，就直接用普通 Codex 会话。成本是真的。在更早的一次小规模 `n=1` dogfood 对比（一个一天规模的 MVP —— 与上面的记账 app 对比是两次独立测量）中，loop 的**活跃耗时是直接会话的 7.2 倍**、**总 token 是 36 倍**；在更大的记账 app 对比中则是 **~10 分钟 vs 数天**、token 高出一到两个数量级。而且默认每个 lane 都跑最高档模型 + `xhigh`，所以一队 agent 相当于同时开好几个顶配会话。这套协议买到的是可追溯性和独立验证，不会让多智能体协作变免费。当没有任何有意义、可机器检查的东西时，它同样不合适。
 
 ## 站在前人的工作之上
 
 它不是凭空造出来的 —— 它融合了两条工作线，并提炼了对社区实践的广泛调研：
 
-- **Codex "Loop Engineering"** —— app 自己的长任务持久化模型（检查点、可恢复会话、自动接续）。这个 skill 把它从单 agent 扩展到一个带评审的多智能体团队。
+- **Codex "Loop Engineering"** —— app 自己的长任务持久化模型（检查点、可恢复会话、自动接续）；没有独立的公开文档 —— 它如何驱动接续与 auto-chain 见本 skill 的 [SKILL.md](skills/codex-agent-loop-orchestrator/SKILL.md)。这个 skill 把它从单 agent 扩展到一个带评审的多智能体团队。
 - **多智能体 lane 编排** —— 把 app 的跨线程工具（`create_thread`、`send_message_to_thread`）变成一个纪律化的团队，写入范围不重叠、有独立评审。
-- **对约 38 个社区 skill 的调研**（[Matt Pocock 的 skills 合集](https://github.com/mattpocock/skills)）—— 这里的验收标准与评审纪律（每条标准都指定一条*可变红*的验证命令）就是从这个生态里提炼的；**38 个 skill 中有 28 个的首要建议都收敛到同一个想法。**
+- **对 38 个社区 skill 的调研**（[Matt Pocock 的 skills 合集](https://github.com/mattpocock/skills)）—— 这里的验收标准与评审纪律（每条标准都指定一条*可变红*的验证命令）就是从这个生态里提炼的；**38 个 skill 中有 28 个的首要建议都收敛到同一个想法**（调研笔记未公开）。
 - **记忆层** —— 追加式决策日志（`decisions.jsonl`，用 `normalize_then_hash()` 对来源文档做内容寻址，从而能检测过期决策）借鉴了 [`Gentleman-Programming/engram`](https://github.com/Gentleman-Programming/engram)（一个 agent 记忆层）、[Cartridges 论文](https://arxiv.org/abs/2506.06266)（把上下文蒸馏成紧凑、可审计的产物，而不是回放原始洪流）和 [`deepseek-ai/Engram`](https://github.com/deepseek-ai/Engram)（内容寻址，类比借鉴）—— 实现为纯粹的仓库可读文件，而不是训练出来的缓存。
 - **[han-design-skill-v1](https://github.com/hanco1/han-design-skill-v1)** —— 用于 dashboard 视觉风格的配套设计 skill。
 
@@ -202,7 +206,7 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 
 - **命名关系，一句话** —— **Loop Crew** 是你看到的品牌（logo 和标题）；`codex-app-loop-crew` 是这个仓库；`codex-agent-loop-orchestrator` 是可安装的 skill 包 —— 也就是你实际输入的名字。三者是同一个项目。
 
-- **[ADVANCED.md](ADVANCED.md)** —— request 生命周期、完成门槛、Git 模型（commit-as-lane、scope guard）、日常使用、仓库结构。
+- **[ADVANCED.zh-CN.md](ADVANCED.zh-CN.md)** —— request 生命周期、完成门槛、Git 模型（commit-as-lane、scope guard）、日常使用、仓库结构。
 - **[skills/codex-agent-loop-orchestrator/](skills/codex-agent-loop-orchestrator/)** —— skill 本体：`SKILL.md` 及其 references。
 
 ## 许可证

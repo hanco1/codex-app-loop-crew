@@ -37,8 +37,10 @@
 `requests.md` 是队列和恢复索引。一个 blocker 修复周期内复用同一个 `request_id`，同时递增 `iteration`：
 
 ```text
-PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE
-        -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED
+PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING
+REVIEWING -> FIX_REQUESTED | ACCEPTED | BLOCKED
+FIX_REQUESTED -> IMPLEMENTING
+BLOCKED -> FIX_REQUESTED | ABANDONED
 ```
 
 跨对话投递前，typed message 先保存在 `docs/loop/messages/<request_id>/`。若无法投递到 thread，原子化文件 inbox 可保住消息——但文件 inbox 不是自动 worker。
@@ -106,6 +108,7 @@ codex-app-loop-crew/
 ├── install.sh
 ├── COMPARISON.md
 ├── ADVANCED.md
+├── ADVANCED.zh-CN.md
 ├── README.zh-CN.md
 ├── README.md
 └── LICENSE

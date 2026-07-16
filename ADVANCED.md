@@ -59,8 +59,10 @@ also owns its `docs/loop/lanes/<lane>/**` worklog area.
 while `iteration` increments:
 
 ```text
-PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE
-        -> REVIEWING -> FIX_REQUESTED -> ACCEPTED | BLOCKED
+PLANNED -> REQUESTED -> IMPLEMENTING -> IMPLEMENTATION_DONE -> REVIEWING
+REVIEWING -> FIX_REQUESTED | ACCEPTED | BLOCKED
+FIX_REQUESTED -> IMPLEMENTING
+BLOCKED -> FIX_REQUESTED | ABANDONED
 ```
 
 Typed messages are saved under `docs/loop/messages/<request_id>/` before cross-conversation delivery. If thread
@@ -151,6 +153,7 @@ codex-app-loop-crew/
 ├── install.sh
 ├── COMPARISON.md
 ├── ADVANCED.md
+├── ADVANCED.zh-CN.md
 ├── README.zh-CN.md
 ├── README.md
 └── LICENSE

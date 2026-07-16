@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+[ -n "${BASH_VERSION:-}" ] || { echo "Please run with bash: bash install.sh" >&2; exit 1; }
 # Install the codex-agent-loop-orchestrator skill into the local Codex skills dir.
 #
 # Copies the skill folder that ships beside this script into
