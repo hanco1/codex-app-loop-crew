@@ -30,8 +30,6 @@ English | [简体中文](README.zh-CN.md)
   <a href="#grounded-in-prior-work">Grounded in</a>
 </p>
 
-![A Codex-app conversation with product, data-eng, frontend, and review lanes, and a local dashboard link](assets/codex-app-session.png)
-
 ## What it is
 
 You describe a goal. The skill splits the work across a few specialized Codex agents ("lanes"), keeps all the
@@ -44,6 +42,10 @@ time a human is needed.
 a real conversation and auto-seed it with its role, write scope, and — by default — the **highest model tier
 your host offers, at `xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole
 team assembles itself inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
+
+<p align="center">
+  <img src="assets/codex-app-session.png" width="820" alt="A Codex-app conversation with product, data-eng, frontend, and review lanes, and a local dashboard link">
+</p>
 
 > The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
 > identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).

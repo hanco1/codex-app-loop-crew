@@ -34,13 +34,16 @@
   <a href="#站在前人的工作之上">理论依据</a>
 </p>
 
-![一个 Codex app 对话，包含 product、data-eng、frontend 和 review lane，以及一个本地 dashboard 链接](assets/codex-app-session.png)
 
 ## 这是什么
 
 你描述一个目标。这个 skill 把工作拆给几个专职的 Codex agent（"lane"），把所有项目状态存进文件而不是随时会丢的聊天记录，让每个 agent 必须**证明**自己的活通过了才算数，再由另一个 agent 复查。一个本地 dashboard 盯着这一切，只在唯一需要人的那一刻亮起提示条。
 
 **专为 Codex app 打造，不是 CLI。** 终端本来就能开 agent；难的是在 *app 里*做到。底层这个 skill 调用 Codex app 自己的 `create_thread` 工具，把每个 agent 开成一个真实对话，并自动注入它的角色、写入范围，以及默认**你的 host 能提供的最高档模型 + `xhigh` 推理**（质量优先；你可以手动把某个 lane 单独调低）—— 整队就在 app 里自己组建起来。你全程不用离开 app：没有终端、不用读日志、不用背命令。
+
+<p align="center">
+  <img src="assets/codex-app-session.png" width="820" alt="一个 Codex app 对话，包含 product、data-eng、frontend 和 review lane，以及一个本地 dashboard 链接">
+</p>
 
 > 上图是通用 Codex 风格桌面端的模拟界面示意图（不含 OpenAI/ChatGPT 品牌、账户身份或真实数据）；HTML 源文件见 [`assets/codex-app-session.html`](assets/codex-app-session.html)。
 
