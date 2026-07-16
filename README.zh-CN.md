@@ -1,9 +1,13 @@
 <p align="center">
-  <strong>Codex Agent Loop Orchestrator</strong>
+  <img src="assets/loop-crew-logo.png" alt="Loop Crew — in the Codex app" width="720">
 </p>
 
 <p align="center">
-  在一个项目上运行一小队 Codex agent —— 并在唯一需要人的那个时刻收到提醒。
+  <strong>Loop Crew</strong> —— 一小队 Codex agent，带内置的评审 loop，全程在 Codex app 里运行。<em>（安装包名：<code>codex-agent-loop-orchestrator</code>）</em>
+</p>
+
+<p align="center">
+  在一个项目上运行一小队 agent —— 并在唯一需要人的那个时刻收到提醒。
 </p>
 
 <p align="center">

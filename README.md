@@ -1,9 +1,13 @@
 <p align="center">
-  <strong>Codex Agent Loop Orchestrator</strong>
+  <img src="assets/loop-crew-logo.png" alt="Loop Crew — in the Codex app" width="720">
 </p>
 
 <p align="center">
-  Run a small team of Codex agents on one project — and get told the one moment a human is needed.
+  <strong>Loop Crew</strong> — a small team of Codex agents with a built-in review loop, run entirely inside the Codex app. <em>(package: <code>codex-agent-loop-orchestrator</code>)</em>
+</p>
+
+<p align="center">
+  Run a small crew of agents on one project — and get told the one moment a human is needed.
 </p>
 
 <p align="center">
