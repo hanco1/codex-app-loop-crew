@@ -117,20 +117,23 @@ Codex session instead of a loop** — this machinery is overkill for small work 
 
 You state a goal once; the agents work; the dashboard tells you the single moment you're needed.
 
+<details>
+<summary><strong>▸ Show the flow</strong></summary>
+
 ```mermaid
-flowchart TD
-    A["You state one goal"] --> B["Product splits it into small requests"]
-    B --> C["An engineer lane builds one slice"]
-    C --> D{"Machine gate:<br/>does the recorded evidence pass?"}
-    D -- "no / missing" --> C
-    D -- "yes" --> E["Review lane checks it independently"]
-    E -- "finds problems" --> C
-    E -- "looks good" --> F{"Is it user-facing?"}
-    F -- "no" --> H["Accepted ✅"]
-    F -- "yes" --> G["READY FOR YOU:<br/>you open the app and confirm"]
-    G -- "you reply PASS" --> H
-    G -- "you report a problem" --> C
+flowchart LR
+    A["You:<br/>one goal"] --> B["Product:<br/>split into requests"] --> C["Engineer lane:<br/>build a slice"]
+    C --> D{"Evidence<br/>passes?"}
+    D -- no --> C
+    D -- yes --> E{"Review<br/>OK?"}
+    E -- no --> C
+    E -- "yes · internal" --> H["Accepted ✅"]
+    E -- "yes · user-facing" --> G["READY FOR YOU:<br/>you confirm"]
+    G -- PASS --> H
+    G -- problem --> C
 ```
+
+</details>
 
 The dashboard screenshots below are the real local viewer (light theme) over an archived run; public copies
 redact local paths, account identity, and conversation IDs.

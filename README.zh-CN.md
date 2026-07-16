@@ -109,20 +109,23 @@ skill 会先判断任务规模。**如果这活一次专注会话就能干完，
 
 你只说一次目标；agent 们干活；dashboard 告诉你唯一需要你的那个时刻。
 
+<details>
+<summary><strong>▸ 展开流程图</strong></summary>
+
 ```mermaid
-flowchart TD
-    A["你说出一个目标"] --> B["Product 拆成一个个小 request"]
-    B --> C["某个工程 lane 构建一个切片"]
-    C --> D{"机器门槛：<br/>记录的证据通过了吗？"}
-    D -- "否 / 缺失" --> C
-    D -- "是" --> E["Review lane 独立复查"]
-    E -- "发现问题" --> C
-    E -- "没问题" --> F{"是否面向用户？"}
-    F -- "否" --> H["已接受 ✅"]
-    F -- "是" --> G["READY FOR YOU：<br/>你打开 app 确认"]
-    G -- "你回复 PASS" --> H
-    G -- "你报告一个问题" --> C
+flowchart LR
+    A["你：<br/>一个目标"] --> B["Product：<br/>拆成 request"] --> C["工程 lane：<br/>构建切片"]
+    C --> D{"证据<br/>通过？"}
+    D -- 否 --> C
+    D -- 是 --> E{"Review<br/>通过？"}
+    E -- 否 --> C
+    E -- "是 · 内部" --> H["已接受 ✅"]
+    E -- "是 · 面向用户" --> G["READY FOR YOU：<br/>你确认"]
+    G -- PASS --> H
+    G -- 有问题 --> C
 ```
+
+</details>
 
 下面的截图是真实的本地查看器（浅色主题）读取一份已归档的运行；公开副本已隐去本地路径、账户身份和 conversation ID。
 
