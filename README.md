@@ -7,6 +7,11 @@
 </p>
 
 <p align="center">
+  <strong>Built for the Codex app, not the terminal.</strong><br>
+  You drive the whole thing by chatting with one agent and watching a local dashboard—so multi-agent development stays approachable even if you're new to it or would rather never touch a CLI.
+</p>
+
+<p align="center">
   <img alt="Codex skill" src="https://img.shields.io/badge/Codex-skill-E5DFD2">
   <img alt="Public repository" src="https://img.shields.io/badge/repo-public-6B8A6F">
   <img alt="Local-first state" src="https://img.shields.io/badge/state-repo--local-3D6F59">
@@ -34,6 +39,8 @@ English | [简体中文](README.zh-CN.md)
 ![Mock Codex-style host showing the product, data-eng, frontend, and review conversations](assets/mock-codex-ui.png)
 
 `codex-agent-loop-orchestrator` is a repo-local operating protocol for long-running Codex projects. It gives each ongoing agent job a named lane, keeps goals and requests in files instead of disposable chat history, requires machine-readable verification evidence, and routes every shipped slice through independent review.
+
+It is designed for the **Codex app** (desktop or web), not for terminal power users: you install it by pasting one message into Codex, then run everything from ordinary conversations plus a local dashboard. The dashboard tells you the one moment a human is needed, so you don't have to read logs, memorize commands, or babysit a terminal.
 
 The image above is a mock of a generic Codex-style desktop host (disclosed here rather than on the image). It contains no OpenAI or ChatGPT branding, account identity, or real project data.
 

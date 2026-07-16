@@ -7,6 +7,11 @@
 </p>
 
 <p align="center">
+  <strong>专为 Codex app 打造，而不是命令行。</strong><br>
+  你只需要和一个 agent 聊天、盯着一个本地 dashboard 就能驱动整套流程——所以即使你是新手、或者根本不想碰 CLI，也能上手多智能体开发。
+</p>
+
+<p align="center">
   <img alt="Codex skill" src="https://img.shields.io/badge/Codex-skill-E5DFD2">
   <img alt="Public repository" src="https://img.shields.io/badge/repo-public-6B8A6F">
   <img alt="Local-first state" src="https://img.shields.io/badge/state-repo--local-3D6F59">
@@ -34,6 +39,8 @@
 ![Codex 风格模拟界面示意图，展示 product、data-eng、frontend 和 review 对话](assets/mock-codex-ui.png)
 
 `codex-agent-loop-orchestrator` 是一套放在仓库本地、面向长期 Codex 项目的运行协议。它为每个持续进行的 agent 任务分配具名 lane，把目标和 request 保存在文件中而不是随时可能丢失的聊天记录里，要求提供机器可读的验证证据，并让每个准备交付的工作切片都经过独立 review。
+
+它是**为 Codex app（桌面端或网页端）设计的**，不是给终端高手用的：你只需把一段话粘贴进 Codex 就完成安装，之后全程用普通对话加一个本地 dashboard 来驱动。dashboard 会告诉你唯一需要人的那个时刻，所以你不用读日志、不用背命令，也不用守着终端。
 
 上图是通用 Codex 风格桌面端的模拟界面示意图（相关说明写在此处，而非图片本身）。它不包含 OpenAI 或 ChatGPT 品牌标识、账户身份或真实项目数据。
 
