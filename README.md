@@ -3,15 +3,8 @@
 </p>
 
 <p align="center">
-  <strong>Loop Crew</strong> — a small team of Codex agents with a built-in review loop, run entirely inside the Codex app. <em>(package: <code>codex-agent-loop-orchestrator</code>)</em>
-</p>
-
-<p align="center">
-  Run a small crew of agents on one project — and get told the one moment a human is needed.
-</p>
-
-<p align="center">
-  <strong>Built for the Codex app — not the CLI.</strong> The terminal can already juggle agents; the hard part was doing it <em>inside the app</em>. This skill uses the app's own <code>create_thread</code> tool to spin up a whole team of agent conversations and auto-seed each one with its role, context, and model — so Codex-app users get real multi-agent orchestration without ever touching a terminal.
+  <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you the one moment a human is needed.<br>
+  <sub>package: <code>codex-agent-loop-orchestrator</code></sub>
 </p>
 
 <p align="center">
@@ -46,10 +39,11 @@ project state in files instead of disposable chat history, makes each agent **pr
 counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner the one
 time a human is needed.
 
-Under the hood it calls the Codex app's own `create_thread` tool to open each agent as a real conversation and
-auto-seed it with its role, write scope, and — by default — the **highest model tier your host offers, at
-`xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole team assembles itself
-inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
+**Built for the Codex app, not the CLI.** The terminal can already spawn agents; the hard part was doing it
+*inside the app*. Under the hood the skill calls the Codex app's own `create_thread` tool to open each agent as
+a real conversation and auto-seed it with its role, write scope, and — by default — the **highest model tier
+your host offers, at `xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole
+team assembles itself inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
 
 > The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
 > identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
