@@ -200,6 +200,8 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 
 ## 更多
 
+- **命名关系，一句话** —— **Loop Crew** 是你看到的品牌（logo 和标题）；`codex-app-loop-crew` 是这个仓库；`codex-agent-loop-orchestrator` 是可安装的 skill 包 —— 也就是你实际输入的名字。三者是同一个项目。
+
 - **[ADVANCED.md](ADVANCED.md)** —— request 生命周期、完成门槛、Git 模型（commit-as-lane、scope guard）、日常使用、仓库结构。
 - **[skills/codex-agent-loop-orchestrator/](skills/codex-agent-loop-orchestrator/)** —— skill 本体：`SKILL.md` 及其 references。
 

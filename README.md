@@ -234,6 +234,10 @@ This isn't invented from scratch — it fuses two lines of work and distills a b
 
 ## More
 
+- **Naming, in one line** — **Loop Crew** is the brand you see (logo & title); `codex-app-loop-crew` is this
+  repository; `codex-agent-loop-orchestrator` is the installable skill package — the name you actually type.
+  All three are the same project.
+
 - **[ADVANCED.md](ADVANCED.md)** — the request lifecycle, the completion gate, the Git model (commit-as-lane,
   scope guard), daily use, and repository layout.
 - **[skills/codex-agent-loop-orchestrator/](skills/codex-agent-loop-orchestrator/)** — the skill itself:
