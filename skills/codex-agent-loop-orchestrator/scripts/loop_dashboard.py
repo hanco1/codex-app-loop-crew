@@ -2249,6 +2249,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return None, "body must be a JSON object", 400
         return payload, None, 200
 
+    def _csrf_check(self) -> bool:
+        """Reject cross-site / non-JSON writes. Returns True to proceed.
+
+        The three write endpoints are same-origin JSON calls from the served
+        page. Requiring ``application/json`` forces a CORS preflight on any
+        cross-origin attempt (which this loopback server never answers, so the
+        POST is never delivered), and the Host allow-list defeats DNS-rebinding.
+        Emits the rejection itself and returns False when the request is refused.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._send_json(415, {"ok": False, "error": "Content-Type must be application/json"})
+            return False
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").strip().lower()
+        allowed_hosts = {
+            "127.0.0.1:{0}".format(port),
+            "localhost:{0}".format(port),
+            "127.0.0.1",
+            "localhost",
+        }
+        if host not in allowed_hosts:
+            self._send_json(403, {"ok": False, "error": "invalid Host header"})
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            allowed_origins = {
+                "http://127.0.0.1:{0}".format(port),
+                "http://localhost:{0}".format(port),
+            }
+            if origin.strip().lower() not in allowed_origins:
+                self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+                return False
+        return True
+
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         route = self._path_only()
         # The write endpoints are EXACTLY three: /api/lanes, /api/policy, and
@@ -2257,6 +2292,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # invariant in the module docstring + smoke.
         if route not in ("/api/lanes", "/api/policy", "/api/project"):
             self._send_json(404, {"error": "not found", "path": route})
+            return
+
+        if not self._csrf_check():
             return
 
         payload, error, status = self._read_json_body()
