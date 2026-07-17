@@ -172,7 +172,7 @@ CHECKBOX_RE = re.compile(r"^\s*-\s+\[(?P<status>[ xX~!])\]\s+(?P<text>.+?)\s*$")
 THREAD_ID_RE = re.compile(r"\b(?:codex:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 AUTO_CHAIN_RE = re.compile(r"(?i)\bauto_chain_next_session\s*:\s*true\b")
 STALE_RE = re.compile(r"(?i)\b(stale|pending re-creation|unreadable|unopenable|not visible|not found)\b")
-MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*max_fix_cycles\s*:\s*(\d+)\b")
+MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*(?:[-*]\s*)?max_fix_cycles\s*:\s*(\d+)\b")
 BUDGET_EXHAUSTED_RE = re.compile(r"(?im)^\s*budget_exhausted\s*:\s*true\b")
 VERIFY_COMMAND_RE = re.compile(r"(?i)\bVERIFY\s+`(?P<command>[^`\r\n]+)`")
 DEFECT_CLASS_LINE_RE = re.compile(r"(?im)^\s*defect_class\s*:")
@@ -269,27 +269,102 @@ def split_md_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
-def parse_table(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
+def parse_table(
+    path: Path, required_headers: tuple[str, ...] = ()
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Parse the control table in ``path``, anchored on ``required_headers``.
 
+    A candidate header row is accepted only when its cell set contains every
+    required header, so a preface/explanatory table earlier in the file can
+    never shadow the real control table (whose rows would then be coerced into
+    the wrong columns and silently dropped). Returns ``(rows, errors)``: each
+    error is a structured ``{severity, code, message}`` entry the caller routes
+    into ``issues`` so a torn, headerless, or shadow-only file blocks
+    readiness instead of reading as an empty-but-healthy queue. A missing file
+    stays ``([], [])``: absence is already covered by REQUIRED_FILES.
+    """
+    errors: list[dict[str, str]] = []
+    if not path.exists():
+        return [], errors
+
+    required = set(required_headers)
     headers: Optional[list[str]] = None
+    header_line = 0
+    awaiting_delimiter = False
     rows: list[dict[str, str]] = []
-    for line in read_text(path).splitlines():
+    for lineno, line in enumerate(read_text(path).splitlines(), start=1):
         if not line.lstrip().startswith("|"):
             continue
         cells = split_md_row(line)
         if not cells:
             continue
         if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            # A delimiter legitimizes the control table only as the row
+            # IMMEDIATELY after its header. A later table's delimiter must not
+            # retroactively "complete" a torn control table.
+            if awaiting_delimiter:
+                awaiting_delimiter = False
             continue
         if headers is None:
-            headers = [cell.strip() for cell in cells]
+            candidate = [cell.strip() for cell in cells]
+            if required and not required <= set(candidate):
+                continue  # a preface table, not the control table: keep looking
+            headers = candidate
+            header_line = lineno
+            awaiting_delimiter = True
             continue
+        if awaiting_delimiter:
+            # The row right after the header is data, not a delimiter: the
+            # control table is torn/half-written. Report once; keep collecting
+            # rows so partial data stays visible while the error blocks
+            # readiness.
+            errors.append(
+                {
+                    "severity": "error",
+                    "code": "malformed_table",
+                    "message": "{0} line {1}: table header is not followed by a "
+                    "delimiter row (torn or half-written table)".format(
+                        path.name, header_line
+                    ),
+                }
+            )
+            awaiting_delimiter = False
+        if len(cells) != len(headers):
+            errors.append(
+                {
+                    "severity": "error",
+                    "code": "malformed_table",
+                    "message": "{0} line {1}: row has {2} cells; expected {3}".format(
+                        path.name, lineno, len(cells), len(headers)
+                    ),
+                }
+            )
         if len(cells) < len(headers):
             cells += [""] * (len(headers) - len(cells))
         rows.append(dict(zip(headers, cells[: len(headers)])))
-    return rows
+    if headers is None:
+        errors.append(
+            {
+                "severity": "error",
+                "code": "malformed_table",
+                "message": "{0}: no table header row containing {1} found; the file "
+                "is empty, torn, or its control table is shadowed -- rows cannot "
+                "be read".format(
+                    path.name, ", ".join(sorted(required)) or "the expected columns"
+                ),
+            }
+        )
+    elif awaiting_delimiter:
+        # The header was the last table row in the file: no delimiter, no data.
+        errors.append(
+            {
+                "severity": "error",
+                "code": "malformed_table",
+                "message": "{0} line {1}: table header has no delimiter row (torn or "
+                "half-written table)".format(path.name, header_line),
+            }
+        )
+    return rows, errors
 
 
 def observed_tier_tag(current_text: str) -> str:
@@ -630,7 +705,7 @@ def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
 
 _POLICY_KEY_RE = re.compile(r"^\s*(?:[-*]\s*)?max_fix_cycles\s*:", re.IGNORECASE)
 _POLICY_STRICT_RE = re.compile(
-    r"^\s*max_fix_cycles\s*:\s*(\d+)\s*$", re.IGNORECASE
+    r"^\s*(?:[-*]\s*)?max_fix_cycles\s*:\s*(\d+)\s*$", re.IGNORECASE
 )
 
 
@@ -685,6 +760,8 @@ def table_key_line_numbers(path: Path, key: str) -> dict[str, int]:
         if not cells or all(set(cell) <= {"-", ":", " "} for cell in cells):
             continue
         if headers is None:
+            if key not in cells:
+                continue  # a preface table without the key column: keep looking
             headers = cells
             continue
         padded = cells + [""] * max(0, len(headers) - len(cells))
@@ -2230,7 +2307,12 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     blocked_exit_unauthorized = check_blocked_exit_authorization(run_log_rows)
     human_qa_message_missing = check_human_qa_messages(loop_dir, run_log_rows)
 
-    lanes = parse_table(loop_dir / "agent-lanes.md")
+    # C3: anchor on a minimal header set every legitimate producer satisfies
+    # (bootstrap REGISTRY_COLUMNS and all fixtures carry lane + write_scope) so
+    # a preface table can never shadow the registry.
+    lanes, lane_table_errors = parse_table(
+        loop_dir / "agent-lanes.md", required_headers=("lane", "write_scope")
+    )
     lane_names = [row.get("lane", "") for row in lanes if row.get("lane")]
     lane_file_missing: dict[str, list[str]] = {}
     lane_summaries: list[dict[str, Any]] = []
@@ -2310,7 +2392,13 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     )
     evidence_request_ids = set(records_by_request)
 
-    requests = parse_table(loop_dir / "requests.md")
+    # C3: minimal required set (every producer, including the smokes' smallest
+    # fixture, carries request_id + status + iteration).
+    requests, request_table_errors = parse_table(
+        loop_dir / "requests.md",
+        required_headers=("request_id", "status", "iteration"),
+    )
+    control_table_errors = lane_table_errors + request_table_errors
     request_line_numbers = table_key_line_numbers(loop_dir / "requests.md", "request_id")
     request_summaries: list[dict[str, Any]] = []
     owner_issues: list[str] = []
@@ -2412,6 +2500,14 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         request["status"] in SETTLED_REQUEST_STATUSES
         for request in request_summaries
     )
+    # C2/G31: a request paused at BLOCKED is a human gate; auto-chain must not
+    # relaunch past it. This is request-lifecycle BLOCKED, deliberately distinct
+    # from the tracker's `!` checkbox list in ``blocked`` above.
+    paused_requests = [
+        summary["request_id"]
+        for summary in request_summaries
+        if summary["status"] in PAUSED_REQUEST_STATUSES
+    ]
 
     stale_markers = [
         line.strip()
@@ -2733,6 +2829,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             }
         )
 
+    # C3: a control table that could not be anchored (headerless, torn, or
+    # shadowed by a preface table) is a structural ERROR: it blocks readiness
+    # instead of presenting an emptied queue/registry as healthy.
+    issues.extend(control_table_errors)
     for path in missing_files:
         issues.append({"severity": "error", "code": "missing_file", "message": path})
     for lane, missing in lane_file_missing.items():
@@ -3117,12 +3217,19 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     warnings.extend(drift["warnings"])
     decisions_summary = drift["decisions"]
 
-    handoff_ready = not missing_files and not lane_file_missing and not owner_issues
+    handoff_ready = (
+        not missing_files
+        and not lane_file_missing
+        and not owner_issues
+        and not control_table_errors
+    )
     auto_chain_ready = (
         handoff_ready
         and auto_chain_enabled
         and bool(unchecked)
         and not blocked
+        and not paused_requests
+        and (not request_summaries or run_log_present)
         and not stale_markers
         and not budget_exhausted
         and not thrash_requests
@@ -3138,10 +3245,19 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         readiness_reasons.append("lane files missing")
     if owner_issues:
         readiness_reasons.append("request owner is not registered")
+    if control_table_errors:
+        readiness_reasons.append("a control table is missing its header or malformed")
     if not unchecked:
         readiness_reasons.append("no unchecked tracker item")
     if blocked:
         readiness_reasons.append("tracker has blocked items")
+    if paused_requests:
+        readiness_reasons.append(
+            "a request is BLOCKED awaiting human input: "
+            + ", ".join(paused_requests)
+        )
+    if request_summaries and not run_log_present:
+        readiness_reasons.append("loop-run-log.md is missing")
     if stale_markers:
         readiness_reasons.append("stale thread markers present")
     if not auto_chain_enabled:
@@ -3185,6 +3301,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             "owner_issues": owner_issues,
             "thrash": thrash_requests,
             "missing_evidence": missing_evidence_requests,
+            "paused": paused_requests,
         },
         # G13: request_id -> recommended_answer for BLOCKED requests.
         "recommended_answers": recommended_answers,
