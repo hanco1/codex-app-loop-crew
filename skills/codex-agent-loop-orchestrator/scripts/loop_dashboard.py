@@ -385,7 +385,7 @@ RUNLOG_PAGE_SIZE = 50
 CURRENT_MAX_CHARS = 4000
 
 _INACTIVE_REQUEST_STATUSES = frozenset(
-    {"ACCEPTED", "CANCELED", "CANCELLED", "CLOSED", "DONE"}
+    {"ACCEPTED", "ABANDONED", "CANCELED", "CANCELLED", "CLOSED", "DONE"}
 )
 
 # Registry columns, in the order bootstrap writes them. The trailing ``tier`` is

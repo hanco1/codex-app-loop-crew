@@ -2271,7 +2271,7 @@
         var s = (status || "").toUpperCase();
         if (s === "ACCEPTED") return "st-accepted";
         if (s === "BLOCKED") return "st-blocked";
-        if (s === "" || s === "PLANNED") return "st-neutral";
+        if (s === "" || s === "PLANNED" || s === "ABANDONED") return "st-neutral";
         return "st-active";
       }
 
@@ -2487,7 +2487,7 @@
       // Is a request status a live, advancing (non-terminal, non-blocked) one?
       function isAdvancingStatus(status) {
         var s = (status || "").toUpperCase();
-        if (s === "ACCEPTED" || s === "BLOCKED" || s === "" || s === "PLANNED") return false;
+        if (s === "ACCEPTED" || s === "ABANDONED" || s === "BLOCKED" || s === "" || s === "PLANNED") return false;
         // REQUESTED / IMPLEMENTING / IMPLEMENTATION_DONE / REVIEWING /
         // FIX_REQUESTED all mean the request is in flight.
         return true;
