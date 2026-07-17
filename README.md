@@ -176,7 +176,10 @@ see it, you can leave the agents alone.
 Six ideas do all the work.
 
 1. **A "lane" is one agent's standing job.** Instead of one AI doing everything, each *kind* of work gets its
-   own worker (backend, frontend, reviewer), and each owns its files so they don't overwrite each other.
+   own worker (backend, frontend, reviewer), and each owns its files so they don't overwrite each other. And
+   this isn't the honor system — a Git pre-commit hook rejects any commit that reaches outside a lane's files,
+   so two agents can't quietly clobber each other's work; when two lanes need the same file for a handoff, one
+   takes a short-lived **lease** on it and the other waits.
 2. **Work has a status you can always read.** Every task moves through fixed stages recorded in files, so if a
    chat is lost the next session resumes exactly where it was.
 3. **"Done" has to be proven, not claimed.** An agent must run the tests and leave the results as a file. No
