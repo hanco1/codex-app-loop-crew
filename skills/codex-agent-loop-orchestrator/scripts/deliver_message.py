@@ -13,9 +13,13 @@ inbox/new, processes each message, then moves it to inbox/cur.
 
 The helper is read-only with respect to project code. It only touches the
 target lane inbox tree plus an append-only index row. It is deterministic and
-idempotent: a given --request-id + --message-type + --iteration always maps to
-the same message id, and re-delivery is a no-op once the message exists in
-inbox/new or inbox/cur (unless --force is given).
+idempotent: a given request_id + message_type + iteration always maps to the
+same message id, and re-delivery is a no-op once the message exists in
+inbox/new or inbox/cur (unless --force is given). Metadata comes from the CLI
+flags or, when a flag is omitted, from the body's leading envelope lines
+(message_type:/request_id:/iteration:/from_lane:); a flag that disagrees with
+the envelope is an error, and message_type + iteration must be supplied by one
+of the two sources.
 
 It is stdlib-only and compatible with the existing flat inbox.md fallback; see
 references/protocol.md "Atomic Message Delivery" for the migration story.
@@ -39,10 +43,12 @@ from _loop_lock import loop_file_lock
 KNOWN_MESSAGE_TYPES = [
     "IMPLEMENTATION_REQUEST",
     "IMPLEMENTATION_DONE",
+    "PRE_IMPLEMENTATION_TEST_REQUEST",
     "REVIEW_REQUEST",
     "REVIEW_DONE",
     "FIX_REQUEST",
     "BLOCKED",
+    "HUMAN_QA_REQUEST",
     "LOOP_STATUS",
 ]
 
@@ -114,6 +120,74 @@ def read_body(message_file: Optional[str]) -> str:
             "No message body provided. Pass --message-file PATH or pipe the body on stdin."
         )
     return data
+
+
+# Envelope fields deliver_message can fall back to when the matching CLI flag
+# is omitted (references/protocol.md "Message Envelope").
+ENVELOPE_FIELDS = ("message_type", "request_id", "iteration", "from_lane")
+
+ENVELOPE_LINE_RE = re.compile(r"^([a-z][a-z0-9_]*):\s*(.*?)\s*$")
+
+
+def parse_envelope(body: str) -> dict:
+    """Extract the leading protocol-envelope fields from a message body.
+
+    The protocol envelope opens the body with a ``# <MESSAGE_TYPE>`` heading
+    followed IMMEDIATELY by contiguous ``key: value`` lines (``message_type:``,
+    ``request_id:``, ``iteration:``, ``from_lane:``, ...) plus ``- item`` list
+    values. Two hard boundaries keep prose from being misread as metadata:
+    (1) a body whose first non-empty line is NOT a heading has no envelope at
+    all — a stray ``label: text`` opening a plain-prose body is never treated
+    as metadata; (2) the first blank line after the heading ends the envelope
+    block, so a quoted/stray ``request_id:``-style line further down the body
+    is never captured. Only the first occurrence of each field wins. Returns a
+    dict of the ENVELOPE_FIELDS present with non-empty values; a body with no
+    envelope yields an empty dict (malformed envelopes degrade, not crash).
+    """
+
+    fields: dict = {}
+    seen_heading = False
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            if seen_heading:
+                break  # a blank line ends the envelope block
+            continue  # leading blank lines before the heading
+        if line.startswith("#"):
+            if seen_heading:
+                break  # a second heading means the envelope block is over
+            seen_heading = True
+            continue
+        if not seen_heading:
+            break  # body does not open with a protocol heading: no envelope
+        if line.startswith("- "):
+            continue  # list values (source_docs, delivery, ...) inside the envelope
+        match = ENVELOPE_LINE_RE.match(line)
+        if not match:
+            break
+        key, value = match.group(1), match.group(2)
+        if key in ENVELOPE_FIELDS and key not in fields and value:
+            fields[key] = value
+    return fields
+
+
+def resolve_field(name: str, flag_value: str, envelope: dict) -> str:
+    """Resolve one metadata field: explicit CLI flag wins, else envelope value.
+
+    If both are present and disagree, exit non-zero naming the field so a
+    mismatched flag can never silently misfile a message.
+    """
+
+    flag = (flag_value or "").strip()
+    env = (envelope.get(name) or "").strip()
+    if flag and env and flag != env:
+        raise SystemExit(
+            "{0} mismatch: --{1} {2!r} disagrees with the message envelope's "
+            "'{0}: {3}'. Make them agree or drop one source.".format(
+                name, name.replace("_", "-"), flag, env
+            )
+        )
+    return flag or env
 
 
 def ensure_inbox_tree(inbox_dir: Path) -> None:
@@ -207,6 +281,38 @@ def archive_message(loop_dir: Path, request_id: str, message_type: str,
     target = msg_dir / "{mtype}-iter-{itr}.md".format(mtype=mtype, itr=itr)
     _rewrite_atomic(target, body)
     return posix_path(str(target))
+
+
+def lane_registered(loop_dir: Path, lane: str) -> Optional[bool]:
+    """Return whether ``lane`` has a row in agent-lanes.md.
+
+    True/False when the registry could be read; None when it is missing or
+    unreadable (unknown -- callers should not punish the sender for a registry
+    they cannot see).
+    """
+
+    registry = loop_dir / "agent-lanes.md"
+    try:
+        text = registry.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    header_cols: Optional[list] = None
+    lane_index = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if cells and all(set(c) <= {"-", ":", " "} for c in cells):
+            continue
+        if header_cols is None:
+            header_cols = [c.lower() for c in cells]
+            if "lane" in header_cols:
+                lane_index = header_cols.index("lane")
+            continue
+        if lane_index < len(cells) and cells[lane_index] == lane:
+            return True
+    return False
 
 
 def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
@@ -415,14 +521,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Path to the message body. Use '-' or omit to read the body from stdin.",
     )
-    parser.add_argument("--request-id", default="", help="Request id this message belongs to.")
+    parser.add_argument(
+        "--request-id",
+        default="",
+        help="Request id this message belongs to (falls back to the body's "
+        "'request_id:' envelope line).",
+    )
     parser.add_argument(
         "--message-type",
         default="",
-        help="Message type. Known: " + ", ".join(KNOWN_MESSAGE_TYPES),
+        help="Message type (falls back to the body's 'message_type:' envelope "
+        "line; one of the two must supply it). Known: "
+        + ", ".join(KNOWN_MESSAGE_TYPES),
     )
-    parser.add_argument("--from-lane", default="", help="Sender lane name (for the index row).")
-    parser.add_argument("--iteration", default="", help="Iteration counter for this request.")
+    parser.add_argument(
+        "--from-lane",
+        default="",
+        help="Sender lane name (falls back to the body's 'from_lane:' envelope "
+        "line; unknown sender skips the heartbeat stamp).",
+    )
+    parser.add_argument(
+        "--iteration",
+        default="",
+        help="Iteration counter for this request (falls back to the body's "
+        "'iteration:' envelope line; one of the two must supply it).",
+    )
     parser.add_argument(
         "--message-id",
         default=None,
@@ -453,23 +576,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not lane:
         raise SystemExit("--to-lane must not be empty.")
 
-    if args.message_type and args.message_type not in KNOWN_MESSAGE_TYPES:
+    body = read_body(args.message_file)
+
+    # Resolve metadata: explicit flag wins, else the body's envelope lines; a
+    # flag/envelope disagreement is a hard error (see resolve_field).
+    envelope = parse_envelope(body)
+    message_type = resolve_field("message_type", args.message_type, envelope)
+    request_id = resolve_field("request_id", args.request_id, envelope)
+    iteration = resolve_field("iteration", args.iteration, envelope)
+    from_lane = resolve_field("from_lane", args.from_lane, envelope)
+
+    # message_type and iteration must be known: defaulting them (the old
+    # behavior) collapsed every message for a request onto one message id, so
+    # the 2nd+ delivery became a silent idempotent no-op.
+    missing = [name for name, value in
+               (("message_type", message_type), ("iteration", iteration)) if not value]
+    if missing:
+        raise SystemExit(
+            "{0} unknown; pass --message-type/--iteration or include "
+            "'message_type:'/'iteration:' lines in the message envelope. "
+            "Without them every message for a request maps to the same id and "
+            "later deliveries silently no-op.".format(" and ".join(missing))
+        )
+    if not from_lane:
         sys.stderr.write(
-            "warning: --message-type {0!r} is not a known type ({1}).\n".format(
-                args.message_type, ", ".join(KNOWN_MESSAGE_TYPES)
+            "warning: from_lane unknown (no --from-lane flag and no 'from_lane:' "
+            "envelope line); delivering anyway, but the sender heartbeat will "
+            "NOT be stamped.\n"
+        )
+
+    if message_type not in KNOWN_MESSAGE_TYPES:
+        sys.stderr.write(
+            "warning: message_type {0!r} is not a known type ({1}).\n".format(
+                message_type, ", ".join(KNOWN_MESSAGE_TYPES)
             )
         )
 
-    body = read_body(args.message_file)
-
     loop_dir = Path(args.loop_dir)
+
+    # A misspelled or unregistered sender must not lose its heartbeat SILENTLY:
+    # the message still delivers (the index records the claimed sender), but say
+    # plainly why no heartbeat will be stamped so a typo'd lane name is caught
+    # instead of quietly producing stale/orphan judgments later.
+    heartbeat_lane = from_lane
+    if from_lane and lane_registered(loop_dir, from_lane) is False:
+        sys.stderr.write(
+            "warning: from_lane {0!r} is not registered in agent-lanes.md; "
+            "delivering anyway, but the sender heartbeat will NOT be "
+            "stamped.\n".format(from_lane)
+        )
+        heartbeat_lane = ""
+
     inbox_dir = loop_dir / "lanes" / lane / "inbox"
     ensure_inbox_tree(inbox_dir)
 
     message_id = build_message_id(
-        request_id=args.request_id,
-        message_type=args.message_type,
-        iteration=args.iteration,
+        request_id=request_id,
+        message_type=message_type,
+        iteration=iteration,
         explicit_id=args.message_id,
     )
 
@@ -482,8 +646,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         # A re-run still proves the sender is alive; refresh its heartbeat (F7)
         # unless opted out.
-        if args.from_lane and not args.no_heartbeat:
-            for path in stamp_lane_heartbeat(loop_dir, args.from_lane.strip(), utc_now()):
+        if heartbeat_lane and not args.no_heartbeat:
+            for path in stamp_lane_heartbeat(loop_dir, heartbeat_lane, utc_now()):
                 print("heartbeat {0}".format(path))
         return 0
 
@@ -495,10 +659,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         title=title_for(lane),
         delivered_at=delivered_at,
         message_id=message_id,
-        request_id=args.request_id,
-        iteration=args.iteration,
-        from_lane=args.from_lane,
-        message_type=args.message_type,
+        request_id=request_id,
+        iteration=iteration,
+        from_lane=from_lane,
+        message_type=message_type,
     )
 
     print("delivered {0}".format(posix_path(str(target))))
@@ -510,7 +674,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # can never leave an empty stray dir behind.
     if args.also_archive:
         archived = archive_message(
-            loop_dir, args.request_id, args.message_type, args.iteration, body
+            loop_dir, request_id, message_type, iteration, body
         )
         if archived:
             print("archived {0}".format(archived))
@@ -518,8 +682,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # F7: delivering a message is proof the sender lane is alive, so stamp its
     # heartbeat (agent-lanes.md heartbeat column + lanes/<lane>/current.md
     # last_updated/heartbeat if present). Best-effort; never blocks delivery.
-    if args.from_lane and not args.no_heartbeat:
-        for path in stamp_lane_heartbeat(loop_dir, args.from_lane.strip(), delivered_at):
+    if heartbeat_lane and not args.no_heartbeat:
+        for path in stamp_lane_heartbeat(loop_dir, heartbeat_lane, delivered_at):
             print("heartbeat {0}".format(path))
 
     return 0
