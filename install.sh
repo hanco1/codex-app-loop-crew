@@ -9,7 +9,25 @@
 set -euo pipefail
 
 SKILL_NAME="codex-agent-loop-orchestrator"
-SKILLS_DIR="${CODEX_SKILLS_DIR:-$HOME/.codex/skills}"
+# Precedence: CODEX_SKILLS_DIR > CODEX_HOME/skills > ~/.codex/skills.
+SKILLS_DIR="${CODEX_SKILLS_DIR:-${CODEX_HOME:-$HOME/.codex}/skills}"
+
+# Probe for a Python >= 3.9 launcher (the skill's scripts require it). This is
+# a warning, not a gate: the copy still proceeds so docs-only hosts install fine.
+PYTHON_LAUNCHER=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 &&
+     "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+    PYTHON_LAUNCHER="$cand"
+    break
+  fi
+done
+if [ -n "$PYTHON_LAUNCHER" ]; then
+  echo "Found Python launcher: $PYTHON_LAUNCHER"
+else
+  echo "warning: no Python 3.9+ launcher found (tried: python3, python)." >&2
+  echo "warning: the skill's scripts require Python 3.9+; installing the files anyway." >&2
+fi
 
 # Resolve the directory this script lives in (repo root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
