@@ -145,6 +145,17 @@ except Exception as exc:  # pragma: no cover - defensive; bootstrap import shoul
     BOOTSTRAP_IMPORT_ERROR = _safe_exception(exc)
     _warn_module_unavailable("bootstrap_agent_loop", BOOTSTRAP_IMPORT_ERROR)
 
+LOOP_LOCK_AVAILABLE = False
+try:
+    from _loop_lock import atomic_replace as _lock_atomic_replace
+    from _loop_lock import loop_file_lock
+
+    LOOP_LOCK_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - defensive; stdlib-only module
+    _lock_atomic_replace = None  # type: ignore
+    loop_file_lock = None  # type: ignore
+    _warn_module_unavailable("_loop_lock", _safe_exception(exc))
+
 # The Codex host probe (usage/account) is the ONLY module that touches the
 # Codex host's undocumented data surfaces (session JSONL rate-limits, auth.json
 # identity). It is an OPTIONAL dependency: if it is missing, the dashboard stays
@@ -329,6 +340,18 @@ def _state_etag(state: dict[str, Any]) -> str:
 # Lane names are validated against this exactly (mirrors the bootstrap/doctor
 # convention): a lowercase letter, then 1..30 more of lowercase / digit / dash.
 LANE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+
+# POST body limits: the write endpoints carry tiny JSON payloads, so cap the
+# body hard (defends against an accidental or hostile large/slow body tying up
+# a request thread) and bound the read.
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+BODY_READ_TIMEOUT_SECONDS = 10.0
+
+# ``role`` is the only free-text cell a POST writes into the Markdown registry.
+# Reject line breaks / control chars / ``|`` so a role can never forge a table
+# row, and cap its length.
+ROLE_MAX_CHARS = 200
+_ROLE_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f|]")
 
 # Names that must never be registered as lanes: they collide with loop control
 # files / directories, or are otherwise structural and would confuse recovery
@@ -1724,11 +1747,33 @@ def _existing_lane_names(registry_path: Path) -> set[str]:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write ``content`` to ``path`` atomically (temp file then os.replace)."""
+    """Write ``content`` to ``path`` atomically (unique temp file + fsync).
+
+    Delegates to the shared ``_loop_lock.atomic_replace`` when available so the
+    temp file is unique per write (``tempfile.mkstemp``) -- a fixed ``.tmp-<pid>``
+    name collides across this server's request threads, letting one thread's
+    ``os.replace`` hit ``FileNotFoundError``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp-{0}".format(os.getpid()))
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    if LOOP_LOCK_AVAILABLE and _lock_atomic_replace is not None:
+        _lock_atomic_replace(path, content)
+        return
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, str(path))
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
@@ -1760,6 +1805,17 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
         }
     if lane.lower() in RESERVED_LANE_NAMES:
         return {"ok": False, "error": "lane name {0!r} is reserved".format(lane)}
+
+    if role and _ROLE_BAD_CHARS_RE.search(role):
+        return {
+            "ok": False,
+            "error": "role must not contain line breaks, control characters, or '|'",
+        }
+    if len(role) > ROLE_MAX_CHARS:
+        return {
+            "ok": False,
+            "error": "role must be at most {0} characters".format(ROLE_MAX_CHARS),
+        }
 
     registry_path = loop_dir / "agent-lanes.md"
     if not registry_path.exists():
@@ -2149,25 +2205,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Unknown GET path.
         self._send_json(404, {"error": "not found", "path": route})
 
-    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-        """Read and JSON-parse the request body. Returns (payload, error).
+    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Read and JSON-parse the request body. Returns (payload, error, status).
 
-        On success ``payload`` is a dict and ``error`` is None. On failure
-        ``payload`` is None and ``error`` is a human-readable reason.
+        On success ``payload`` is a dict, ``error`` is None, ``status`` is 200.
+        On failure ``payload`` is None, ``error`` is a reason, and ``status`` is
+        the HTTP status to return (400 bad body, 408 timeout, 413 too large).
         """
+        if self.headers.get("Transfer-Encoding"):
+            return None, "chunked Transfer-Encoding is not supported", 400
         length = self.headers.get("Content-Length")
-        try:
-            n = int(length) if length is not None else 0
-        except ValueError:
+        if length is None:
             n = 0
-        raw = self.rfile.read(n) if n > 0 else b""
+        else:
+            try:
+                n = int(length)
+            except ValueError:
+                return None, "invalid Content-Length", 400
+            if n < 0:
+                return None, "invalid Content-Length", 400
+        if n > MAX_REQUEST_BODY_BYTES:
+            return (
+                None,
+                "request body too large (max {0} bytes)".format(MAX_REQUEST_BODY_BYTES),
+                413,
+            )
+        raw = b""
+        if n > 0:
+            self.connection.settimeout(BODY_READ_TIMEOUT_SECONDS)
+            try:
+                raw = self.rfile.read(n)
+            except (TimeoutError, OSError):
+                return None, "timed out reading request body", 408
+            finally:
+                self.connection.settimeout(None)
+            if len(raw) != n:
+                return None, "incomplete request body", 400
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeDecodeError):
-            return None, "body must be valid JSON"
+            return None, "body must be valid JSON", 400
         if not isinstance(payload, dict):
-            return None, "body must be a JSON object"
-        return payload, None
+            return None, "body must be a JSON object", 400
+        return payload, None, 200
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         route = self._path_only()
@@ -2179,9 +2259,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found", "path": route})
             return
 
-        payload, error = self._read_json_body()
+        payload, error, status = self._read_json_body()
         if error is not None:
-            self._send_json(400, {"ok": False, "error": error})
+            self._send_json(status, {"ok": False, "error": error})
             return
 
         if route == "/api/lanes":
