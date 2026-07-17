@@ -42,7 +42,8 @@ human is needed.
 **Built for the Codex app, not the CLI.** The terminal can already spawn agents; the hard part was doing it
 *inside the app*. Under the hood the skill calls the Codex app's own `create_thread` tool to open each agent as
 a real conversation and auto-seed it with its role, write scope, and — by default — the **highest model tier
-your host offers, at `xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole
+your host offers**, at `xhigh` reasoning when the model supports it, else its highest supported effort
+(quality-first; you can dial any single lane down by hand). The whole
 team assembles itself inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
 
 <p align="center">
@@ -53,8 +54,8 @@ team assembles itself inside the app. You never leave it: no terminal, no logs t
 
 ## Install (2 minutes)
 
-> Needs: the Codex app (with skills enabled), `git`, and Python 3 on `PATH` — the dashboard and the
-> verification gates are small local Python scripts.
+> Needs: the Codex app (with skills enabled), `git`, and Python 3.9+ on `PATH` (any of `python3` /
+> `python` / `py -3`) — the dashboard and the verification gates are small local Python scripts.
 
 Open a fresh folder, start one Codex conversation in it, and paste this:
 
@@ -89,7 +90,9 @@ chmod +x install.sh
 ```
 
 Default install path: `%USERPROFILE%\.codex\skills\...` (Windows) or `~/.codex/skills/...` (macOS/Linux).
-Override with `-SkillsDir <path>` (PowerShell) or `CODEX_SKILLS_DIR=<path>` (bash). Open a new Codex session afterward.
+Override with `-SkillsDir <path>` (PowerShell) or `CODEX_SKILLS_DIR=<path>` (bash). Precedence: an explicit
+`-SkillsDir` / `CODEX_SKILLS_DIR` wins, then `$CODEX_HOME/skills` when `CODEX_HOME` is set, then
+`~/.codex/skills` (`%USERPROFILE%\.codex\skills` on Windows). Open a new Codex session afterward.
 
 Plugin marketplace:
 
@@ -209,8 +212,9 @@ codebases were scored by the same rubric with every serious finding independentl
 | Maintainability | 8 | 8 |
 | **Average** | **6.8** | **7.8** |
 
-The loop's margin is in **security and defense-in-depth**, at roughly 8.5× the code and one-to-two orders of
-magnitude more time and tokens. Honestly, **it is not magic** — the same review found real bugs in the loop's
+The loop's margin is in **security and defense-in-depth**, at roughly 8.5× the code, roughly two-to-three
+orders of magnitude more wall-clock time, and one-to-two orders of magnitude more tokens. Honestly, **it is
+not magic** — the same review found real bugs in the loop's
 own output too. The takeaway isn't "always use the loop," it's **match the machinery to the stakes**.
 
 - **Full comparison:** [COMPARISON.md](COMPARISON.md)
@@ -221,10 +225,11 @@ own output too. The takeaway isn't "always use the loop," it's **match the machi
 
 Use a plain Codex session for a small, low-risk task one agent can finish in one sitting — roughly under two
 hours — when auditability, handoff recovery, sensitive-data gates, and real parallel lanes don't matter. The
-cost is real. In an earlier, smaller `n=1` dogfood run (a one-day MVP — a separate, earlier measurement from
-the expense-app comparison above) the loop took **7.2× the active wall time** and **36× the total tokens** of
-the direct session; in the larger expense-app comparison it was **~10 minutes vs multiple days** and one-to-two
-orders of magnitude more tokens. And by default every lane runs on the top model at `xhigh`, so a team is
+cost is real. In an earlier, smaller `n=1` dogfood run (a single early trial: a one-day MVP, measured
+separately from the expense-app comparison above) the loop took **7.2× the active wall time** and **36× the
+total tokens** of the direct session; in the larger expense-app comparison the gap was **~10 minutes vs
+multiple days** — roughly two-to-three orders of magnitude of wall-clock — and one-to-two orders of magnitude
+more tokens. And by default every lane runs on the top model at `xhigh` (or its highest supported effort), so a team is
 several premium sessions at once. This protocol buys traceability and independent verification; it does not
 make multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
 

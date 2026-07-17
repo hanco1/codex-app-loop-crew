@@ -37,7 +37,7 @@
 
 你描述一个目标。这个 skill 把工作拆给几个专职的 Codex agent（"lane"），把所有项目状态存进文件而不是随时会丢的聊天记录，让每个 agent 必须**证明**自己的活通过了才算数，再由另一个 agent 复查。一个本地 dashboard 盯着这一切，在需要人时亮起提示条。
 
-**专为 Codex app 打造，不是 CLI。** 终端本来就能开 agent；难的是在 *app 里*做到。底层这个 skill 调用 Codex app 自己的 `create_thread` 工具，把每个 agent 开成一个真实对话，并自动注入它的角色、写入范围，以及默认**你的 host 能提供的最高档模型 + `xhigh` 推理**（质量优先；你可以手动把某个 lane 单独调低）—— 整队就在 app 里自己组建起来。你全程不用离开 app：没有终端、不用读日志、不用背命令。
+**专为 Codex app 打造，不是 CLI。** 终端本来就能开 agent；难的是在 *app 里*做到。底层这个 skill 调用 Codex app 自己的 `create_thread` 工具，把每个 agent 开成一个真实对话，并自动注入它的角色、写入范围，以及默认**你的 host 能提供的最高档模型**——模型支持 `xhigh` 时用 `xhigh` 推理，否则用它支持的最高推理档（质量优先；你可以手动把某个 lane 单独调低）—— 整队就在 app 里自己组建起来。你全程不用离开 app：没有终端、不用读日志、不用背命令。
 
 <p align="center">
   <img src="assets/codex-app-session.png" width="820" alt="一个 Codex app 对话，包含 product、data-eng、frontend 和 review lane，以及一个本地 dashboard 链接">
@@ -47,7 +47,7 @@
 
 ## 安装（2 分钟）
 
-> 需要：Codex app（启用 skills）、`git`，以及 `PATH` 上的 Python 3 —— dashboard 和验证门槛都是小型本地 Python 脚本。
+> 需要：Codex app（启用 skills）、`git`，以及 `PATH` 上的 Python 3.9+（`python3` / `python` / `py -3` 任意一个即可）—— dashboard 和验证门槛都是小型本地 Python 脚本。
 
 打开一个新文件夹，在里面启动一个 Codex 对话，粘贴这段话：
 
@@ -82,7 +82,7 @@ chmod +x install.sh
 ```
 
 默认安装位置：Windows `%USERPROFILE%\.codex\skills\...`，macOS/Linux `~/.codex/skills/...`。
-用 `-SkillsDir <path>`（PowerShell）或 `CODEX_SKILLS_DIR=<path>`（bash）覆盖。安装后打开新的 Codex 会话。
+用 `-SkillsDir <path>`（PowerShell）或 `CODEX_SKILLS_DIR=<path>`（bash）覆盖。优先级：显式指定的 `-SkillsDir` / `CODEX_SKILLS_DIR` 最高，其次是设置了 `CODEX_HOME` 时的 `$CODEX_HOME/skills`，最后才回退到 `~/.codex/skills`（Windows 为 `%USERPROFILE%\.codex\skills`）。安装后打开新的 Codex 会话。
 
 插件市场：
 
@@ -182,7 +182,7 @@ flowchart LR
 | 可维护性 | 8 | 8 |
 | **平均** | **6.8** | **7.8** |
 
-loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间和 token 高出一到两个数量级。说实话，**它不是魔法** —— 同一轮评审在 loop 自己的产出里也找出了真实 bug。结论不是"永远用 loop"，而是**让 machinery 匹配 stakes**。
+loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、墙钟时间高出约两到三个数量级、token 高出一到两个数量级。说实话，**它不是魔法** —— 同一轮评审在 loop 自己的产出里也找出了真实 bug。结论不是"永远用 loop"，而是**让 machinery 匹配 stakes**。
 
 - **完整对比：** [COMPARISON.md](COMPARISON.md)
 - **loop 构建**（含完整决策账本）：[expense-app-loop-built](https://github.com/hanco1/expense-app-loop-built)
@@ -190,7 +190,7 @@ loop 的优势在**安全和防御纵深**，代价是约 8.5 倍代码、时间
 
 ## 什么时候不该用
 
-如果任务规模小、风险低，一个 agent 一次就能干完——大致不超过两小时——而且你不需要可审计性、handoff 恢复、敏感数据门槛或真正并行的 lane，就直接用普通 Codex 会话。成本是真的。在更早的一次小规模 `n=1` dogfood 对比（一个一天规模的 MVP —— 与上面的记账 app 对比是两次独立测量）中，loop 的**活跃耗时是直接会话的 7.2 倍**、**总 token 是 36 倍**；在更大的记账 app 对比中则是 **~10 分钟 vs 数天**、token 高出一到两个数量级。而且默认每个 lane 都跑最高档模型 + `xhigh`，所以一队 agent 相当于同时开好几个顶配会话。这套协议买到的是可追溯性和独立验证，不会让多智能体协作变免费。当没有任何有意义、可机器检查的东西时，它同样不合适。
+如果任务规模小、风险低，一个 agent 一次就能干完——大致不超过两小时——而且你不需要可审计性、handoff 恢复、敏感数据门槛或真正并行的 lane，就直接用普通 Codex 会话。成本是真的。在更早的一次小规模 `n=1` dogfood 试跑（即仅做过一次的早期试运行：一个一天规模的 MVP，与上面的记账 app 对比是两次独立测量）中，loop 的**活跃耗时是直接会话的 7.2 倍**、**总 token 是 36 倍**；在更大的记账 app 对比中则是 **~10 分钟 vs 数天** —— 墙钟时间差出约两到三个数量级 —— token 高出一到两个数量级。而且默认每个 lane 都跑最高档模型 + `xhigh`（或该模型支持的最高推理档），所以一队 agent 相当于同时开好几个顶配会话。这套协议买到的是可追溯性和独立验证，不会让多智能体协作变免费。当没有任何有意义、可机器检查的东西时，它同样不合适。
 
 ## 站在前人的工作之上
 
