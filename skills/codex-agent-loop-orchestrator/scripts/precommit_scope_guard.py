@@ -174,10 +174,18 @@ def glob_matches(path: str, pattern: str) -> bool:
 
 
 def staged_paths() -> List[str]:
-    """Return staged (cached) paths via git, normalized to posix slashes."""
+    """Return staged (cached) paths via git, normalized to posix slashes.
+
+    Uses ``--name-status`` (not ``--name-only`` + ``--diff-filter=ACMR``) so
+    that pure deletions (``D``) and BOTH endpoints of a rename/copy (``R``/``C``)
+    are surfaced. ``--name-only`` with ``--diff-filter=ACMR`` silently drops
+    every deletion and reports only a rename's destination, which let a lane
+    ``git rm`` or ``git mv`` a file it neither scoped nor leased straight past
+    the guard.
+    """
     try:
         out = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+            ["git", "diff", "--cached", "--name-status", "-z"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -187,8 +195,35 @@ def staged_paths() -> List[str]:
     if out.returncode != 0:
         err = out.stderr.decode("utf-8", "replace").strip()
         raise SystemExit(f"precommit_scope_guard: git diff failed: {err}")
-    raw = out.stdout.decode("utf-8", "replace")
-    return [posix_path(part) for part in raw.split("\0") if part.strip()]
+    # With ``-z --name-status`` each record is NUL-separated fields: a status
+    # token followed by one path (A/M/D/T/U/...) or, for rename/copy (R/C), a
+    # status token followed by the source and destination paths.
+    parts = out.stdout.decode("utf-8", "replace").split("\0")
+    collected: List[str] = []
+    i = 0
+    n = len(parts)
+    while i < n:
+        token = parts[i]
+        if not token.strip():
+            i += 1
+            continue
+        code = token[0].upper()
+        if code in ("R", "C"):
+            if i + 2 < n:
+                collected.append(posix_path(parts[i + 1]))
+                collected.append(posix_path(parts[i + 2]))
+            i += 3
+        else:
+            if i + 1 < n:
+                collected.append(posix_path(parts[i + 1]))
+            i += 2
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for part in collected:
+        if part and part not in seen:
+            seen.add(part)
+            ordered.append(part)
+    return ordered
 
 
 def lane_write_globs(lanes: List[Dict[str, str]], lane: str) -> Optional[List[str]]:

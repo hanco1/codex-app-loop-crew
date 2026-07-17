@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Loop Crew</strong> —— 一小队 Codex agent，带内置的评审 loop，全程在 Codex app 里运行（不用 CLI）。它会在唯一需要人的那个时刻提醒你。<br>
+  <strong>Loop Crew</strong> —— 一小队 Codex agent，带内置的评审 loop，全程在 Codex app 里运行（不用 CLI）。它会在需要你时提醒你。<br>
   <sub>安装包名：<code>codex-agent-loop-orchestrator</code> · <a href="#更多">为什么有三个名字？</a></sub>
 </p>
 
@@ -35,7 +35,7 @@
 
 ## 这是什么
 
-你描述一个目标。这个 skill 把工作拆给几个专职的 Codex agent（"lane"），把所有项目状态存进文件而不是随时会丢的聊天记录，让每个 agent 必须**证明**自己的活通过了才算数，再由另一个 agent 复查。一个本地 dashboard 盯着这一切，只在唯一需要人的那一刻亮起提示条。
+你描述一个目标。这个 skill 把工作拆给几个专职的 Codex agent（"lane"），把所有项目状态存进文件而不是随时会丢的聊天记录，让每个 agent 必须**证明**自己的活通过了才算数，再由另一个 agent 复查。一个本地 dashboard 盯着这一切，在需要人时亮起提示条。
 
 **专为 Codex app 打造，不是 CLI。** 终端本来就能开 agent；难的是在 *app 里*做到。底层这个 skill 调用 Codex app 自己的 `create_thread` 工具，把每个 agent 开成一个真实对话，并自动注入它的角色、写入范围，以及默认**你的 host 能提供的最高档模型 + `xhigh` 推理**（质量优先；你可以手动把某个 lane 单独调低）—— 整队就在 app 里自己组建起来。你全程不用离开 app：没有终端、不用读日志、不用背命令。
 
@@ -43,7 +43,7 @@
   <img src="assets/codex-app-session.png" width="820" alt="一个 Codex app 对话，包含 product、data-eng、frontend 和 review lane，以及一个本地 dashboard 链接">
 </p>
 
-> 上图是通用 Codex 风格桌面端的模拟界面示意图（不含 OpenAI/ChatGPT 品牌、账户身份或真实数据）；HTML 源文件见 [`assets/codex-app-session.html`](assets/codex-app-session.html)。
+> 上图是 Codex 风格桌面端的模拟界面示意图；HTML 源文件见 [`assets/codex-app-session.html`](assets/codex-app-session.html)。
 
 ## 安装（2 分钟）
 
@@ -115,7 +115,7 @@ skill 会先判断任务规模。**如果这活一次专注会话就能干完，
 
 ## 一次运行长什么样
 
-你只说一次目标；agent 们干活；dashboard 告诉你唯一需要你的那个时刻。
+你只说一次目标；agent 们干活；dashboard 告诉你何时需要你。
 
 <details>
 <summary><strong>▸ 展开流程图</strong></summary>
@@ -145,7 +145,7 @@ flowchart LR
 
 ![Dashboard 中 data-eng lane 卡片的局部图](assets/dashboard-lane-card.png)
 
-**"Ready for you" —— 唯一需要你的时刻。** 提示条指明要打开哪个对话。在你看到它之前，agent 们可以自己跑。
+**"Ready for you" —— 轮到你了。** 提示条指明要打开哪个对话。在你看到它之前，agent 们可以自己跑。
 
 ![Dashboard 提示条，告诉用户 data-eng 已准备好等待确认](assets/dashboard-your-turn.png)
 

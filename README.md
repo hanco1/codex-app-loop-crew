@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you the one moment a human is needed.<br>
+  <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you whenever your input is needed.<br>
   <sub>package: <code>codex-agent-loop-orchestrator</code> · <a href="#more">why three names?</a></sub>
 </p>
 
@@ -36,8 +36,8 @@
 
 You describe a goal. The skill splits the work across a few specialized Codex agents ("lanes"), keeps all the
 project state in files instead of disposable chat history, makes each agent **prove** its work passed before it
-counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner the one
-time a human is needed.
+counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner whenever a
+human is needed.
 
 **Built for the Codex app, not the CLI.** The terminal can already spawn agents; the hard part was doing it
 *inside the app*. Under the hood the skill calls the Codex app's own `create_thread` tool to open each agent as
@@ -49,8 +49,7 @@ team assembles itself inside the app. You never leave it: no terminal, no logs t
   <img src="assets/codex-app-session.png" width="820" alt="A Codex-app conversation with product, data-eng, frontend, and review lanes, and a local dashboard link">
 </p>
 
-> The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
-> identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
+> The image above is a mock of a Codex-style desktop host; the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
 
 ## Install (2 minutes)
 
@@ -127,7 +126,7 @@ Codex session instead of a loop** — this machinery is overkill for small work 
 
 ## What a run looks like
 
-You state a goal once; the agents work; the dashboard tells you the single moment you're needed.
+You state a goal once; the agents work; the dashboard tells you whenever you're needed.
 
 <details>
 <summary><strong>▸ Show the flow</strong></summary>
@@ -160,7 +159,7 @@ model tier.
 
 ![Dashboard close-up of the data-eng lane card](assets/dashboard-lane-card.png)
 
-**"Ready for you" — the one moment you're needed.** The banner names the exact conversation to open. Until you
+**"Ready for you" — when it's your turn.** The banner names the exact conversation to open. Until you
 see it, you can leave the agents alone.
 
 ![Dashboard banner telling the human that data-eng is ready for confirmation](assets/dashboard-your-turn.png)
