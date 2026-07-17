@@ -53,10 +53,13 @@ REQUIRED_STRING_FIELDS = ("request_id", "checkpoint", "command", "ran_at")
 # ``REQ-YYYYMMDD-HHMMSS-<lane>-iter-<n>-<slug>.json``; the request_id is stable
 # across fix cycles while the iteration increments, so both must be read from
 # the filename to scope the gate to the request's CURRENT iteration.
+# Evidence files are named ``<request_id>-iter-<n>[-<slug>].json`` -- the command
+# slug is optional, so these must match both ``...-iter-1-npm-test.json`` and
+# ``...-iter-1.json``.
 EVIDENCE_REQID_RE = re.compile(
-    r"^(?P<request_id>REQ-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9-]*?)-iter-\d+-.+$"
+    r"^(?P<request_id>REQ-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9-]*?)-iter-\d+"
 )
-EVIDENCE_ITERATION_RE = re.compile(r"(?i)-iter-(?P<iteration>\d+)-")
+EVIDENCE_ITERATION_RE = re.compile(r"(?i)-iter-(?P<iteration>\d+)")
 
 
 def _name_attribution(path: Path) -> Tuple[Optional[str], Optional[str]]:
@@ -254,6 +257,7 @@ def evaluate(
     request_id: Optional[str],
     *,
     current_iteration: Optional[str] = None,
+    require_iteration: bool = False,
     records_by_request: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate the gate for a single request or all requests.
@@ -268,19 +272,19 @@ def evaluate(
     In all-request mode each request is judged on its newest iteration only.
     """
     norm_current = _norm_iter(current_iteration)
-
-    # Newest iteration seen per request (used by all-request mode).
     max_iter: Dict[str, Optional[int]] = {}
-    for rec in records:
-        rid = str(rec.get("request_id", "")).strip()
-        if not rid:
-            continue
-        num = _iter_num(rec.get("_iteration"))
-        prev = max_iter.get(rid)
-        if num is not None and (prev is None or num > prev):
-            max_iter[rid] = num
 
     if request_id is None:
+        # Newest iteration seen per request (all-request mode only -- kept out of
+        # the per-request path so the doctor's per-request loop stays O(N)).
+        for rec in records:
+            rid = str(rec.get("request_id", "")).strip()
+            if not rid:
+                continue
+            num = _iter_num(rec.get("_iteration"))
+            prev = max_iter.get(rid)
+            if num is not None and (prev is None or num > prev):
+                max_iter[rid] = num
         scoped_records = []
         for rec in records:
             rid = str(rec.get("request_id", "")).strip()
@@ -290,28 +294,40 @@ def evaluate(
             num = _iter_num(rec.get("_iteration"))
             if top is None or num is None or num == top:
                 scoped_records.append(rec)
-    elif norm_current is None:
-        return {
-            "ok": False,
-            "request_id": request_id,
-            "request_ids": [],
-            "passing": [],
-            "failing": [],
-            "load_errors": [],
-            "reasons": [
-                "cannot determine current iteration for request {0} "
-                "(requests.md row/iteration missing) -- pass --iteration to "
-                "override".format(request_id)
-            ],
-            "total_records": 0,
-        }
     else:
         group = (
             list(records_by_request.get(request_id, []))
             if records_by_request is not None
             else [r for r in records if str(r.get("request_id", "")).strip() == request_id]
         )
-        scoped_records = [r for r in group if _norm_iter(r.get("_iteration")) == norm_current]
+        if norm_current is None:
+            if require_iteration:
+                # The CLI cannot tell which iteration is current -> fail closed
+                # rather than risk judging a re-opened request on stale evidence.
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "request_ids": [],
+                    "passing": [],
+                    "failing": [],
+                    "load_errors": [],
+                    "reasons": [
+                        "cannot determine current iteration for request {0} "
+                        "(requests.md row/iteration missing) -- pass --iteration "
+                        "to override".format(request_id)
+                    ],
+                    "total_records": 0,
+                }
+            # No iteration required (e.g. the doctor, which has richer context):
+            # judge the newest iteration present in this request's records.
+            nums = [n for n in (_iter_num(r.get("_iteration")) for r in group) if n is not None]
+            if nums:
+                top = max(nums)
+                scoped_records = [r for r in group if _iter_num(r.get("_iteration")) == top]
+            else:
+                scoped_records = list(group)
+        else:
+            scoped_records = [r for r in group if _norm_iter(r.get("_iteration")) == norm_current]
 
     # Scope malformed-file errors by the request_id/iteration parsed from the
     # filename. An error the gate cannot attribute (no REQ- prefix) stays
@@ -331,7 +347,9 @@ def evaluate(
         else:
             if e_req is None:
                 scoped_errors.append(error)
-            elif e_req == request_id and (e_iter is None or e_iter == norm_current):
+            elif e_req == request_id and (
+                norm_current is None or e_iter is None or e_iter == norm_current
+            ):
                 scoped_errors.append(error)
 
     failing: List[Dict[str, Any]] = []
@@ -365,11 +383,14 @@ def evaluate(
     if failing:
         reasons.append("one or more evidence records did not exit 0")
     if request_id is not None and not scoped_records and not scoped_errors:
-        reasons.append(
-            "no evidence records found for request {0} at iteration {1}".format(
-                request_id, norm_current
+        if norm_current is not None:
+            reasons.append(
+                "no evidence records found for request {0} at iteration {1}".format(
+                    request_id, norm_current
+                )
             )
-        )
+        else:
+            reasons.append("no evidence records found for request {0}".format(request_id))
     if request_id is None and not scoped_records and not scoped_errors:
         reasons.append("no evidence records found")
 
@@ -468,6 +489,7 @@ def main() -> int:
         load_errors,
         request_id,
         current_iteration=current_iteration,
+        require_iteration=request_id is not None,
     )
     result["evidence_dir"] = posix_path(evidence_dir)
 

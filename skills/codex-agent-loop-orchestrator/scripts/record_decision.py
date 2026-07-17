@@ -22,9 +22,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _loop_lock import loop_file_lock
 
 
 # Separator concatenated between per-document normalized text before hashing.
@@ -87,6 +91,12 @@ def _count_existing_for_request(decisions_path: Path, request_id: str) -> int:
         text = decisions_path.read_text(encoding="utf-8")
     except OSError:
         return 0
+    except UnicodeDecodeError:
+        raise SystemExit(
+            "decisions.jsonl is not valid UTF-8: {0}; re-save it as UTF-8".format(
+                str(decisions_path)
+            )
+        )
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -102,14 +112,46 @@ def _count_existing_for_request(decisions_path: Path, request_id: str) -> int:
     return count
 
 
+def _decision_id_exists(decisions_path: Path, decision_id: str) -> bool:
+    """Return True if ``decision_id`` is already recorded in the log."""
+    if not decisions_path.exists():
+        return False
+    try:
+        text = decisions_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    except UnicodeDecodeError:
+        raise SystemExit(
+            "decisions.jsonl is not valid UTF-8: {0}; re-save it as UTF-8".format(
+                str(decisions_path)
+            )
+        )
+    target = decision_id.strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and str(obj.get("decision_id", "")).strip() == target:
+            return True
+    return False
+
+
 def _derive_decision_id(request_id: str, decisions_path: Path, explicit: str) -> str:
     """Return a stable decision_id.
 
-    Priority: an explicit ``--decision-id`` wins; otherwise derive from the
-    request_id plus the next per-request sequence number (read-only count).
+    Priority: an explicit ``--decision-id`` wins (rejected if it already exists);
+    otherwise derive from the request_id plus the next per-request sequence
+    number. Callers must hold the ``decisions`` lock so the count/derivation and
+    the append are one critical section.
     """
     explicit = (explicit or "").strip()
     if explicit:
+        if _decision_id_exists(decisions_path, explicit):
+            raise SystemExit("decision_id already exists: {0}".format(explicit))
         return explicit
     seq = _count_existing_for_request(decisions_path, request_id) + 1
     safe_request = request_id.strip() or "REQ-UNKNOWN"
@@ -218,8 +260,12 @@ def main(argv: List[str] = None) -> int:
             "source doc(s) not found: {0}".format(", ".join(missing))
         )
 
-    record = build_record(args, loop_dir, decisions_path)
-    append_decision(decisions_path, record)
+    # Count-and-append under one lock so two concurrent writers for the same
+    # request cannot both derive the same "-dN" id, and an explicit
+    # --decision-id collision is detected against the log at write time.
+    with loop_file_lock(loop_dir, "decisions"):
+        record = build_record(args, loop_dir, decisions_path)
+        append_decision(decisions_path, record)
     print("recorded {0} -> {1}".format(record["decision_id"], decisions_path))
     return 0
 

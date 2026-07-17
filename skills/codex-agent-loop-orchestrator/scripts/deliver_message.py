@@ -32,6 +32,9 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _loop_lock import loop_file_lock
+
 
 KNOWN_MESSAGE_TYPES = [
     "IMPLEMENTATION_REQUEST",
@@ -272,60 +275,64 @@ def _update_registry_heartbeat(registry: Path, lane: str, when: str) -> bool:
     """
     if not registry.exists():
         return False
-    try:
-        original = registry.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        _warn_heartbeat_failure(registry, exc)
-        return False
+    # Serialize under the shared ``registry`` lock and re-read inside it so a
+    # concurrent bootstrap (which rewrites the whole registry) or another
+    # heartbeat cannot lose this update to a stale-snapshot overwrite.
+    with loop_file_lock(registry.parent, "registry"):
+        try:
+            original = registry.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _warn_heartbeat_failure(registry, exc)
+            return False
 
-    lines = original.splitlines(keepends=True)
-    header_cols: Optional[list[str]] = None
-    hb_index: Optional[int] = None
-    lane_index = 0
-    changed = False
-    out: list[str] = []
+        lines = original.splitlines(keepends=True)
+        header_cols: Optional[list[str]] = None
+        hb_index: Optional[int] = None
+        lane_index = 0
+        changed = False
+        out: list[str] = []
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            out.append(line)
-            continue
-        cells = [c.strip() for c in stripped.strip("|").split("|")]
-        # Separator row (all dashes/colons): pass through untouched.
-        if cells and all(set(c) <= {"-", ":", " "} for c in cells):
-            out.append(line)
-            continue
-        if header_cols is None:
-            header_cols = [c.lower() for c in cells]
-            if "heartbeat" in header_cols:
-                hb_index = header_cols.index("heartbeat")
-            if "lane" in header_cols:
-                lane_index = header_cols.index("lane")
-            out.append(line)
-            continue
-        # Data row.
-        if hb_index is None or lane_index >= len(cells):
-            out.append(line)
-            continue
-        if cells[lane_index] == lane:
-            while len(cells) <= hb_index:
-                cells.append("-")
-            if cells[hb_index] != when:
-                cells[hb_index] = when
-                changed = True
-            newline_suffix = "\n" if line.endswith("\n") else ""
-            out.append("| " + " | ".join(cells) + " |" + newline_suffix)
-        else:
-            out.append(line)
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                out.append(line)
+                continue
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            # Separator row (all dashes/colons): pass through untouched.
+            if cells and all(set(c) <= {"-", ":", " "} for c in cells):
+                out.append(line)
+                continue
+            if header_cols is None:
+                header_cols = [c.lower() for c in cells]
+                if "heartbeat" in header_cols:
+                    hb_index = header_cols.index("heartbeat")
+                if "lane" in header_cols:
+                    lane_index = header_cols.index("lane")
+                out.append(line)
+                continue
+            # Data row.
+            if hb_index is None or lane_index >= len(cells):
+                out.append(line)
+                continue
+            if cells[lane_index] == lane:
+                while len(cells) <= hb_index:
+                    cells.append("-")
+                if cells[hb_index] != when:
+                    cells[hb_index] = when
+                    changed = True
+                newline_suffix = "\n" if line.endswith("\n") else ""
+                out.append("| " + " | ".join(cells) + " |" + newline_suffix)
+            else:
+                out.append(line)
 
-    if not changed:
-        return False
-    try:
-        _rewrite_atomic(registry, "".join(out))
-    except OSError as exc:
-        _warn_heartbeat_failure(registry, exc)
-        return False
-    return True
+        if not changed:
+            return False
+        try:
+            _rewrite_atomic(registry, "".join(out))
+        except OSError as exc:
+            _warn_heartbeat_failure(registry, exc)
+            return False
+        return True
 
 
 def _update_current_heartbeat(current: Path, when: str) -> bool:

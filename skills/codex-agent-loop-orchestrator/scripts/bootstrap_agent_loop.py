@@ -18,6 +18,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _loop_lock import atomic_replace, loop_file_lock
+
 
 # Default lane write scopes obey the G22 "Proposing Lanes" rules: pairwise
 # disjoint, product owns the whole docs/loop/** ledger (plus .gitignore) so its
@@ -1091,42 +1094,49 @@ def main() -> int:
         if write_if_missing(path, template):
             wrote.append(path)
 
-    rows = existing_rows(registry)
-    # G22: which lanes are NEW this run (absent from the on-disk registry). Only
-    # these get an overlap advisory below; a pre-existing overlap is not
-    # re-announced on every flagless rerun.
-    preexisting_lanes = set(rows)
-    for lane, defaults in lane_defaults.items():
-        worklog = f"{posix_path(args.loop_dir)}/lanes/{lane}/worklog.md"
-        rows.setdefault(
-            lane,
-            {
-                "thread_id": "UNVERIFIED",
-                "role": defaults["role"],
-                "write_scope": defaults["write_scope"],
-                "worklog": worklog,
-                "status": "needs-thread",
-                "heartbeat": "-",
-                # F8 advisory tier: policy default for a brand-new lane.
-                "tier": recommended_tier_for(lane),
-            },
-        )
-        # Ensure any pre-existing row gains a heartbeat default on upgrade.
-        rows[lane].setdefault("heartbeat", "-")
-        # Ensure any pre-existing (legacy) row gains a tier on upgrade WITHOUT
-        # overriding a human opt-down: only fill it when it is missing or blank.
-        if not (rows[lane].get("tier") or "").strip():
-            rows[lane]["tier"] = recommended_tier_for(lane)
+    # Serialize the registry read-modify-write across concurrent writers
+    # (another bootstrap, or deliver_message's heartbeat stamp). Re-read the
+    # on-disk rows INSIDE the lock so a racing writer's rows are merged, not
+    # clobbered, and replace the file atomically so no reader sees a torn write.
+    with loop_file_lock(registry.parent, "registry"):
+        rows = existing_rows(registry)
+        # G22: which lanes are NEW this run (absent from the on-disk registry).
+        # Only these get an overlap advisory below; a pre-existing overlap is not
+        # re-announced on every flagless rerun.
+        preexisting_lanes = set(rows)
+        for lane, defaults in lane_defaults.items():
+            worklog = f"{posix_path(args.loop_dir)}/lanes/{lane}/worklog.md"
+            rows.setdefault(
+                lane,
+                {
+                    "thread_id": "UNVERIFIED",
+                    "role": defaults["role"],
+                    "write_scope": defaults["write_scope"],
+                    "worklog": worklog,
+                    "status": "needs-thread",
+                    "heartbeat": "-",
+                    # F8 advisory tier: policy default for a brand-new lane.
+                    "tier": recommended_tier_for(lane),
+                },
+            )
+            # Ensure any pre-existing row gains a heartbeat default on upgrade.
+            rows[lane].setdefault("heartbeat", "-")
+            # Ensure any pre-existing (legacy) row gains a tier on upgrade WITHOUT
+            # overriding a human opt-down: only fill it when it is missing or blank.
+            if not (rows[lane].get("tier") or "").strip():
+                rows[lane]["tier"] = recommended_tier_for(lane)
 
-    # Apply --set-thread adoption over the FULL row set -- existing on-disk rows
-    # included -- not just this invocation's lane_defaults (F11 completion: the
-    # documented adoption one-liner must fill a custom lane's EXISTING row even
-    # in a later, flagless run). Every lane here passed the validation above, so
-    # rows[lane] is guaranteed to exist: flip thread_id and status in place;
-    # tier and every other cell are preserved (render_registry keeps them).
-    for lane, thread_id in thread_mapping.items():
-        rows[lane]["thread_id"] = thread_id
-        rows[lane]["status"] = "registered"
+        # Apply --set-thread adoption over the FULL row set -- existing on-disk
+        # rows included -- not just this invocation's lane_defaults (F11
+        # completion: the documented adoption one-liner must fill a custom lane's
+        # EXISTING row even in a later, flagless run). Every lane here passed the
+        # validation above, so rows[lane] is guaranteed to exist: flip thread_id
+        # and status in place; tier and every other cell are preserved.
+        for lane, thread_id in thread_mapping.items():
+            rows[lane]["thread_id"] = thread_id
+            rows[lane]["status"] = "registered"
+
+        atomic_replace(registry, render_registry(rows))
 
     for lane in sorted(rows):
         lane_dir = lanes_dir / lane
@@ -1153,8 +1163,6 @@ def main() -> int:
         if lane in observed_models:
             if stamp_observed_model(lane_dir / "current.md", observed_models[lane]):
                 stamped_observed.append(lane)
-
-    registry.write_text(render_registry(rows), encoding="utf-8")
 
     print(f"wrote {registry}")
     if wrote:

@@ -2547,6 +2547,15 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             for request in request_summaries
             if request["status"] in COMPLETION_GATE_REQUIRED_STATUSES
         }
+        # Scope each request's gate evaluation to its current iteration (from
+        # requests.md) so stale prior-iteration evidence is ignored, matching the
+        # standalone completion_gate CLI. An evidence-only id with no summary row
+        # has no known iteration -> newest-iteration-in-records fallback.
+        iteration_by_request = {
+            request["request_id"]: (request.get("iteration") or None)
+            for request in request_summaries
+            if request.get("request_id")
+        }
         evaluated_ids = sorted(evidence_request_ids | required_ids)
         for request_id in evaluated_ids:
             # Evaluate against the records only (pass no load_errors here): a
@@ -2555,7 +2564,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             # `not gate_load_errors` term below and the gate_malformed_evidence
             # issues, so they must not smear a failure across every request_id.
             gate_result = completion_gate.evaluate(
-                gate_records, [], request_id, records_by_request
+                gate_records,
+                [],
+                request_id,
+                current_iteration=iteration_by_request.get(request_id),
+                records_by_request=records_by_request,
             )
             if not gate_result["ok"]:
                 gate_failed_requests.append(request_id)
