@@ -3870,7 +3870,9 @@ def main() -> int:
             "`handoff.md`",
             "`agent-lanes.md`",
             "`requests.md`",
-            "this lane's `current.md` and `inbox.md`",
+            # E5: inbox/new/ is the canonical pending-work surface; the flat
+            # inbox.md is only the Python-unavailable degrade path.
+            "this lane's `current.md` and its `inbox/new/`",
         ):
             if needle not in recovery_lower:
                 _fail("OPEN-THE-TURN must not replace Recovery Gate item: {0}".format(needle))

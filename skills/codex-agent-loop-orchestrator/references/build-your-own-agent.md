@@ -63,18 +63,28 @@ nested or `.txt` template.**
   unless you intentionally kept them. If those three are still there, you re-ran
   the default team; add `--no-default-lanes` and your own lanes.
 
-## 5. Worked example - a 2-lane research + writing team
+## 5. Worked example - a research + writing team
 
 ```bash
 python <skill_dir>/scripts/bootstrap_agent_loop.py --loop-dir docs/loop \
   --no-default-lanes \
-  --extra-lane "research|Gather and cite sources|docs/research/**" \
-  --extra-lane "writing|Synthesize a sourced briefing|docs/briefing/**"
+  --extra-lane "coordinator|Own the ledger and perform ACCEPTED|docs/loop/**" \
+  --extra-lane "research|Gather and cite sources|docs/research/**; docs/loop/lanes/research/**" \
+  --extra-lane "writing|Synthesize a sourced briefing|docs/briefing/**; docs/loop/lanes/writing/**"
 ```
 
 Without `--no-default-lanes`, bootstrap can only **append** lanes onto the
 default `product` / `implementation` / `review` trio - it cannot **replace** it.
 So building a genuinely different team requires this flag.
+
+General rule: every custom team designates exactly one lane whose scope
+includes `docs/loop/**` as the ledger owner and acceptance authority - here
+`coordinator` commits the ledger and alone performs the `ACCEPTED` transition,
+the same duties `product` holds in the default trio. And when you pass an
+explicit write_scope in `--extra-lane`, bootstrap does NOT auto-append
+`docs/loop/lanes/<lane>/**` (that default applies only when the scope segment
+is empty), so every other lane's scope must carry its own lane dir explicitly,
+as `research` and `writing` do above.
 
 - **Verification surface:** `linkcheck` exits 0, **and** every claim carries a
   parseable `source_url`.
