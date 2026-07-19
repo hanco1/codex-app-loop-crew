@@ -145,6 +145,77 @@ except Exception as exc:  # pragma: no cover - defensive; bootstrap import shoul
     BOOTSTRAP_IMPORT_ERROR = _safe_exception(exc)
     _warn_module_unavailable("bootstrap_agent_loop", BOOTSTRAP_IMPORT_ERROR)
 
+LOOP_LOCK_AVAILABLE = False
+try:
+    from _loop_lock import atomic_replace as _lock_atomic_replace
+    from _loop_lock import loop_file_lock
+
+    LOOP_LOCK_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - defensive; stdlib-only module
+    _lock_atomic_replace = None  # type: ignore
+    loop_file_lock = None  # type: ignore
+    _warn_module_unavailable("_loop_lock", _safe_exception(exc))
+
+# THE single canonical state-grammar parser shared with the doctor
+# (``loop_state_parsing``: pure text -> value, no filesystem I/O). The doctor
+# and this dashboard used to carry private copies of these primitives and they
+# drifted (max_fix_cycles regex, table header anchoring); the shared module is
+# the fix, contract-tested by ``test_loop_state_parsing.py``. Guarded exactly
+# like the sibling imports above: on failure the dashboard keeps serving --
+# the doctor's re-exported copies cover the trivial primitives when the doctor
+# imported, and table parsing degrades to a VISIBLE parse error (never
+# silently-empty rows).
+PARSING_IMPORT_ERROR = ""
+try:
+    from loop_state_parsing import DEFAULT_MAX_FIX_CYCLES  # type: ignore
+    from loop_state_parsing import POLICY_LINE_RE as _MAX_FIX_CYCLES_RE  # type: ignore
+    from loop_state_parsing import TERMINAL_REQUEST_STATUSES  # type: ignore
+    from loop_state_parsing import dashboard_table_error as _dashboard_table_error  # type: ignore
+    from loop_state_parsing import parse_md_table as _shared_parse_md_table  # type: ignore
+    from loop_state_parsing import parse_timestamp as _parse_timestamp  # type: ignore
+    from loop_state_parsing import read_max_fix_cycles as _read_policy_max_fix_cycles  # type: ignore
+    from loop_state_parsing import split_md_row as _split_md_row  # type: ignore
+
+    PARSING_AVAILABLE = True
+except Exception as exc:
+    PARSING_AVAILABLE = False
+    PARSING_IMPORT_ERROR = _safe_exception(exc)
+    _warn_module_unavailable("loop_state_parsing", PARSING_IMPORT_ERROR)
+    _shared_parse_md_table = None  # type: ignore
+    _dashboard_table_error = None  # type: ignore
+    # Strict policy-line regex (the named groups drive the in-place rewrite in
+    # ``set_max_fix_cycles``); byte-identical local copy of the shared pattern.
+    _MAX_FIX_CYCLES_RE = re.compile(
+        r"^(?P<prefix>\s*(?:[-*]\s*)?)(?P<key>max_fix_cycles)\s*:\s*(?P<value>\d+)\s*$",
+        re.IGNORECASE,
+    )
+    if DOCTOR_AVAILABLE and doctor is not None:
+        # The doctor re-exports the same canonical names (with its own faithful
+        # fallbacks), so even a partial install leaves ONE shared vocabulary.
+        TERMINAL_REQUEST_STATUSES = doctor.TERMINAL_REQUEST_STATUSES
+        DEFAULT_MAX_FIX_CYCLES = doctor.DEFAULT_MAX_FIX_CYCLES
+        _split_md_row = doctor.split_md_row
+        _parse_timestamp = doctor.parse_timestamp
+        _read_policy_max_fix_cycles = doctor.read_max_fix_cycles
+    else:  # pragma: no cover - doubly-broken install; keep serving, degraded
+        TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "ABANDONED"}
+        DEFAULT_MAX_FIX_CYCLES = 3
+
+        def _split_md_row(line: str) -> list:
+            return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+        def _parse_timestamp(value: str):
+            return None  # display-only freshness degrades to "none"
+
+        def _read_policy_max_fix_cycles(policy_text: str) -> int:
+            # Doubly-degraded install (no loop_state_parsing AND no doctor):
+            # do NOT re-implement the policy grammar here -- a drifted copy is
+            # exactly what the shared module exists to prevent (a strict local
+            # scan disagreed with the canonical tolerant reader on lines like
+            # 'max_fix_cycles: 1 # comment'). Report the documented default;
+            # build_state already surfaces the missing-module degradation.
+            return DEFAULT_MAX_FIX_CYCLES
+
 # The Codex host probe (usage/account) is the ONLY module that touches the
 # Codex host's undocumented data surfaces (session JSONL rate-limits, auth.json
 # identity). It is an OPTIONAL dependency: if it is missing, the dashboard stays
@@ -330,6 +401,18 @@ def _state_etag(state: dict[str, Any]) -> str:
 # convention): a lowercase letter, then 1..30 more of lowercase / digit / dash.
 LANE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 
+# POST body limits: the write endpoints carry tiny JSON payloads, so cap the
+# body hard (defends against an accidental or hostile large/slow body tying up
+# a request thread) and bound the read.
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+BODY_READ_TIMEOUT_SECONDS = 10.0
+
+# ``role`` is the only free-text cell a POST writes into the Markdown registry.
+# Reject line breaks / control chars / ``|`` so a role can never forge a table
+# row, and cap its length.
+ROLE_MAX_CHARS = 200
+_ROLE_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f|]")
+
 # Names that must never be registered as lanes: they collide with loop control
 # files / directories, or are otherwise structural and would confuse recovery
 # tooling. Kept lowercase for a case-insensitive check.
@@ -361,8 +444,13 @@ EVIDENCE_PAGE_SIZE = 100
 RUNLOG_PAGE_SIZE = 50
 CURRENT_MAX_CHARS = 4000
 
+# Statuses that stop counting a request as active for DISPLAY purposes. The
+# base vocabulary is the shared TERMINAL_REQUEST_STATUSES (ACCEPTED, ABANDONED)
+# from loop_state_parsing -- imported above, so this set can never drift from
+# the doctor's terminal vocabulary again. The extra aliases are display-side
+# tolerance for hand-edited requests.md files; they are NOT protocol statuses.
 _INACTIVE_REQUEST_STATUSES = frozenset(
-    {"ACCEPTED", "CANCELED", "CANCELLED", "CLOSED", "DONE"}
+    TERMINAL_REQUEST_STATUSES | {"CANCELED", "CANCELLED", "CLOSED", "DONE"}
 )
 
 # Registry columns, in the order bootstrap writes them. The trailing ``tier`` is
@@ -417,19 +505,13 @@ _PROJECT_FILE_TEMPLATE = (
 
 _DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 
-# Default max_fix_cycles when loop-policy.md is absent or has no line (mirrors
-# the bootstrap template default and protocol.md's documented default).
-DEFAULT_MAX_FIX_CYCLES = 3
+# DEFAULT_MAX_FIX_CYCLES and the strict ``max_fix_cycles`` line regex
+# (``_MAX_FIX_CYCLES_RE``, named groups for the in-place rewrite) come from
+# loop_state_parsing (guarded import above), shared with the doctor's policy
+# diagnostics.
 # Valid inclusive range for the human-set fix-cycle cap.
 MAX_FIX_CYCLES_MIN = 1
 MAX_FIX_CYCLES_MAX = 10
-# Matches the "max_fix_cycles: <int>" line in loop-policy.md. Tolerant of
-# surrounding whitespace and an optional leading list marker, case-insensitive
-# on the key; captures the integer so it can be read or rewritten in place.
-_MAX_FIX_CYCLES_RE = re.compile(
-    r"^(?P<prefix>\s*(?:[-*]\s*)?)(?P<key>max_fix_cycles)\s*:\s*(?P<value>\d+)\s*$",
-    re.IGNORECASE,
-)
 
 # Test seam only: ``main`` stashes the bound server here so an in-process smoke
 # can shut down a main() started in a background thread. The app never reads it.
@@ -459,8 +541,9 @@ def _read_text_status(path: Path) -> tuple[str, str, str]:
     return text, ("empty" if not text.strip() else "ok"), ""
 
 
-def _split_md_row(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+# ``_split_md_row`` and ``_parse_timestamp`` come from loop_state_parsing
+# (guarded import above): the same cell splitter and timestamp grammar the
+# doctor uses.
 
 
 def _parse_md_table_text(
@@ -468,58 +551,26 @@ def _parse_md_table_text(
     source: str,
     required_headers: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Parse a Markdown table while retaining structural parse diagnostics."""
-    headers: Optional[list[str]] = None
-    header_line = 0
-    delimiter_seen = False
-    rows: list[dict[str, str]] = []
-    errors: list[dict[str, str]] = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        if not line.lstrip().startswith("|"):
-            continue
-        cells = _split_md_row(line)
-        if not cells:
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            if headers is not None:
-                delimiter_seen = True
-            continue
-        if headers is None:
-            headers = [cell.strip() for cell in cells]
-            header_line = lineno
-            continue
-        if len(cells) != len(headers):
-            errors.append(
-                {
-                    "source": source,
-                    "reason": "line {0}: table row has {1} cells; expected {2}".format(
-                        lineno, len(cells), len(headers)
-                    ),
-                }
-            )
-        if len(cells) < len(headers):
-            cells = cells + [""] * (len(headers) - len(cells))
-        rows.append(dict(zip(headers, cells[: len(headers)])))
+    """Parse a Markdown table while retaining structural parse diagnostics.
 
-    if headers is None:
-        errors.append({"source": source, "reason": "no Markdown table found"})
-        return rows, errors
-    if not delimiter_seen:
-        errors.append(
+    Thin wrapper over the canonical ``loop_state_parsing.parse_md_table`` --
+    ONE body shared with the doctor, carrying its header anchoring (a preface
+    table can never shadow the control table) and its delimiter-must-
+    immediately-follow-header rule -- rendered into this module's
+    ``{source, reason}`` parse-error shape. When the shared module is absent
+    (partial install) parsing fails VISIBLY with an error entry and no rows,
+    never pretending the file is empty-but-healthy.
+    """
+    if not PARSING_AVAILABLE or _shared_parse_md_table is None:
+        return [], [
             {
                 "source": source,
-                "reason": "line {0}: table header has no delimiter row".format(header_line),
+                "reason": "loop_state_parsing module is missing ({0}); table rows "
+                "cannot be read".format(PARSING_IMPORT_ERROR or "partial install"),
             }
-        )
-    missing = [name for name in required_headers if name not in headers]
-    if missing:
-        errors.append(
-            {
-                "source": source,
-                "reason": "table is missing required column(s): {0}".format(", ".join(missing)),
-            }
-        )
-    return rows, errors
+        ]
+    rows, errors = _shared_parse_md_table(text, source, required_headers)
+    return rows, [_dashboard_table_error(error) for error in errors]
 
 
 def _parse_md_table(path: Path) -> list[dict[str, str]]:
@@ -534,37 +585,6 @@ def _parse_md_table(path: Path) -> list[dict[str, str]]:
         return []
     rows, _errors = _parse_md_table_text(text, str(path).replace("\\", "/"))
     return rows
-
-
-def _parse_timestamp(value: str) -> Optional[datetime]:
-    """Parse an ISO-8601-ish timestamp into an aware UTC datetime, or None.
-
-    Handles a trailing ``Z`` and a space date/time separator, and assumes UTC
-    for naive values. Returns None for blank or unparseable input.
-    """
-    text = (value or "").strip()
-    if not text or text.upper() in {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}:
-        return None
-    candidate = text
-    if candidate.endswith(("Z", "z")):
-        candidate = candidate[:-1] + "+00:00"
-    if " " in candidate and "T" not in candidate:
-        candidate = candidate.replace(" ", "T", 1)
-    parsed: Optional[datetime] = None
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(candidate, fmt)
-                break
-            except ValueError:
-                continue
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _heartbeat_freshness(raw: str, now: datetime) -> dict[str, Any]:
@@ -763,9 +783,16 @@ def _current_summary(lanes_dir: Path, lane: str) -> dict[str, Any]:
     ``current`` keeps the raw (capped) current.md for the "View raw" details
     block; ``summary`` carries the structured fields parsed from it so the card
     can render a clean block without re-parsing on the client.
+
+    B6: ``current_status`` / ``current_read_error`` distinguish missing, empty,
+    ok, and UNREADABLE current.md -- an unreadable lane state must surface as a
+    read error, never render as an empty lane. worklog.md stays on the
+    forgiving reader: it is a display tail, not lane state.
     """
     lane_dir = lanes_dir / lane
-    raw_current = _read_text(lane_dir / "current.md")
+    raw_current, current_status, current_read_error = _read_text_status(
+        lane_dir / "current.md"
+    )
     summary = _parse_current_md(raw_current)
     current_text = raw_current
     if len(current_text) > CURRENT_MAX_CHARS:
@@ -774,6 +801,8 @@ def _current_summary(lanes_dir: Path, lane: str) -> dict[str, Any]:
     workspace_files = _lane_workspace_files(lanes_dir, lane)
     return {
         "current": current_text,
+        "current_status": current_status,
+        "current_read_error": current_read_error,
         "summary": summary,
         "worklog_tail": worklog_tail,
         "workspace_files": workspace_files,
@@ -1173,23 +1202,22 @@ def read_max_fix_cycles(
 
     Returns ``{"max_fix_cycles": int, "source_present": bool}``. When the file
     is missing or has no recognizable line, falls back to
-    ``DEFAULT_MAX_FIX_CYCLES`` and reports ``source_present`` honestly. Never
-    raises; a malformed value degrades to the default.
+    ``DEFAULT_MAX_FIX_CYCLES`` and reports ``source_present`` honestly. The
+    integer itself comes from the shared
+    ``loop_state_parsing.read_max_fix_cycles`` -- the SAME tolerant
+    list-marker-aware reader the doctor gates with, so the dashboard can never
+    display a different cap than the doctor enforces. Never raises; a
+    malformed value degrades to the default (and ``build_state`` separately
+    flags a policy file whose line is not strictly well-formed).
     """
     policy_path = loop_dir / "loop-policy.md"
     if text is None:
         text = _read_text(policy_path)
     present = bool(text) if source_present is None else source_present
-    value = DEFAULT_MAX_FIX_CYCLES
-    for line in text.splitlines():
-        m = _MAX_FIX_CYCLES_RE.match(line)
-        if m:
-            try:
-                value = int(m.group("value"))
-            except ValueError:
-                value = DEFAULT_MAX_FIX_CYCLES
-            break
-    return {"max_fix_cycles": value, "source_present": present}
+    return {
+        "max_fix_cycles": _read_policy_max_fix_cycles(text),
+        "source_present": present,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1393,6 +1421,17 @@ def build_state(
         if not lane:
             continue
         detail = _current_summary(lanes_dir, lane)
+        # B6: an unreadable current.md is a READ ERROR, not an empty lane.
+        # Route it into the state's read_errors and flag the lane so the page
+        # can say "unreadable" instead of presenting a blank card as truth.
+        current_unreadable = detail["current_status"] == "unreadable"
+        if current_unreadable:
+            read_errors.append(
+                {
+                    "source": str(lanes_dir / lane / "current.md").replace("\\", "/"),
+                    "reason": detail["current_read_error"],
+                }
+            )
         # F14: attach the human-readable goal of the lane's current request.
         # The request row's ``next_action`` is the plainest human sentence
         # available; its ``status`` is the machine token. This lets the card
@@ -1447,6 +1486,9 @@ def build_state(
                     row.get("heartbeat", "") or row.get("last_heartbeat", ""), now
                 ),
                 "current": detail["current"],
+                # B6: distinguish an unreadable current.md from an empty one.
+                "current_status": detail["current_status"],
+                "current_unreadable": current_unreadable,
                 "summary": summary,
                 "current_request": current_request,
                 "worklog_tail": detail["worklog_tail"],
@@ -1716,6 +1758,18 @@ def _paginate_state(
 
 def _existing_lane_names(registry_path: Path) -> set[str]:
     names: set[str] = set()
+    # Prefer bootstrap's module-independent reader: add_lane's duplicate guard
+    # must never silently collapse to "no lanes" when loop_state_parsing is
+    # absent (partial install) -- a POST for an existing lane would then
+    # OVERWRITE its registry row (thread_id -> UNVERIFIED) instead of being
+    # refused. The rebuild below already reads via bootstrap, so the guard must
+    # see the registry through the same eyes.
+    if BOOTSTRAP_AVAILABLE and bootstrap_agent_loop is not None:
+        for lane in bootstrap_agent_loop.existing_rows(registry_path):
+            lane = (lane or "").strip()
+            if lane:
+                names.add(lane.lower())
+        return names
     for row in _parse_md_table(registry_path):
         lane = (row.get("lane", "") or "").strip()
         if lane:
@@ -1724,11 +1778,33 @@ def _existing_lane_names(registry_path: Path) -> set[str]:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write ``content`` to ``path`` atomically (temp file then os.replace)."""
+    """Write ``content`` to ``path`` atomically (unique temp file + fsync).
+
+    Delegates to the shared ``_loop_lock.atomic_replace`` when available so the
+    temp file is unique per write (``tempfile.mkstemp``) -- a fixed ``.tmp-<pid>``
+    name collides across this server's request threads, letting one thread's
+    ``os.replace`` hit ``FileNotFoundError``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp-{0}".format(os.getpid()))
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    if LOOP_LOCK_AVAILABLE and _lock_atomic_replace is not None:
+        _lock_atomic_replace(path, content)
+        return
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, str(path))
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
@@ -1760,6 +1836,17 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
         }
     if lane.lower() in RESERVED_LANE_NAMES:
         return {"ok": False, "error": "lane name {0!r} is reserved".format(lane)}
+
+    if role and _ROLE_BAD_CHARS_RE.search(role):
+        return {
+            "ok": False,
+            "error": "role must not contain line breaks, control characters, or '|'",
+        }
+    if len(role) > ROLE_MAX_CHARS:
+        return {
+            "ok": False,
+            "error": "role must be at most {0} characters".format(ROLE_MAX_CHARS),
+        }
 
     registry_path = loop_dir / "agent-lanes.md"
     if not registry_path.exists():
@@ -2149,25 +2236,84 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Unknown GET path.
         self._send_json(404, {"error": "not found", "path": route})
 
-    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-        """Read and JSON-parse the request body. Returns (payload, error).
+    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Read and JSON-parse the request body. Returns (payload, error, status).
 
-        On success ``payload`` is a dict and ``error`` is None. On failure
-        ``payload`` is None and ``error`` is a human-readable reason.
+        On success ``payload`` is a dict, ``error`` is None, ``status`` is 200.
+        On failure ``payload`` is None, ``error`` is a reason, and ``status`` is
+        the HTTP status to return (400 bad body, 408 timeout, 413 too large).
         """
+        if self.headers.get("Transfer-Encoding"):
+            return None, "chunked Transfer-Encoding is not supported", 400
         length = self.headers.get("Content-Length")
-        try:
-            n = int(length) if length is not None else 0
-        except ValueError:
+        if length is None:
             n = 0
-        raw = self.rfile.read(n) if n > 0 else b""
+        else:
+            try:
+                n = int(length)
+            except ValueError:
+                return None, "invalid Content-Length", 400
+            if n < 0:
+                return None, "invalid Content-Length", 400
+        if n > MAX_REQUEST_BODY_BYTES:
+            return (
+                None,
+                "request body too large (max {0} bytes)".format(MAX_REQUEST_BODY_BYTES),
+                413,
+            )
+        raw = b""
+        if n > 0:
+            self.connection.settimeout(BODY_READ_TIMEOUT_SECONDS)
+            try:
+                raw = self.rfile.read(n)
+            except (TimeoutError, OSError):
+                return None, "timed out reading request body", 408
+            finally:
+                self.connection.settimeout(None)
+            if len(raw) != n:
+                return None, "incomplete request body", 400
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeDecodeError):
-            return None, "body must be valid JSON"
+            return None, "body must be valid JSON", 400
         if not isinstance(payload, dict):
-            return None, "body must be a JSON object"
-        return payload, None
+            return None, "body must be a JSON object", 400
+        return payload, None, 200
+
+    def _csrf_check(self) -> bool:
+        """Reject cross-site / non-JSON writes. Returns True to proceed.
+
+        The three write endpoints are same-origin JSON calls from the served
+        page. Requiring ``application/json`` forces a CORS preflight on any
+        cross-origin attempt (which this loopback server never answers, so the
+        POST is never delivered), and the Host allow-list defeats DNS-rebinding.
+        Emits the rejection itself and returns False when the request is refused.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._send_json(415, {"ok": False, "error": "Content-Type must be application/json"})
+            return False
+        port = self.server.server_address[1]
+        host = (self.headers.get("Host") or "").strip().lower()
+        allowed_hosts = {
+            "127.0.0.1:{0}".format(port),
+            "localhost:{0}".format(port),
+            "127.0.0.1",
+            "localhost",
+        }
+        if host not in allowed_hosts:
+            self._send_json(403, {"ok": False, "error": "invalid Host header"})
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            allowed_origins = {
+                "http://127.0.0.1:{0}".format(port),
+                "http://localhost:{0}".format(port),
+            }
+            if origin.strip().lower() not in allowed_origins:
+                self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+                return False
+        return True
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
         route = self._path_only()
@@ -2179,9 +2325,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found", "path": route})
             return
 
-        payload, error = self._read_json_body()
+        if not self._csrf_check():
+            return
+
+        payload, error, status = self._read_json_body()
         if error is not None:
-            self._send_json(400, {"ok": False, "error": error})
+            self._send_json(status, {"ok": False, "error": error})
             return
 
         if route == "/api/lanes":

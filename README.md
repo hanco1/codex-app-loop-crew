@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you the one moment a human is needed.<br>
+  <strong>Loop Crew</strong> — a small crew of Codex agents with a built-in review loop, run entirely inside the Codex app (no CLI). It tells you whenever your input is needed.<br>
   <sub>package: <code>codex-agent-loop-orchestrator</code> · <a href="#more">why three names?</a></sub>
 </p>
 
@@ -36,26 +36,26 @@
 
 You describe a goal. The skill splits the work across a few specialized Codex agents ("lanes"), keeps all the
 project state in files instead of disposable chat history, makes each agent **prove** its work passed before it
-counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner the one
-time a human is needed.
+counts, and has a separate agent review it. A local dashboard watches all of it and raises a banner whenever a
+human is needed.
 
 **Built for the Codex app, not the CLI.** The terminal can already spawn agents; the hard part was doing it
 *inside the app*. Under the hood the skill calls the Codex app's own `create_thread` tool to open each agent as
 a real conversation and auto-seed it with its role, write scope, and — by default — the **highest model tier
-your host offers, at `xhigh` reasoning** (quality-first; you can dial any single lane down by hand). The whole
+your host offers**, at `xhigh` reasoning when the model supports it, else its highest supported effort
+(quality-first; you can dial any single lane down by hand). The whole
 team assembles itself inside the app. You never leave it: no terminal, no logs to read, no commands to memorize.
 
 <p align="center">
   <img src="assets/codex-app-session.png" width="820" alt="A Codex-app conversation with product, data-eng, frontend, and review lanes, and a local dashboard link">
 </p>
 
-> The image above is a mock of a generic Codex-style desktop host (no OpenAI/ChatGPT branding, account
-> identity, or real data); the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
+> The image above is a mock of a Codex-style desktop host; the HTML source is [`assets/codex-app-session.html`](assets/codex-app-session.html).
 
 ## Install (2 minutes)
 
-> Needs: the Codex app (with skills enabled), `git`, and Python 3 on `PATH` — the dashboard and the
-> verification gates are small local Python scripts.
+> Needs: the Codex app (with skills enabled), `git`, and Python 3.9+ on `PATH` (any of `python3` /
+> `python` / `py -3`) — the dashboard and the verification gates are small local Python scripts.
 
 Open a fresh folder, start one Codex conversation in it, and paste this:
 
@@ -90,7 +90,9 @@ chmod +x install.sh
 ```
 
 Default install path: `%USERPROFILE%\.codex\skills\...` (Windows) or `~/.codex/skills/...` (macOS/Linux).
-Override with `-SkillsDir <path>` (PowerShell) or `CODEX_SKILLS_DIR=<path>` (bash). Open a new Codex session afterward.
+Override with `-SkillsDir <path>` (PowerShell) or `CODEX_SKILLS_DIR=<path>` (bash). Precedence: an explicit
+`-SkillsDir` / `CODEX_SKILLS_DIR` wins, then `$CODEX_HOME/skills` when `CODEX_HOME` is set, then
+`~/.codex/skills` (`%USERPROFILE%\.codex\skills` on Windows). Open a new Codex session afterward.
 
 Plugin marketplace:
 
@@ -127,7 +129,7 @@ Codex session instead of a loop** — this machinery is overkill for small work 
 
 ## What a run looks like
 
-You state a goal once; the agents work; the dashboard tells you the single moment you're needed.
+You state a goal once; the agents work; the dashboard tells you whenever you're needed.
 
 <details>
 <summary><strong>▸ Show the flow</strong></summary>
@@ -160,7 +162,7 @@ model tier.
 
 ![Dashboard close-up of the data-eng lane card](assets/dashboard-lane-card.png)
 
-**"Ready for you" — the one moment you're needed.** The banner names the exact conversation to open. Until you
+**"Ready for you" — when it's your turn.** The banner names the exact conversation to open. Until you
 see it, you can leave the agents alone.
 
 ![Dashboard banner telling the human that data-eng is ready for confirmation](assets/dashboard-your-turn.png)
@@ -177,7 +179,10 @@ see it, you can leave the agents alone.
 Six ideas do all the work.
 
 1. **A "lane" is one agent's standing job.** Instead of one AI doing everything, each *kind* of work gets its
-   own worker (backend, frontend, reviewer), and each owns its files so they don't overwrite each other.
+   own worker (backend, frontend, reviewer), and each owns its files so they don't overwrite each other. And
+   this isn't the honor system — a Git pre-commit hook rejects any commit that reaches outside a lane's files,
+   so two agents can't quietly clobber each other's work; when two lanes need the same file for a handoff, one
+   takes a short-lived **lease** on it and the other waits.
 2. **Work has a status you can always read.** Every task moves through fixed stages recorded in files, so if a
    chat is lost the next session resumes exactly where it was.
 3. **"Done" has to be proven, not claimed.** An agent must run the tests and leave the results as a file. No
@@ -207,8 +212,9 @@ codebases were scored by the same rubric with every serious finding independentl
 | Maintainability | 8 | 8 |
 | **Average** | **6.8** | **7.8** |
 
-The loop's margin is in **security and defense-in-depth**, at roughly 8.5× the code and one-to-two orders of
-magnitude more time and tokens. Honestly, **it is not magic** — the same review found real bugs in the loop's
+The loop's margin is in **security and defense-in-depth**, at roughly 8.5× the code, roughly two-to-three
+orders of magnitude more wall-clock time, and one-to-two orders of magnitude more tokens. Honestly, **it is
+not magic** — the same review found real bugs in the loop's
 own output too. The takeaway isn't "always use the loop," it's **match the machinery to the stakes**.
 
 - **Full comparison:** [COMPARISON.md](COMPARISON.md)
@@ -219,10 +225,11 @@ own output too. The takeaway isn't "always use the loop," it's **match the machi
 
 Use a plain Codex session for a small, low-risk task one agent can finish in one sitting — roughly under two
 hours — when auditability, handoff recovery, sensitive-data gates, and real parallel lanes don't matter. The
-cost is real. In an earlier, smaller `n=1` dogfood run (a one-day MVP — a separate, earlier measurement from
-the expense-app comparison above) the loop took **7.2× the active wall time** and **36× the total tokens** of
-the direct session; in the larger expense-app comparison it was **~10 minutes vs multiple days** and one-to-two
-orders of magnitude more tokens. And by default every lane runs on the top model at `xhigh`, so a team is
+cost is real. In an earlier, smaller `n=1` dogfood run (a single early trial: a one-day MVP, measured
+separately from the expense-app comparison above) the loop took **7.2× the active wall time** and **36× the
+total tokens** of the direct session; in the larger expense-app comparison the gap was **~10 minutes vs
+multiple days** — roughly two-to-three orders of magnitude of wall-clock — and one-to-two orders of magnitude
+more tokens. And by default every lane runs on the top model at `xhigh` (or its highest supported effort), so a team is
 several premium sessions at once. This protocol buys traceability and independent verification; it does not
 make multi-agent work free. It is also a poor fit when there's nothing meaningful to machine-check.
 

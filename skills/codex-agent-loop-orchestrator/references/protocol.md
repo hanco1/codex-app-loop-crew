@@ -429,7 +429,10 @@ docs/loop/messages/<request_id>/<message_type>-iter-<n>.md
 Also append a one-line summary to:
 
 - sender `lanes/<lane>/outbox.md`
-- target `lanes/<lane>/inbox.md` when delivery is pending or tool delivery is unavailable
+- when tool delivery is pending or unavailable, deliver the durable copy with
+  `deliver_message.py` into the target's `inbox/new/` (see "Atomic Message
+  Delivery" below); append to the flat target `lanes/<lane>/inbox.md` only when
+  Python itself cannot run
 - sender `lanes/<lane>/worklog.md`
 
 ## Atomic Message Delivery
@@ -617,7 +620,8 @@ and a human has to hand-carry the baton.
 4. **Refresh your heartbeat** - the `heartbeat` column in `agent-lanes.md` and
    the `last_updated`/`heartbeat` mirror in lane `current.md`.
    (`deliver_message.py --from-lane <you>` does this for you.)
-5. **Commit your slice as your lane** - `CODEX_LANE=<lane> git commit -m "..."`.
+5. **Commit your slice as your lane** - POSIX `CODEX_LANE=<lane> git commit -m "..."`;
+   PowerShell `$env:CODEX_LANE = '<lane>'; git commit -m "..."`.
    A closed slice that is not committed leaves the scope guard inert (it only
    runs at commit time) and the next lane builds on uncommitted state.
 
@@ -630,7 +634,8 @@ the lane to nudge.
 **Product's accept/pause path: a paused loop is a fully committed loop.** Before
 product accepts a slice or pauses the loop, run `git status --porcelain` and
 commit every non-exempt dirty or untracked file as its owning lane
-(`CODEX_LANE=<lane> git commit ...`) so the tree is clean at the pause. Data and
+(POSIX `CODEX_LANE=<lane> git commit ...`; PowerShell
+`$env:CODEX_LANE = '<lane>'; git commit ...`) so the tree is clean at the pause. Data and
 DB artifacts stay exempt per `constraints.md` (for example `data/`, `uploads/`,
 `private_samples/`, `*.sqlite`/`*.sqlite3`/`*.db`); everything else must be
 committed. A pause with an in-scope dirty file is not a paused loop - it is an
@@ -706,7 +711,12 @@ request. The DEFAULT for UI work is both skills with a division of labor:
 color, layout mood), and `ui-ux-pro-max` owns the UX MECHANICS (interaction,
 accessibility, responsive behavior, component/chart/table usability). On a
 conflict, a visual call goes to `han-design-skill-v1` and a usability/
-accessibility call goes to `ui-ux-pro-max`. The human's explicit choice ALWAYS
+accessibility call goes to `ui-ux-pro-max`. The Han default is DISCLOSED, never
+silent: when UI work first enters the loop the human is told it is the default
+and offered a different direction (settled in the product conversation or via a
+dedicated design lane - see `SKILL.md` "Design Skills For UI Work",
+"Default-style disclosure"), and the default applies only when they do not
+object. The human's explicit choice ALWAYS
 overrides this default and is recorded here, on the request the UI lane reads
 (this per-request envelope line is the chosen record over a separate decision
 entry). Skills are looked up by NAME in the host's standard skills locations

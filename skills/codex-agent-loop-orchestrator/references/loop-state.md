@@ -127,7 +127,7 @@ Common lane presets:
 | visual | Review UI/visual output and prepare visual asset requests. | `docs/design/**; docs/loop/lanes/visual/**` |
 | security | Review security risks, threat models, and sensitive changes. | `docs/security/**; docs/loop/lanes/security/**` |
 | data | Analyze metrics, datasets, experiments, and validation evidence. | `docs/data/**; docs/loop/lanes/data/**` |
-| docs | Maintain docs, changelogs, release notes, and user-facing copy. | `docs/**; docs/loop/lanes/docs/**` |
+| docs | Maintain docs, changelogs, release notes, and user-facing copy. | `docs/user/**; CHANGELOG.md; docs/loop/lanes/docs/**` |
 | release | Coordinate release readiness, QA checklist, packaging, and blockers. | `docs/release/**; docs/loop/lanes/release/**` |
 | media | Coordinate scripts, covers, videos, and social-content assets. | `docs/media/**; docs/loop/lanes/media/**` |
 
@@ -182,11 +182,18 @@ staged file is either:
 - outside the committing lane's `write_scope` globs in `agent-lanes.md`, or
 - covered by an **active lease held by a different lane** in `leases.md`.
 
-Commit with the lane set, e.g. `CODEX_LANE=implementation git commit -m "..."`.
+Commit with the lane set - POSIX `CODEX_LANE=implementation git commit -m "..."`;
+PowerShell `$env:CODEX_LANE = 'implementation'; git commit -m "..."`.
 With no lane set the guard fails closed (the commit is blocked) unless
-`CODEX_PRECOMMIT_SKIP=1` is exported, or `precommit_scope_guard.py` is invoked
-directly with `--allow-unscoped` (`install_precommit.py` itself does not accept
-that flag). Free-text notes in a `write_scope` cell (for example
+`CODEX_PRECOMMIT_SKIP=1` is exported (POSIX `CODEX_PRECOMMIT_SKIP=1 git commit ...`,
+an inline one-shot; PowerShell `$env:CODEX_PRECOMMIT_SKIP = 1; git commit ...;
+Remove-Item Env:CODEX_PRECOMMIT_SKIP` - remove it afterwards, or every later
+commit in the session keeps bypassing the guard) - the one skip
+mechanism the installed hook honors. (`precommit_scope_guard.py` also accepts
+`--allow-unscoped`, but only for direct manual invocations of the guard script:
+the installed hook never passes that flag, and `install_precommit.py` does not
+accept it, so it cannot unblock a real commit.) Free-text notes in a
+`write_scope` cell (for example
 `implementation notes named by request`) are ignored for matching; only
 path/glob tokens constrain the commit.
 
@@ -528,7 +535,7 @@ On resume, do not start by inventing a new plan. First read:
 5. `handoff.md`
 6. `agent-lanes.md`
 7. `requests.md`
-8. this lane's `current.md` and `inbox.md`
+8. this lane's `current.md` and its `inbox/new/` (read sorted by filename) - the presence of a file in `inbox/new` is the source of truth for pending work (`references/protocol.md`, "Atomic Message Delivery"); consult the flat `inbox.md` only if Python was unavailable when a message was delivered
 
 Continue the oldest non-terminal request owned by this lane. If ownership is unclear, ask product or mark `BLOCKED`.
 

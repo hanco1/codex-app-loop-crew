@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""In-process smoke test for the read-only loop dashboard.
+"""Smoke test for the read-only loop dashboard.
 
-Exercises ``loop_dashboard`` end to end WITHOUT spawning any subprocess (this
-box's sandbox cannot shell out): everything is a direct module-level import of
-``bootstrap_agent_loop`` and ``loop_dashboard``, and the server runs in a
-background thread bound to 127.0.0.1 on an ephemeral port (0).
+Exercises ``loop_dashboard`` end to end, mostly in-process: nearly every check
+is a direct module-level import of ``bootstrap_agent_loop`` and
+``loop_dashboard``, and the server runs in a background thread bound to
+127.0.0.1 on an ephemeral port (0). ONE check does spawn a subprocess: the
+probe-standalone check runs ``codex_host_probe.py`` under ``sys.executable``
+to verify its CLI JSON contract, so the current interpreter must be launchable
+as a child process.
 
 Asserts, in one temp loop:
 
@@ -91,6 +94,7 @@ import threading
 import time
 import tokenize
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -2760,11 +2764,25 @@ def main() -> int:
             text = body.decode("utf-8", errors="replace").lower()
             if "<html" not in text:
                 _fail("GET / body does not contain '<html'")
-            # Sanity: the page must be self-contained (no external script/link/font).
-            for needle in ("http://", "https://", "//fonts", "cdn"):
-                # Allow the word inside comments only if it's not a real URL.
-                # A strict check: no 'src=\"http' and no 'href=\"http'.
-                pass
+            # Sanity: the page must be self-contained (no external script/link/
+            # font). Harvest every http(s):// URL token in the served body and
+            # assert its host is local -- ANY other network origin fails, even
+            # inside CSS or comments. Non-network schemes (data:, blob:) never
+            # match the harvest regex and stay allowed.
+            # Parse the host with urlsplit so bracketed IPv6 origins
+            # (https://[2001:db8::1]/x) cannot slip past a hostname character
+            # class that only knows letters/digits/dots.
+            for url_match in re.finditer(r"https?://[^\s\"'<>()]+", text):
+                url_host = urllib.parse.urlsplit(url_match.group(0)).hostname or ""
+                if url_host not in ("127.0.0.1", "localhost", "::1"):
+                    _fail("GET / page references an external origin: {0!r}".format(
+                        url_match.group(0)))
+            # Protocol-relative references (``//host/...``) dodge the scheme
+            # harvest above but are still network fetches; reject them too.
+            for rel_prefix in ('src="//', "src='//", 'href="//', "href='//"):
+                if rel_prefix in text:
+                    _fail("GET / page uses a protocol-relative external reference ({0}...)".format(
+                        rel_prefix))
             if 'src="http' in text or "src='http" in text:
                 _fail("GET / page references an external script (src=http...)")
             if 'href="http' in text or "href='http" in text:
@@ -3415,12 +3433,16 @@ def main() -> int:
                     _diff_keys(snap_before_bad_policy, snap_after_bad_policy)))
 
             # (9) URL LINE + fallback: bind helper reports the actual port.
+            # (The DASHBOARD_URL line itself is asserted against a hand-built
+            # expected string in _assert_main_prints_url below.)
             free_srv, fell = loop_dashboard.make_server_with_fallback(loop_dir, 0)
             try:
+                bound_host = free_srv.server_address[0]
                 bound_port = free_srv.server_address[1]
-                url_line = "DASHBOARD_URL=http://127.0.0.1:{0}/".format(bound_port)
-                if "DASHBOARD_URL=http://127.0.0.1:{0}/".format(bound_port) != url_line:
-                    _fail("URL line does not match bound port")
+                if bound_host != "127.0.0.1":
+                    _fail("make_server_with_fallback bound {0}, expected loopback".format(bound_host))
+                if not (1 <= bound_port <= 65535):
+                    _fail("make_server_with_fallback reported an invalid port: {0!r}".format(bound_port))
                 if fell is not False:
                     _fail("binding port 0 should not count as a fallback")
             finally:
@@ -3482,12 +3504,15 @@ def _assert_main_prints_url(tmp: Path) -> None:
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
-    # Wait for the URL line to appear in the captured stdout.
+    # Wait for the URL line to appear in the captured stdout. Keep the RAW
+    # line (unstripped) so the exact emitted format can be asserted below.
     url = None
+    raw_line = None
     for _ in range(100):  # up to ~5s
         text = buf.getvalue()
         for line in text.splitlines():
             if line.startswith("DASHBOARD_URL="):
+                raw_line = line
                 url = line[len("DASHBOARD_URL="):].strip()
                 break
         if url is not None:
@@ -3513,6 +3538,18 @@ def _assert_main_prints_url(tmp: Path) -> None:
     status, _ = _http_get("http://127.0.0.1:{0}/api/state".format(port))
     if status != 200:
         _fail("DASHBOARD_URL port {0} did not serve /api/state (got {1})".format(port, status))
+
+    # The exact emitted format is the contract an orchestrator greps for.
+    # Hand-build the expected string from the INDEPENDENTLY observed bound
+    # port (the server object main() stashed on the module), so a format
+    # regression in main()'s print cannot self-verify.
+    hook_srv = getattr(loop_dashboard, "_LAST_SERVER_FOR_TEST", None)
+    if hook_srv is None:
+        _fail("main() did not stash its server on _LAST_SERVER_FOR_TEST")
+    expected_line = "DASHBOARD_URL=http://127.0.0.1:{0}/".format(hook_srv.server_address[1])
+    if raw_line != expected_line:
+        _fail("main() URL line {0!r} != expected {1!r} (format drift)".format(
+            raw_line, expected_line))
 
     # Shut the server down through the test hook main() left on the module.
     srv = getattr(loop_dashboard, "_LAST_SERVER_FOR_TEST", None)

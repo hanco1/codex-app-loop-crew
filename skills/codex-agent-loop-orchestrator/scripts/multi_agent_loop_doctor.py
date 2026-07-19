@@ -130,6 +130,91 @@ except ImportError:
     normalize_then_hash = None  # type: ignore
     DECISIONS_HELPER_AVAILABLE = False
 
+# Import THE single canonical state-grammar parser shared with the dashboard
+# (``loop_state_parsing``: pure text -> value, no filesystem I/O). The two
+# programs used to carry private copies of these functions and the copies
+# drifted; the shared module is the fix, contract-tested by
+# ``test_loop_state_parsing.py``. Guard the import like the sibling imports
+# above so a partial install never crashes the read-only doctor: on
+# ImportError the trivial primitives fall back to faithful local copies,
+# policy diagnostics degrade to silence (WARNING-only surface, like the absent
+# record_decision drift check), and control-table parsing fails CLOSED via the
+# ``parse_table`` wrapper below (a structured error, never silently-empty
+# rows).
+try:
+    from loop_state_parsing import (  # type: ignore
+        DEFAULT_MAX_FIX_CYCLES,
+        EMPTY_CELL_VALUES,
+        MAX_FIX_CYCLES_RE,
+        PAUSED_REQUEST_STATUSES,
+        TERMINAL_REQUEST_STATUSES,
+        diagnose_policy,
+        doctor_table_error,
+        parse_md_table,
+        parse_timestamp,
+        read_max_fix_cycles,
+        split_md_row,
+        status_key,
+    )
+
+    PARSING_AVAILABLE = True
+except ImportError:
+    PARSING_AVAILABLE = False
+    parse_md_table = None  # type: ignore
+    doctor_table_error = None  # type: ignore
+    TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "ABANDONED"}
+    PAUSED_REQUEST_STATUSES = {"BLOCKED"}
+    EMPTY_CELL_VALUES = {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}
+    DEFAULT_MAX_FIX_CYCLES = 3
+    MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*(?:[-*]\s*)?max_fix_cycles\s*:\s*(\d+)\b")
+
+    def split_md_row(line: str) -> list[str]:
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    def status_key(value: str) -> str:
+        return value.strip().upper().replace(" ", "_").replace("-", "_")
+
+    def parse_timestamp(value: str) -> Optional[datetime]:
+        """Faithful fallback copy: stale-heartbeat detection, run-log ordering,
+        and authorization trust must not silently fail OPEN on a partial
+        install."""
+        text = (value or "").strip()
+        if not text or text.upper() in EMPTY_CELL_VALUES:
+            return None
+        candidate = text
+        if candidate.endswith(("Z", "z")):
+            candidate = candidate[:-1] + "+00:00"
+        if " " in candidate and "T" not in candidate:
+            candidate = candidate.replace(" ", "T", 1)
+        parsed: Optional[datetime] = None
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(candidate, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def read_max_fix_cycles(policy_text: str) -> int:
+        match = MAX_FIX_CYCLES_RE.search(policy_text)
+        if not match:
+            return DEFAULT_MAX_FIX_CYCLES
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return DEFAULT_MAX_FIX_CYCLES
+
+    def diagnose_policy(policy_text: str, source_present: bool) -> list[dict[str, str]]:
+        """WARNING-only diagnostics degrade to silence when the module is absent."""
+        return []
+
 
 REQUIRED_FILES = [
     "goal.md",
@@ -141,8 +226,9 @@ REQUIRED_FILES = [
     "loop-policy.md",
 ]
 LANE_FILES = ["inbox.md", "outbox.md", "current.md", "worklog.md"]
-TERMINAL_REQUEST_STATUSES = {"ACCEPTED", "ABANDONED"}
-PAUSED_REQUEST_STATUSES = {"BLOCKED"}
+# TERMINAL_REQUEST_STATUSES / PAUSED_REQUEST_STATUSES come from
+# loop_state_parsing (guarded import above): the ONE protocol vocabulary shared
+# with the dashboard's display predicates.
 SETTLED_REQUEST_STATUSES = TERMINAL_REQUEST_STATUSES | PAUSED_REQUEST_STATUSES
 COMPLETION_GATE_REQUIRED_STATUSES = {
     "IMPLEMENTATION_DONE",
@@ -162,17 +248,17 @@ EVIDENCE_MANIFEST_REQUIRED_STATUSES = {
     "ABANDONED",
 }
 UNVERIFIED_THREAD_VALUES = {"", "UNVERIFIED", "TBD", "NONE", "NULL", "-"}
-EMPTY_CELL_VALUES = {"", "-", "TBD", "NONE", "NULL", "N/A", "NA"}
+# EMPTY_CELL_VALUES and DEFAULT_MAX_FIX_CYCLES come from loop_state_parsing
+# (guarded import above).
 # Statuses involved in the FIX_REQUESTED<->IMPLEMENTING thrash cycle.
 THRASH_STATUSES = {"FIX_REQUESTED", "IMPLEMENTING"}
-DEFAULT_MAX_FIX_CYCLES = 3
 DEFAULT_STALE_HEARTBEAT_MINS = 30
 
 CHECKBOX_RE = re.compile(r"^\s*-\s+\[(?P<status>[ xX~!])\]\s+(?P<text>.+?)\s*$")
 THREAD_ID_RE = re.compile(r"\b(?:codex:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 AUTO_CHAIN_RE = re.compile(r"(?i)\bauto_chain_next_session\s*:\s*true\b")
 STALE_RE = re.compile(r"(?i)\b(stale|pending re-creation|unreadable|unopenable|not visible|not found)\b")
-MAX_FIX_CYCLES_RE = re.compile(r"(?im)^\s*max_fix_cycles\s*:\s*(\d+)\b")
+# MAX_FIX_CYCLES_RE comes from loop_state_parsing (guarded import above).
 BUDGET_EXHAUSTED_RE = re.compile(r"(?im)^\s*budget_exhausted\s*:\s*true\b")
 VERIFY_COMMAND_RE = re.compile(r"(?i)\bVERIFY\s+`(?P<command>[^`\r\n]+)`")
 DEFECT_CLASS_LINE_RE = re.compile(r"(?im)^\s*defect_class\s*:")
@@ -265,31 +351,38 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def split_md_row(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+def parse_table(
+    path: Path, required_headers: tuple[str, ...] = ()
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Parse the control table in ``path``, anchored on ``required_headers``.
 
-
-def parse_table(path: Path) -> list[dict[str, str]]:
+    Thin file-reading wrapper over the canonical
+    ``loop_state_parsing.parse_md_table`` -- the doctor and the dashboard share
+    that ONE body, so their table grammars can never drift again. A candidate
+    header row is accepted only when its cell set contains every required
+    header, so a preface/explanatory table earlier in the file can never
+    shadow the real control table (whose rows would then be coerced into the
+    wrong columns and silently dropped). Returns ``(rows, errors)``: each
+    error is a structured ``{severity, code, message}`` entry the caller routes
+    into ``issues`` so a torn, headerless, or shadow-only file blocks
+    readiness instead of reading as an empty-but-healthy queue. A missing file
+    stays ``([], [])``: absence is already covered by REQUIRED_FILES.
+    """
     if not path.exists():
-        return []
-
-    headers: Optional[list[str]] = None
-    rows: list[dict[str, str]] = []
-    for line in read_text(path).splitlines():
-        if not line.lstrip().startswith("|"):
-            continue
-        cells = split_md_row(line)
-        if not cells:
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        if headers is None:
-            headers = [cell.strip() for cell in cells]
-            continue
-        if len(cells) < len(headers):
-            cells += [""] * (len(headers) - len(cells))
-        rows.append(dict(zip(headers, cells[: len(headers)])))
-    return rows
+        return [], []
+    if not PARSING_AVAILABLE or parse_md_table is None:
+        # Fail CLOSED on a partial install: an unreadable grammar must block
+        # readiness, never read as an empty-but-healthy queue.
+        return [], [
+            {
+                "severity": "error",
+                "code": "malformed_table",
+                "message": "{0}: loop_state_parsing module is missing (partial "
+                "install); control-table rows cannot be read".format(path.name),
+            }
+        ]
+    rows, errors = parse_md_table(read_text(path), path.name, required_headers)
+    return rows, [doctor_table_error(error) for error in errors]
 
 
 def observed_tier_tag(current_text: str) -> str:
@@ -408,47 +501,13 @@ def find_checkboxes(text: str) -> list[dict[str, str]]:
     return items
 
 
-def status_key(value: str) -> str:
-    return value.strip().upper().replace(" ", "_").replace("-", "_")
+# ``status_key`` and ``parse_timestamp`` come from loop_state_parsing (guarded
+# import above): one canonical status token and timestamp grammar shared with
+# the dashboard.
 
 
 def is_empty_cell(value: str) -> bool:
     return value.strip().upper() in EMPTY_CELL_VALUES or value.strip() == ""
-
-
-def parse_timestamp(value: str) -> Optional[datetime]:
-    """Parse an ISO-8601-ish timestamp into an aware UTC datetime.
-
-    Handles a trailing ``Z`` (which ``datetime.fromisoformat`` rejects on
-    Python 3.8-3.10) and naive timestamps (assumed UTC). Returns ``None`` for
-    blank or unparseable values.
-    """
-    text = value.strip()
-    if not text or text.upper() in EMPTY_CELL_VALUES:
-        return None
-
-    candidate = text
-    if candidate.endswith(("Z", "z")):
-        candidate = candidate[:-1] + "+00:00"
-    # Normalize a space separator between date and time to 'T'.
-    if " " in candidate and "T" not in candidate:
-        candidate = candidate.replace(" ", "T", 1)
-
-    parsed: Optional[datetime] = None
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(candidate, fmt)
-                break
-            except ValueError:
-                continue
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def lane_status(row: dict[str, str]) -> str:
@@ -473,14 +532,9 @@ def lane_heartbeat_age_mins(row: dict[str, str], now: datetime) -> Optional[floa
     return delta.total_seconds() / 60.0
 
 
-def read_max_fix_cycles(policy_text: str) -> int:
-    match = MAX_FIX_CYCLES_RE.search(policy_text)
-    if not match:
-        return DEFAULT_MAX_FIX_CYCLES
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return DEFAULT_MAX_FIX_CYCLES
+# ``read_max_fix_cycles`` comes from loop_state_parsing (guarded import
+# above): the tolerant list-marker-aware reader is shared with the dashboard
+# so the two programs can never read a different cap from the same policy.
 
 
 def has_active_max_fix_override(policy_text: str, value: int) -> bool:
@@ -628,48 +682,9 @@ def diagnose_run_log(loop_dir: Path) -> list[dict[str, str]]:
     return load_run_log_snapshot(loop_dir)["warnings"]
 
 
-_POLICY_KEY_RE = re.compile(r"^\s*(?:[-*]\s*)?max_fix_cycles\s*:", re.IGNORECASE)
-_POLICY_STRICT_RE = re.compile(
-    r"^\s*max_fix_cycles\s*:\s*(\d+)\s*$", re.IGNORECASE
-)
-
-
-def diagnose_policy(policy_text: str, source_present: bool) -> list[dict[str, str]]:
-    """Warn on malformed max_fix_cycles while preserving the existing reader."""
-    if not source_present:
-        return []
-    for lineno, line in enumerate(policy_text.splitlines(), start=1):
-        if not _POLICY_KEY_RE.match(line):
-            continue
-        match = _POLICY_STRICT_RE.match(line)
-        if match is None:
-            return [
-                {
-                    "severity": "warning",
-                    "code": "malformed_policy",
-                    "message": "loop-policy.md line {0}: max_fix_cycles is not an integer; "
-                    "using the existing fallback {1}".format(lineno, DEFAULT_MAX_FIX_CYCLES),
-                }
-            ]
-        value = int(match.group(1))
-        if value < 1 or value > 10:
-            return [
-                {
-                    "severity": "warning",
-                    "code": "malformed_policy",
-                    "message": "loop-policy.md line {0}: max_fix_cycles {1} is outside 1..10; "
-                    "reader behavior is unchanged".format(lineno, value),
-                }
-            ]
-        return []
-    return [
-        {
-            "severity": "warning",
-            "code": "malformed_policy",
-            "message": "loop-policy.md line 1: max_fix_cycles is missing; using the existing "
-            "fallback {0}".format(DEFAULT_MAX_FIX_CYCLES),
-        }
-    ]
+# ``diagnose_policy`` (and its strict POLICY_KEY_RE / POLICY_LINE_RE line
+# regexes) comes from loop_state_parsing (guarded import above); on a partial
+# install the WARNING-only diagnostics degrade to silence.
 
 
 def table_key_line_numbers(path: Path, key: str) -> dict[str, int]:
@@ -685,6 +700,8 @@ def table_key_line_numbers(path: Path, key: str) -> dict[str, int]:
         if not cells or all(set(cell) <= {"-", ":", " "} for cell in cells):
             continue
         if headers is None:
+            if key not in cells:
+                continue  # a preface table without the key column: keep looking
             headers = cells
             continue
         padded = cells + [""] * max(0, len(headers) - len(cells))
@@ -2230,7 +2247,12 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     blocked_exit_unauthorized = check_blocked_exit_authorization(run_log_rows)
     human_qa_message_missing = check_human_qa_messages(loop_dir, run_log_rows)
 
-    lanes = parse_table(loop_dir / "agent-lanes.md")
+    # C3: anchor on a minimal header set every legitimate producer satisfies
+    # (bootstrap REGISTRY_COLUMNS and all fixtures carry lane + write_scope) so
+    # a preface table can never shadow the registry.
+    lanes, lane_table_errors = parse_table(
+        loop_dir / "agent-lanes.md", required_headers=("lane", "write_scope")
+    )
     lane_names = [row.get("lane", "") for row in lanes if row.get("lane")]
     lane_file_missing: dict[str, list[str]] = {}
     lane_summaries: list[dict[str, Any]] = []
@@ -2310,7 +2332,13 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     )
     evidence_request_ids = set(records_by_request)
 
-    requests = parse_table(loop_dir / "requests.md")
+    # C3: minimal required set (every producer, including the smokes' smallest
+    # fixture, carries request_id + status + iteration).
+    requests, request_table_errors = parse_table(
+        loop_dir / "requests.md",
+        required_headers=("request_id", "status", "iteration"),
+    )
+    control_table_errors = lane_table_errors + request_table_errors
     request_line_numbers = table_key_line_numbers(loop_dir / "requests.md", "request_id")
     request_summaries: list[dict[str, Any]] = []
     owner_issues: list[str] = []
@@ -2412,6 +2440,14 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         request["status"] in SETTLED_REQUEST_STATUSES
         for request in request_summaries
     )
+    # C2/G31: a request paused at BLOCKED is a human gate; auto-chain must not
+    # relaunch past it. This is request-lifecycle BLOCKED, deliberately distinct
+    # from the tracker's `!` checkbox list in ``blocked`` above.
+    paused_requests = [
+        summary["request_id"]
+        for summary in request_summaries
+        if summary["status"] in PAUSED_REQUEST_STATUSES
+    ]
 
     stale_markers = [
         line.strip()
@@ -2547,6 +2583,15 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             for request in request_summaries
             if request["status"] in COMPLETION_GATE_REQUIRED_STATUSES
         }
+        # Scope each request's gate evaluation to its current iteration (from
+        # requests.md) so stale prior-iteration evidence is ignored, matching the
+        # standalone completion_gate CLI. An evidence-only id with no summary row
+        # has no known iteration -> newest-iteration-in-records fallback.
+        iteration_by_request = {
+            request["request_id"]: (request.get("iteration") or None)
+            for request in request_summaries
+            if request.get("request_id")
+        }
         evaluated_ids = sorted(evidence_request_ids | required_ids)
         for request_id in evaluated_ids:
             # Evaluate against the records only (pass no load_errors here): a
@@ -2555,7 +2600,11 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             # `not gate_load_errors` term below and the gate_malformed_evidence
             # issues, so they must not smear a failure across every request_id.
             gate_result = completion_gate.evaluate(
-                gate_records, [], request_id, records_by_request
+                gate_records,
+                [],
+                request_id,
+                current_iteration=iteration_by_request.get(request_id),
+                records_by_request=records_by_request,
             )
             if not gate_result["ok"]:
                 gate_failed_requests.append(request_id)
@@ -2720,6 +2769,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             }
         )
 
+    # C3: a control table that could not be anchored (headerless, torn, or
+    # shadowed by a preface table) is a structural ERROR: it blocks readiness
+    # instead of presenting an emptied queue/registry as healthy.
+    issues.extend(control_table_errors)
     for path in missing_files:
         issues.append({"severity": "error", "code": "missing_file", "message": path})
     for lane, missing in lane_file_missing.items():
@@ -3104,12 +3157,19 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     warnings.extend(drift["warnings"])
     decisions_summary = drift["decisions"]
 
-    handoff_ready = not missing_files and not lane_file_missing and not owner_issues
+    handoff_ready = (
+        not missing_files
+        and not lane_file_missing
+        and not owner_issues
+        and not control_table_errors
+    )
     auto_chain_ready = (
         handoff_ready
         and auto_chain_enabled
         and bool(unchecked)
         and not blocked
+        and not paused_requests
+        and (not request_summaries or run_log_present)
         and not stale_markers
         and not budget_exhausted
         and not thrash_requests
@@ -3125,10 +3185,19 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         readiness_reasons.append("lane files missing")
     if owner_issues:
         readiness_reasons.append("request owner is not registered")
+    if control_table_errors:
+        readiness_reasons.append("a control table is missing its header or malformed")
     if not unchecked:
         readiness_reasons.append("no unchecked tracker item")
     if blocked:
         readiness_reasons.append("tracker has blocked items")
+    if paused_requests:
+        readiness_reasons.append(
+            "a request is BLOCKED awaiting human input: "
+            + ", ".join(paused_requests)
+        )
+    if request_summaries and not run_log_present:
+        readiness_reasons.append("loop-run-log.md is missing")
     if stale_markers:
         readiness_reasons.append("stale thread markers present")
     if not auto_chain_enabled:
@@ -3172,6 +3241,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
             "owner_issues": owner_issues,
             "thrash": thrash_requests,
             "missing_evidence": missing_evidence_requests,
+            "paused": paused_requests,
         },
         # G13: request_id -> recommended_answer for BLOCKED requests.
         "recommended_answers": recommended_answers,

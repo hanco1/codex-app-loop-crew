@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +47,86 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REQUIRED_FIELDS = ("request_id", "checkpoint", "command", "exit_code", "ran_at")
 REQUIRED_STRING_FIELDS = ("request_id", "checkpoint", "command", "ran_at")
+
+# Keep these in sync with multi_agent_loop_doctor.py EVIDENCE_REQID_RE /
+# EVIDENCE_ITERATION_RE. Evidence files are named
+# ``REQ-YYYYMMDD-HHMMSS-<lane>-iter-<n>-<slug>.json``; the request_id is stable
+# across fix cycles while the iteration increments, so both must be read from
+# the filename to scope the gate to the request's CURRENT iteration.
+# Evidence files are named ``<request_id>-iter-<n>[-<slug>].json`` -- the command
+# slug is optional, so these must match both ``...-iter-1-npm-test.json`` and
+# ``...-iter-1.json``.
+EVIDENCE_REQID_RE = re.compile(
+    r"^(?P<request_id>REQ-\d{8}-\d{6}-[A-Za-z0-9][A-Za-z0-9-]*?)-iter-\d+"
+)
+EVIDENCE_ITERATION_RE = re.compile(r"(?i)-iter-(?P<iteration>\d+)")
+
+
+def _name_attribution(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Return (request_id, iteration) parsed from an evidence filename."""
+    name = path.name
+    match = EVIDENCE_REQID_RE.match(name)
+    name_req = match.group("request_id") if match else None
+    iter_match = EVIDENCE_ITERATION_RE.search(name)
+    name_iter = iter_match.group("iteration") if iter_match else None
+    return name_req, name_iter
+
+
+def _norm_iter(value: Any) -> Optional[str]:
+    """Normalize an iteration value so '01' and '1' compare equal."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return str(int(text)) if text.isdigit() else text
+
+
+def _iter_num(value: Any) -> Optional[int]:
+    text = _norm_iter(value)
+    if text is not None and text.isdigit():
+        return int(text)
+    return None
+
+
+def _split_row(line: str) -> List[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def read_current_iteration(loop_dir: Path, request_id: str) -> Optional[str]:
+    """Return the normalized ``iteration`` for ``request_id`` from requests.md.
+
+    Anchors on the first markdown table whose header carries both
+    ``request_id`` and ``iteration`` columns (so an explanatory preface table
+    cannot be mistaken for the request ledger). Returns None when requests.md is
+    missing/unreadable or the request row is absent.
+    """
+    requests_path = Path(loop_dir) / "requests.md"
+    try:
+        text = requests_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    headers: Optional[List[str]] = None
+    req_idx: Optional[int] = None
+    it_idx: Optional[int] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = _split_row(stripped)
+        if all(set(cell) <= set("-: ") for cell in cells if cell):
+            continue  # delimiter row
+        if headers is None:
+            if "request_id" in cells and "iteration" in cells:
+                headers = cells
+                req_idx = cells.index("request_id")
+                it_idx = cells.index("iteration")
+            continue
+        if req_idx is None or it_idx is None or len(cells) <= max(req_idx, it_idx):
+            continue
+        if cells[req_idx] == request_id:
+            return _norm_iter(cells[it_idx])
+    return None
 
 
 def posix_path(path: Path) -> str:
@@ -102,24 +183,32 @@ def load_evidence(evidence_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
 
     for path in sorted(evidence_dir.glob("*.json")):
         source = posix_path(path)
+        name_req, name_iter = _name_attribution(path)
+
+        def err(reason: str) -> Dict[str, Any]:
+            return {
+                "source": source,
+                "reason": reason,
+                "request_id": name_req,
+                "iteration": name_iter,
+            }
+
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            load_errors.append({"source": source, "reason": "unreadable: {0}".format(exc)})
+        except (OSError, UnicodeDecodeError) as exc:
+            load_errors.append(err("unreadable: {0}".format(exc)))
             continue
         try:
             data = json.loads(raw)
-        except (ValueError, UnicodeDecodeError) as exc:
-            load_errors.append({"source": source, "reason": "invalid JSON: {0}".format(exc)})
+        except ValueError as exc:
+            load_errors.append(err("invalid JSON: {0}".format(exc)))
             continue
         if not isinstance(data, dict):
-            load_errors.append({"source": source, "reason": "not a JSON object"})
+            load_errors.append(err("not a JSON object"))
             continue
         missing = [field for field in REQUIRED_FIELDS if field not in data]
         if missing:
-            load_errors.append(
-                {"source": source, "reason": "missing fields: {0}".format(", ".join(missing))}
-            )
+            load_errors.append(err("missing fields: {0}".format(", ".join(missing))))
             continue
         empty_or_non_string = [
             field
@@ -128,21 +217,23 @@ def load_evidence(evidence_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[s
         ]
         if empty_or_non_string:
             load_errors.append(
-                {
-                    "source": source,
-                    "reason": "empty or non-string fields: {0}".format(
-                        ", ".join(empty_or_non_string)
-                    ),
-                }
+                err("empty or non-string fields: {0}".format(", ".join(empty_or_non_string)))
             )
             continue
         if not valid_timestamp(data.get("ran_at")):
-            load_errors.append(
-                {"source": source, "reason": "ran_at is not a valid timezone-aware ISO timestamp"}
-            )
+            load_errors.append(err("ran_at is not a valid timezone-aware ISO timestamp"))
+            continue
+        if (
+            "iteration" in data
+            and name_iter is not None
+            and _norm_iter(data.get("iteration")) != name_iter
+        ):
+            load_errors.append(err("iteration field disagrees with filename"))
             continue
         record = dict(data)
         record["_source"] = source
+        record["_iteration"] = name_iter
+        record["_name_request_id"] = name_req
         records.append(record)
 
     return records, load_errors
@@ -162,29 +253,104 @@ def index_records(
 
 def evaluate(
     records: List[Dict[str, Any]],
-    load_errors: List[Dict[str, str]],
+    load_errors: List[Dict[str, Any]],
     request_id: Optional[str],
+    *,
+    current_iteration: Optional[str] = None,
+    require_iteration: bool = False,
     records_by_request: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate the gate for a single request or all requests.
 
     A record fails when its exit_code is not an int equal to 0, or when it
-    cannot be coerced to a trustworthy int. Malformed evidence files (in
-    ``load_errors``) are always failures. When ``request_id`` is given, only
-    records and errors for that request are scoped; missing evidence for a
-    requested id is itself a failure.
+    cannot be coerced to a trustworthy int. When ``request_id`` is given, only
+    records for that request's CURRENT iteration are considered: stale
+    prior-iteration evidence is ignored, and missing evidence for the current
+    iteration is a failure. Malformed evidence files (in ``load_errors``) are
+    failures, scoped to the affected request+iteration when the filename
+    attributes them and otherwise treated as globally in-scope (fail closed).
+    In all-request mode each request is judged on its newest iteration only.
     """
-    # A malformed file cannot be parsed, so its request_id field is unreadable.
-    # Fail closed: every unparseable evidence file is treated as in-scope for any
-    # request, because the gate cannot prove the file is not part of this request.
-    scoped_errors: List[Dict[str, str]] = list(load_errors)
+    norm_current = _norm_iter(current_iteration)
+    max_iter: Dict[str, Optional[int]] = {}
 
     if request_id is None:
-        scoped_records = list(records)
-    elif records_by_request is not None:
-        scoped_records = list(records_by_request.get(request_id, []))
+        # Newest iteration seen per request (all-request mode only -- kept out of
+        # the per-request path so the doctor's per-request loop stays O(N)).
+        for rec in records:
+            rid = str(rec.get("request_id", "")).strip()
+            if not rid:
+                continue
+            num = _iter_num(rec.get("_iteration"))
+            prev = max_iter.get(rid)
+            if num is not None and (prev is None or num > prev):
+                max_iter[rid] = num
+        scoped_records = []
+        for rec in records:
+            rid = str(rec.get("request_id", "")).strip()
+            if not rid:
+                continue
+            top = max_iter.get(rid)
+            num = _iter_num(rec.get("_iteration"))
+            if top is None or num is None or num == top:
+                scoped_records.append(rec)
     else:
-        scoped_records = [rec for rec in records if str(rec.get("request_id", "")).strip() == request_id]
+        group = (
+            list(records_by_request.get(request_id, []))
+            if records_by_request is not None
+            else [r for r in records if str(r.get("request_id", "")).strip() == request_id]
+        )
+        if norm_current is None:
+            if require_iteration:
+                # The CLI cannot tell which iteration is current -> fail closed
+                # rather than risk judging a re-opened request on stale evidence.
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "request_ids": [],
+                    "passing": [],
+                    "failing": [],
+                    "load_errors": [],
+                    "reasons": [
+                        "cannot determine current iteration for request {0} "
+                        "(requests.md row/iteration missing) -- pass --iteration "
+                        "to override".format(request_id)
+                    ],
+                    "total_records": 0,
+                }
+            # No iteration required (e.g. the doctor, which has richer context):
+            # judge the newest iteration present in this request's records.
+            nums = [n for n in (_iter_num(r.get("_iteration")) for r in group) if n is not None]
+            if nums:
+                top = max(nums)
+                scoped_records = [r for r in group if _iter_num(r.get("_iteration")) == top]
+            else:
+                scoped_records = list(group)
+        else:
+            scoped_records = [r for r in group if _norm_iter(r.get("_iteration")) == norm_current]
+
+    # Scope malformed-file errors by the request_id/iteration parsed from the
+    # filename. An error the gate cannot attribute (no REQ- prefix) stays
+    # globally in-scope so it fails closed.
+    scoped_errors: List[Dict[str, Any]] = []
+    for error in load_errors:
+        e_req = error.get("request_id")
+        e_iter = _norm_iter(error.get("iteration"))
+        if request_id is None:
+            if e_req is None or e_iter is None:
+                scoped_errors.append(error)
+            else:
+                top = max_iter.get(e_req)
+                e_num = _iter_num(e_iter)
+                if top is None or e_num is None or e_num >= top:
+                    scoped_errors.append(error)
+        else:
+            if e_req is None:
+                scoped_errors.append(error)
+            elif e_req == request_id and (
+                norm_current is None or e_iter is None or e_iter == norm_current
+            ):
+                scoped_errors.append(error)
 
     failing: List[Dict[str, Any]] = []
     passing: List[Dict[str, Any]] = []
@@ -217,7 +383,14 @@ def evaluate(
     if failing:
         reasons.append("one or more evidence records did not exit 0")
     if request_id is not None and not scoped_records and not scoped_errors:
-        reasons.append("no evidence records found for request {0}".format(request_id))
+        if norm_current is not None:
+            reasons.append(
+                "no evidence records found for request {0} at iteration {1}".format(
+                    request_id, norm_current
+                )
+            )
+        else:
+            reasons.append("no evidence records found for request {0}".format(request_id))
     if request_id is None and not scoped_records and not scoped_errors:
         reasons.append("no evidence records found")
 
@@ -283,13 +456,41 @@ def main() -> int:
         default=None,
         help="Scope the gate to one request_id. Omit to evaluate every request found.",
     )
+    parser.add_argument(
+        "--iteration",
+        default=None,
+        help="Override the current iteration for --request-id (else read from requests.md).",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON instead of the text token.")
     args = parser.parse_args()
 
     evidence_dir = Path(args.loop_dir) / "evidence"
     records, load_errors = load_evidence(evidence_dir)
-    request_id = args.request_id.strip() if args.request_id else None
-    result = evaluate(records, load_errors, request_id or None)
+
+    if args.request_id is not None:
+        request_id = args.request_id.strip()
+        if not request_id:
+            parser.error(
+                "--request-id was provided but is empty; pass a real request id "
+                "or omit the flag to evaluate every request"
+            )
+    else:
+        request_id = None
+
+    current_iteration: Optional[str] = None
+    if request_id is not None:
+        if args.iteration is not None and args.iteration.strip():
+            current_iteration = args.iteration.strip()
+        else:
+            current_iteration = read_current_iteration(Path(args.loop_dir), request_id)
+
+    result = evaluate(
+        records,
+        load_errors,
+        request_id,
+        current_iteration=current_iteration,
+        require_iteration=request_id is not None,
+    )
     result["evidence_dir"] = posix_path(evidence_dir)
 
     if args.json:

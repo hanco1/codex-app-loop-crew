@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""In-process smoke test for the memory layer + team-shape flags.
+"""Smoke test for the memory layer + team-shape flags.
 
-Exercises the reference implementation end to end WITHOUT spawning any
-subprocess (this box's sandbox cannot shell out): everything is a direct
-module-level import of ``bootstrap_agent_loop``, ``completion_gate``,
-``record_decision``, and ``multi_agent_loop_doctor``.
+Exercises the reference implementation end to end. Most checks run in-process
+as direct module-level imports of ``bootstrap_agent_loop``,
+``completion_gate``, ``record_decision``, and ``multi_agent_loop_doctor``, but
+some checks DO spawn subprocesses: the pre-commit guard checks build
+disposable ``git`` repos and run ``precommit_scope_guard.py`` under
+``sys.executable``, so a working ``git`` on PATH is a PREREQUISITE for this
+suite. (The G7 uncommitted-work positive case also shells out to git, but
+skips itself gracefully when git cannot run.)
 
 It asserts, in one temp loop:
 
@@ -3870,7 +3874,9 @@ def main() -> int:
             "`handoff.md`",
             "`agent-lanes.md`",
             "`requests.md`",
-            "this lane's `current.md` and `inbox.md`",
+            # E5: inbox/new/ is the canonical pending-work surface; the flat
+            # inbox.md is only the Python-unavailable degrade path.
+            "this lane's `current.md` and its `inbox/new/`",
         ):
             if needle not in recovery_lower:
                 _fail("OPEN-THE-TURN must not replace Recovery Gate item: {0}".format(needle))
@@ -4363,8 +4369,16 @@ def main() -> int:
         # the resolution; the human edits a proposal, not a blank page".
         if "recommended_answer:" not in protocol_md:
             _fail("protocol.md BLOCKED envelope must carry a recommended_answer field")
-        if "recommended_answer" not in protocol_md.lower():
-            _fail("protocol.md must document the recommended_answer field")
+        # The field name is a literal protocol token: every mention must use
+        # the exact lowercase spelling, or agents copy a drifted casing into
+        # real envelopes that tooling then fails to parse.
+        for cased in re.finditer(r"(?i)recommended_answer", protocol_md):
+            if cased.group(0) != "recommended_answer":
+                _fail(
+                    "protocol.md spells the recommended_answer field with wrong casing: {0!r}".format(
+                        cased.group(0)
+                    )
+                )
         if "edits a proposal" not in protocol_md.lower():
             _fail("protocol.md must state the human edits a proposal instead of authoring cold")
 

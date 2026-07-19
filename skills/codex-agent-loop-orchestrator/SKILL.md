@@ -47,6 +47,8 @@ Do not treat the registry as a dashboard. It is a small source-of-truth table th
 
 In every command example below, `<skill_dir>` means the directory that contains this SKILL.md - `~/.codex/skills/codex-agent-loop-orchestrator` for a direct install, or `~/.codex/plugins/<plugin>/skills/codex-agent-loop-orchestrator` when installed as a Codex plugin. Substitute your actual path (an absolute path works everywhere).
 
+**Size before you mutate (advisory judgment, before any file is written).** The human invoking this skill implies they want the loop, so when the task clearly warrants one, proceed silently through the steps below - no permission prompt. But make that sizing judgment (the Task-Size Gate criteria in Identity And Fit) BEFORE any mutating step: if the task plausibly does NOT need the loop - it fits one session per the gate - STOP before step 2, recommend a direct session, and wait for the human's call, writing nothing (no bootstrap, no `git init`, no commit, no hook) until they answer. The only action allowed before that answer is the read-only existence check in step 1. This judgment applies at first contact only (loop files absent, no prior request); when `docs/loop` already exists, keep today's refresh behavior - a live loop is never re-gated.
+
 1. Inspect whether `docs/loop/goal.md`, `tracker.md`, `constraints.md`, and `handoff.md` exist.
 2. If the loop files (`goal.md`, `tracker.md`, `constraints.md`, `handoff.md`) are missing, run the local bootstrap helper below - it now writes starter templates for all four (Status Legend `[ ]`/`[~]`/`[x]`/`[!]`, a `Done When` section, `auto_chain_next_session: false`), plus `loop-budget.md`, `loop-run-log.md`, `leases.md`, and an empty `evidence/` dir. No external skill is required; `$codex-loop-engineering` is optional, not a dependency.
 3. Run the local bootstrap helper when the registry, request ledger, or lane files are missing or stale:
@@ -67,7 +69,7 @@ If that fails (not a repo), initialize one before anything else depends on it: `
 python <skill_dir>/scripts/install_precommit.py --loop-dir docs/loop
 ```
 
-CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no lane is rejected. So pair the install with commit-as-lane guidance and use it on every commit: `CODEX_LANE=<lane> git commit -m "..."`. If a lane cannot reliably export `CODEX_LANE` yet (for example the initial bootstrap commit before any lane exists), keep the guard warn-first by invoking `precommit_scope_guard.py --allow-unscoped` for that commit rather than skipping enforcement wholesale. Without a git repo the guard cannot install and write_scope/leases silently degrade to the honor system - so the git check is not optional.
+CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no lane is rejected. So pair the install with commit-as-lane guidance and use it on every commit - POSIX `CODEX_LANE=<lane> git commit -m "..."`; PowerShell `$env:CODEX_LANE = '<lane>'; git commit -m "..."`. For a commit that legitimately has no lane (for example the initial bootstrap commit before any lane exists), set `CODEX_PRECOMMIT_SKIP=1` for that one commit - POSIX `CODEX_PRECOMMIT_SKIP=1 git commit ...` (inline env var, one-shot); PowerShell `$env:CODEX_PRECOMMIT_SKIP = 1; git commit ...; Remove-Item Env:CODEX_PRECOMMIT_SKIP` (the variable persists for the whole session otherwise, which would keep bypassing the guard on every later commit) - the one skip mechanism the installed hook honors (documented in `references/loop-state.md` "How write_scope is enforced"). Do not reach for `precommit_scope_guard.py --allow-unscoped` here: that flag exists only for direct manual invocations of the guard script - the installed hook never passes it, so it cannot unblock a real commit. Without a git repo the guard cannot install and write_scope/leases silently degrade to the honor system - so the git check is not optional.
 
 5. **Open the turn** before acting by following the single authoritative rule in `references/protocol.md` ("Open the turn"); then read the relevant lane `current.md` before cross-agent work.
 6. Use `tool_search` for thread tools before assuming they exist. Look for `create_thread`, `list_threads`, `read_thread`, `send_message_to_thread`, and `set_thread_title`.
@@ -77,7 +79,7 @@ CAUTION: the guard **fails closed without `CODEX_LANE` set** - a commit with no 
 
 A freshly bootstrapped `goal.md`/`tracker.md` contains only placeholder `Done When` lines. **Placeholders mean there is no objective yet - and "no objective yet" is the ABSENCE of a request, not a blocked request.** Do not mint a `PLANNED -> BLOCKED` "no goal yet" placeholder request; a first-contact loop that shows a red BLOCKED row before the human has spoken looks like failure. Instead, run a short intake conversation and create the first real request only after the human answers.
 
-Run the Task-Size Gate first (see Identity And Fit). If the work plausibly fits one session, say so and recommend a direct session rather than a loop.
+The Task-Size Gate's ask-before-mutation form lives in First Move ("Size before you mutate") and has normally already run by now. Its stop rule still governs intake: if the interview reveals the work plausibly fits one session (see Identity And Fit), say so and recommend a direct session rather than a loop.
 
 **Intake is an interview, not a questionnaire.** Grill the objective one step at a time:
 
@@ -183,11 +185,11 @@ Use these helpers alongside the bootstrap and doctor. All are stdlib-only and id
 
 ```bash
 python <skill_dir>/scripts/completion_gate.py --loop-dir docs/loop
-python <skill_dir>/scripts/deliver_message.py --loop-dir docs/loop --request-id <request_id> --to-lane <lane> --message-file <message.md>
+python <skill_dir>/scripts/deliver_message.py --loop-dir docs/loop --request-id <request_id> --iteration <n> --from-lane <sender> --to-lane <lane> --message-type <TYPE> --message-file <message.md>
 python <skill_dir>/scripts/install_precommit.py --loop-dir docs/loop
 ```
 
-Run `completion_gate.py` before any final acceptance, `deliver_message.py` on every cross-lane send, and `install_precommit.py` once during setup or when write scopes change.
+Run `completion_gate.py` before any final acceptance, `deliver_message.py` on every cross-lane send, and `install_precommit.py` once during setup or when write scopes change. Pass `deliver_message.py` the full flag set shown above: the message id is derived from `request_id` + `message_type` + `iteration` (omitting the type/iteration collides every message for a request onto one id), and `--from-lane` is what stamps the sender heartbeat. The script also reads these fields from the message body's envelope lines, so a flag may be omitted when the body carries a complete envelope.
 
 ## Memory Layer
 
@@ -346,7 +348,7 @@ Use these message types:
 - `BLOCKED`: any lane -> product
 - `LOOP_STATUS`: any lane -> product or coordinator
 
-Every message must include `message_type`, `request_id`, `iteration`, `from_lane`, `to_lane`, `status`, `source_docs`, `scope` or `artifact_scope`, `acceptance_criteria`, and `expected_reply`.
+Every message must include the Common Envelope fields defined in `references/protocol.md` ("Common Envelope"). The required fields beyond the envelope - for example `scope`/`artifact_scope`, `acceptance_criteria`, or `expected_reply` - vary by message type and are defined by each type's template in `references/protocol.md`; the template for the type you are sending is authoritative.
 
 ## Dispatch Rules
 
@@ -357,7 +359,7 @@ Before sending to another lane:
 3. Save the exact message under `docs/loop/messages/<request_id>/`.
 4. If the target lane has a verified thread ID, use `send_message_to_thread`.
 5. Record delivery status in the message copy and sender worklog.
-6. If the thread tool is unavailable, append the message to the target lane `inbox.md` and add a pending entry to `handoff.md`.
+6. If the thread tool is unavailable, THE durable fallback is `deliver_message.py` into the target lane's `inbox/new/` - the presence of a file in `inbox/new` is the source of truth for pending work (`references/protocol.md`, "Atomic Message Delivery") - plus a pending entry in `handoff.md`. Append a summary row to the flat `inbox.md` only when Python itself cannot run; it is the last-resort degrade, never the pending truth.
 
 Do not ask the human to copy/paste unless no thread tool or durable inbox fallback can be used.
 
@@ -435,6 +437,16 @@ with a clear division of labor:
 - **`ui-ux-pro-max` owns the UX MECHANICS.** Interaction patterns, accessibility,
   responsive behavior, component usability, and chart/table ergonomics. Reach for
   it for anything about how the UI *works* and how usable/accessible it is.
+
+**Default-style disclosure (mandatory, once per loop).** When UI work first
+enters the loop - at intake of a UI goal, or on the first UI request if none was
+named at intake - you MUST tell the human in plain words: *the current default
+visual style is the Han house aesthetic (via `han-design-skill-v1`); if you want
+a different direction, say so - we can settle the style right here in the
+product conversation, or spin up a dedicated design lane to explore it.* The Han
+default applies only when the human does not object after this disclosure; an
+objection is the human's explicit choice (see the override rule below) and is
+recorded on the request's `design_system:` line.
 
 **Conflict rule.** When the two disagree, the axis decides: a **visual** call
 (what it looks like) goes to `han-design-skill-v1`; a **usability or

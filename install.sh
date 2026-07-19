@@ -9,7 +9,25 @@
 set -euo pipefail
 
 SKILL_NAME="codex-agent-loop-orchestrator"
-SKILLS_DIR="${CODEX_SKILLS_DIR:-$HOME/.codex/skills}"
+# Precedence: CODEX_SKILLS_DIR > CODEX_HOME/skills > ~/.codex/skills.
+SKILLS_DIR="${CODEX_SKILLS_DIR:-${CODEX_HOME:-$HOME/.codex}/skills}"
+
+# Probe for a Python >= 3.9 launcher (the skill's scripts require it). This is
+# a warning, not a gate: the copy still proceeds so docs-only hosts install fine.
+PYTHON_LAUNCHER=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 &&
+     "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+    PYTHON_LAUNCHER="$cand"
+    break
+  fi
+done
+if [ -n "$PYTHON_LAUNCHER" ]; then
+  echo "Found Python launcher: $PYTHON_LAUNCHER"
+else
+  echo "warning: no Python 3.9+ launcher found (tried: python3, python)." >&2
+  echo "warning: the skill's scripts require Python 3.9+; installing the files anyway." >&2
+fi
 
 # Resolve the directory this script lives in (repo root).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -34,6 +52,42 @@ fi
 TARGET="$SKILLS_DIR/$SKILL_NAME"
 
 mkdir -p "$SKILLS_DIR"
+
+# Self-delete guard: refuse when the install target resolves to (or overlaps)
+# the skill source, or the "rm -rf" below would destroy the source itself.
+# Portable realpath: macOS lacks readlink -f, so resolve via cd + pwd -P.
+resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+SOURCE_REAL="$(resolve_dir "$SOURCE")"
+SKILLS_REAL="$(resolve_dir "$SKILLS_DIR")"
+if [ -z "$SOURCE_REAL" ] || [ -z "$SKILLS_REAL" ]; then
+  echo "error: cannot resolve source ($SOURCE) or skills dir ($SKILLS_DIR) to a real path" >&2
+  exit 1
+fi
+TARGET_REAL="$SKILLS_REAL/$SKILL_NAME"
+if [ -d "$TARGET_REAL" ]; then
+  TARGET_REAL="$(resolve_dir "$TARGET_REAL")"
+fi
+CMP_SOURCE="$SOURCE_REAL"
+CMP_TARGET="$TARGET_REAL"
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # Windows filesystems are case-insensitive; compare lowercased.
+    CMP_SOURCE="$(printf '%s' "$SOURCE_REAL" | tr '[:upper:]' '[:lower:]')"
+    CMP_TARGET="$(printf '%s' "$TARGET_REAL" | tr '[:upper:]' '[:lower:]')"
+    ;;
+esac
+case "$CMP_TARGET/" in
+  "$CMP_SOURCE/"*)
+    echo "error: refusing to install: the skills dir cannot point into the repo's own skills/ folder (target $TARGET_REAL is the skill source $SOURCE_REAL or inside it)" >&2
+    exit 1
+    ;;
+esac
+case "$CMP_SOURCE/" in
+  "$CMP_TARGET/"*)
+    echo "error: refusing to install: the skills dir cannot point into the repo's own skills/ folder (skill source $SOURCE_REAL is inside target $TARGET_REAL, so installing would delete it)" >&2
+    exit 1
+    ;;
+esac
 
 # Remove any previous install so stale files never linger, then copy fresh.
 rm -rf "$TARGET"

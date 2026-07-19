@@ -5,10 +5,12 @@ and the **same** synthetic bank-statement fixtures, on the **same** model (codex
 
 - **Skill arm** — built by the `codex-agent-loop-orchestrator` multi-agent loop: a Product / Implementation /
   Review lane structure over 5 requests and ~15 review iterations, with independent code review and a human
-  QA gate on every user-facing slice. Lives at `hanco1/expense-app-loop-built` (the full `docs/loop/` ledger is
-  included — the audit trail *is* the demo).
+  QA gate on every user-facing slice. Lives at
+  [`hanco1/expense-app-loop-built`](https://github.com/hanco1/expense-app-loop-built) (the full `docs/loop/`
+  ledger is included — the audit trail *is* the demo).
 - **Solo arm** — one plain `codex exec` session, no orchestration skill, no built-in playbooks/subagents/
-  worktrees, single shot. Lives at `hanco1/expense-app-solo-session-built`.
+  worktrees, single shot. Lives at
+  [`hanco1/expense-app-solo-session-built`](https://github.com/hanco1/expense-app-solo-session-built).
 
 ### How the comparison was kept fair (controlled variables)
 
@@ -18,7 +20,7 @@ and the **same** synthetic bank-statement fixtures, on the **same** model (codex
 | Fixtures | The same synthetic TD-style CSV + text-PDF |
 | Model / effort | `gpt-5.6-sol`, xhigh |
 | Skill isolation | Solo ran under an isolated `CODEX_HOME` — probed and confirmed the orchestrator skill was **not** visible (evidence recorded) |
-| Superpowers | Solo forbidden from invoking any built-in playbook/subagent/worktree — one plain session |
+| Superpowers (the CLI's built-in playbook/subagent/worktree tooling) | Solo forbidden from invoking any of it — one plain session |
 
 **Honest limitations (stated up front):** n = 1. The skill arm consumed mid-run human QA feedback (it caught a
 port-collision and a pie-chart rendering bug during the run); the solo arm got no mid-run feedback — it was
@@ -50,7 +52,7 @@ adversarial verifier before it counts.
 | Build tokens | **733,070 (exact)** | not precisely reconstructable; 1–2 orders of magnitude higher |
 | App code | 1,606 LOC | 13,622 LOC (~8.5×) |
 | Tests | 12 | 100 static defs → 299 executed cases (matrices) |
-| Human interventions | 0 | 5 QA gates + 7 cap authorizations |
+| Human interventions | 0 | 5 QA gates + 7 cap authorizations (human approvals to continue past a budget cap) |
 
 ---
 
@@ -101,8 +103,8 @@ into the wrong month, no CSRF, and thin tests around its most exactness-critical
 
 The loop bought roughly **one point of average quality (6.8 → 7.8)**, concentrated exactly where a
 review-and-invariants process should concentrate it: **security and defense-in-depth**. It did so at ~8.5× the
-code and one-to-two orders of magnitude more time and tokens — and it still shipped real defects, including one
-that violates its own headline invariant.
+code, roughly two-to-three orders of magnitude more wall-clock time, and one-to-two orders of magnitude more
+tokens — and it still shipped real defects, including one that violates its own headline invariant.
 
 Read that honestly in both directions:
 
@@ -116,5 +118,7 @@ Read that honestly in both directions:
   comparison found real bugs in it. The right takeaway is not "always use the loop" but "match the machinery to
   the stakes" — which is the same task-size lesson the skill's own methodology already records.
 
-*Both repositories are public so you can read the code and, for the skill arm, the complete decision ledger
-that produced it. Every finding above cites a file and line in those repos.*
+*Both repositories — [`hanco1/expense-app-loop-built`](https://github.com/hanco1/expense-app-loop-built) and
+[`hanco1/expense-app-solo-session-built`](https://github.com/hanco1/expense-app-solo-session-built) — are
+public so you can read the code and, for the skill arm, the complete decision ledger that produced it. Key
+findings cite a file and line in those repos.*
