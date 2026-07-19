@@ -86,6 +86,23 @@ if (-not (Test-Path -LiteralPath $SkillsDir)) {
     New-Item -ItemType Directory -Path $SkillsDir -Force | Out-Null
 }
 
+# Self-delete guard: refuse when the install target resolves to (or overlaps)
+# the skill source — the Remove-Item below would destroy the source itself.
+$SkillsReal = (Resolve-Path -LiteralPath $SkillsDir).Path
+$TargetReal = Join-Path $SkillsReal $SkillName
+if (Test-Path -LiteralPath $TargetReal) {
+    $TargetReal = (Resolve-Path -LiteralPath $TargetReal).Path
+}
+$sep = [System.IO.Path]::DirectorySeparatorChar
+$srcCmp = $Source.TrimEnd('\', '/') + $sep
+$tgtCmp = $TargetReal.TrimEnd('\', '/') + $sep
+$overlap = $tgtCmp.StartsWith($srcCmp, [System.StringComparison]::OrdinalIgnoreCase) -or
+           $srcCmp.StartsWith($tgtCmp, [System.StringComparison]::OrdinalIgnoreCase)
+if ($overlap) {
+    Write-Error "Refusing to install: the skills dir cannot point into the repo's own skills/ folder (target '$TargetReal' overlaps the skill source '$Source'; installing would delete the source)."
+    exit 1
+}
+
 # Remove any previous install so stale files never linger, then copy fresh.
 if (Test-Path -LiteralPath $Target) {
     Remove-Item -LiteralPath $Target -Recurse -Force

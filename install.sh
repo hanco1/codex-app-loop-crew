@@ -53,6 +53,42 @@ TARGET="$SKILLS_DIR/$SKILL_NAME"
 
 mkdir -p "$SKILLS_DIR"
 
+# Self-delete guard: refuse when the install target resolves to (or overlaps)
+# the skill source, or the "rm -rf" below would destroy the source itself.
+# Portable realpath: macOS lacks readlink -f, so resolve via cd + pwd -P.
+resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+SOURCE_REAL="$(resolve_dir "$SOURCE")"
+SKILLS_REAL="$(resolve_dir "$SKILLS_DIR")"
+if [ -z "$SOURCE_REAL" ] || [ -z "$SKILLS_REAL" ]; then
+  echo "error: cannot resolve source ($SOURCE) or skills dir ($SKILLS_DIR) to a real path" >&2
+  exit 1
+fi
+TARGET_REAL="$SKILLS_REAL/$SKILL_NAME"
+if [ -d "$TARGET_REAL" ]; then
+  TARGET_REAL="$(resolve_dir "$TARGET_REAL")"
+fi
+CMP_SOURCE="$SOURCE_REAL"
+CMP_TARGET="$TARGET_REAL"
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # Windows filesystems are case-insensitive; compare lowercased.
+    CMP_SOURCE="$(printf '%s' "$SOURCE_REAL" | tr '[:upper:]' '[:lower:]')"
+    CMP_TARGET="$(printf '%s' "$TARGET_REAL" | tr '[:upper:]' '[:lower:]')"
+    ;;
+esac
+case "$CMP_TARGET/" in
+  "$CMP_SOURCE/"*)
+    echo "error: refusing to install: the skills dir cannot point into the repo's own skills/ folder (target $TARGET_REAL is the skill source $SOURCE_REAL or inside it)" >&2
+    exit 1
+    ;;
+esac
+case "$CMP_SOURCE/" in
+  "$CMP_TARGET/"*)
+    echo "error: refusing to install: the skills dir cannot point into the repo's own skills/ folder (skill source $SOURCE_REAL is inside target $TARGET_REAL, so installing would delete it)" >&2
+    exit 1
+    ;;
+esac
+
 # Remove any previous install so stale files never linger, then copy fresh.
 rm -rf "$TARGET"
 mkdir -p "$TARGET"
