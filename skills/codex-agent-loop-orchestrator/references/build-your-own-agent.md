@@ -28,7 +28,7 @@ invariants; swap the implementation.
 | --- | --- | --- |
 | lane set | `--preset` / `--extra-lane "lane\|role\|write_scope"` / `--no-default-lanes` | no |
 | per-lane write scope | the `write_scope` column in `agent-lanes.md` | no |
-| message vocabulary | your own `*_REQUEST` / `*_DONE` verbs; **the fixed envelope fields do not change** (`message_type, request_id, iteration, from_lane, to_lane, status, source_docs, acceptance_criteria, expected_reply`) | no |
+| message vocabulary | your own `*_REQUEST` / `*_DONE` verbs; **the Common Envelope fields do not change** (`message_type, request_id, iteration, from_lane, to_lane, status, source_docs`); per-type fields such as `acceptance_criteria` / `expected_reply` are defined by each type's template in `references/protocol.md` | no |
 | request lifecycle intermediate states | the `status` values in `requests.md` | no |
 | acceptance_criteria | per request, written into the message | no |
 | evidence command | any command that exits 0 on success; one flat JSON record per command | no |

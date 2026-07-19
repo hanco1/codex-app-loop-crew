@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure git identity (smoke tests create commits)
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+
+      - name: Syntax-check install.sh
+        if: runner.os == 'Linux'
+        run: bash -n install.sh
+
+      - name: Parse-check install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw install.ps1), [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+
+      - name: Validate plugin JSON
+        shell: bash
+        run: |
+          python -m json.tool .agents/plugins/marketplace.json > /dev/null
+          python -m json.tool .codex-plugin/plugin.json > /dev/null
+
+      - name: Byte-compile scripts
+        shell: bash
+        run: python -m py_compile skills/codex-agent-loop-orchestrator/scripts/*.py
+
+      - name: Contract test (state parsing)
+        run: python skills/codex-agent-loop-orchestrator/scripts/test_loop_state_parsing.py
+
+      - name: Smoke test (memory layer)
+        run: python skills/codex-agent-loop-orchestrator/scripts/smoke_memory_layer.py
+
+      - name: Smoke test (dashboard)
+        run: python skills/codex-agent-loop-orchestrator/scripts/smoke_dashboard.py
