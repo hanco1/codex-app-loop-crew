@@ -116,10 +116,10 @@ _ACCOUNT_CACHE_LOCK = threading.Lock()
 
 
 def _read_text(path: Path) -> str:
-    """Read a file as UTF-8, or '' on any IO error. Never raises."""
+    """Read a file as UTF-8, or '' on any IO/decode error. Never raises."""
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 

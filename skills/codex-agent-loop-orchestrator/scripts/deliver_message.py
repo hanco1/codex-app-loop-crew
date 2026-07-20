@@ -64,9 +64,69 @@ INDEX_HEADER = (
 
 SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# D5 path-traversal guard: a value that becomes a single path segment under
+# docs/loop must be a plain name. The leading character class rejects empty
+# values and dot-leading segments ('.', '..', hidden files); the body class
+# rejects '/', '\\', ':', NUL, and every other separator or metacharacter.
+# fullmatch (not match) so a trailing newline cannot ride along; trailing
+# dots/spaces and DOS device names are rejected separately because Windows
+# aliases them onto other paths ('lane.' resolves to 'lane'; NUL/COM1 are
+# devices regardless of extension).
+SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+_DOS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {"com{0}".format(i) for i in range(1, 10)}
+    | {"lpt{0}".format(i) for i in range(1, 10)}
+)
+
+
+def is_safe_name(value: str) -> bool:
+    """True when ``value`` is a safe single path segment on POSIX and Windows."""
+
+    if not SAFE_NAME_RE.fullmatch(value):
+        return False
+    if value.endswith(".") or value.endswith(" "):
+        return False
+    if value.split(".", 1)[0].lower() in _DOS_RESERVED_NAMES:
+        return False
+    return True
+
 
 def posix_path(value: str) -> str:
     return value.replace("\\", "/")
+
+
+def safe_name(value: str, flag: str) -> str:
+    """Validate ``value`` as a safe single path segment; exit loudly otherwise."""
+
+    if not is_safe_name(value):
+        raise SystemExit(
+            "{0} value {1!r} is not a safe name: use only letters, digits, "
+            "'.', '_' and '-', starting with a letter or digit (no path "
+            "separators, no leading/trailing dot, no DOS device names).".format(
+                flag, value
+            )
+        )
+    return value
+
+
+def assert_within(base: Path, child: Path) -> None:
+    """Belt-and-suspenders containment check: ``child`` must resolve under ``base``."""
+
+    base_resolved = str(base.resolve())
+    child_resolved = str(child.resolve())
+    try:
+        contained = os.path.commonpath([base_resolved, child_resolved]) == base_resolved
+    except ValueError:
+        # Different drives / mixed absolute-relative on Windows: not contained.
+        contained = False
+    if not contained:
+        raise SystemExit(
+            "refusing to write outside {0}: {1}".format(
+                posix_path(base_resolved), posix_path(child_resolved)
+            )
+        )
 
 
 def title_for(lane: str) -> str:
@@ -113,8 +173,31 @@ def read_body(message_file: Optional[str]) -> str:
         path = Path(message_file)
         if not path.exists():
             raise SystemExit("--message-file not found: {0}".format(message_file))
-        return path.read_text(encoding="utf-8")
-    data = sys.stdin.read()
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise SystemExit(
+                "--message-file is not valid UTF-8: {0}; re-save it as "
+                "UTF-8".format(posix_path(str(path)))
+            )
+    try:
+        data = sys.stdin.read()
+    except UnicodeDecodeError:
+        raise SystemExit(
+            "stdin message body is not valid UTF-8; re-encode it as UTF-8 "
+            "before piping."
+        )
+    # A strict-UTF-8 stdin raises above; a surrogateescape stdin (Windows)
+    # reads garbage bytes "successfully" as lone surrogates that would only
+    # blow up later when the body is written back out. Reject them here with
+    # the same actionable message.
+    try:
+        data.encode("utf-8")
+    except UnicodeEncodeError:
+        raise SystemExit(
+            "stdin message body is not valid UTF-8; re-encode it as UTF-8 "
+            "before piping."
+        )
     if not data.strip():
         raise SystemExit(
             "No message body provided. Pass --message-file PATH or pipe the body on stdin."
@@ -276,6 +359,10 @@ def archive_message(loop_dir: Path, request_id: str, message_type: str,
     mtype = slugify(message_type, default="MESSAGE") if message_type else "MESSAGE"
     itr = slugify(iteration, default="1") if iteration else "1"
     msg_dir = loop_dir / "messages" / request_id
+    # D5: the request id was validated by safe_name in main; keep a
+    # belt-and-suspenders containment check here so no importer can archive
+    # outside the messages store either.
+    assert_within(loop_dir / "messages", msg_dir)
     # mkdir + write happen together: the directory never exists without a file.
     msg_dir.mkdir(parents=True, exist_ok=True)
     target = msg_dir / "{mtype}-iter-{itr}.md".format(mtype=mtype, itr=itr)
@@ -338,8 +425,20 @@ def stamp_lane_heartbeat(loop_dir: Path, lane: str, when: str) -> list[str]:
     if _update_registry_heartbeat(registry, lane, when):
         touched.append(posix_path(str(registry)))
 
-    current = loop_dir / "lanes" / lane / "current.md"
-    if _update_current_heartbeat(current, when):
+    # D5 belt-and-suspenders: callers validate the lane name, but this is a
+    # module-level helper -- never write a current.md outside the lanes tree.
+    # Soft check (skip, not exit): the heartbeat is best-effort and runs after
+    # a successful delivery.
+    lanes_root = loop_dir / "lanes"
+    current = lanes_root / lane / "current.md"
+    try:
+        contained = (
+            os.path.commonpath([str(lanes_root.resolve()), str(current.resolve())])
+            == str(lanes_root.resolve())
+        )
+    except (OSError, ValueError):
+        contained = False
+    if contained and _update_current_heartbeat(current, when):
         touched.append(posix_path(str(current)))
 
     return touched
@@ -575,6 +674,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     lane = args.to_lane.strip()
     if not lane:
         raise SystemExit("--to-lane must not be empty.")
+    # D5: reject traversal before the lane becomes loop_dir/lanes/<lane>.
+    safe_name(lane, "--to-lane")
 
     body = read_body(args.message_file)
 
@@ -598,6 +699,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Without them every message for a request maps to the same id and "
             "later deliveries silently no-op.".format(" and ".join(missing))
         )
+    # D9: --also-archive without a request_id used to skip the durable archive
+    # SILENTLY (archive_message returns None on a blank id). The check sits
+    # AFTER envelope resolution on purpose: an envelope-supplied request_id
+    # satisfies it. D5: the id then becomes loop_dir/messages/<request_id>, so
+    # it must also be a safe path segment.
+    if args.also_archive:
+        if not request_id:
+            parser.error(
+                "--also-archive requires a request_id: pass --request-id or "
+                "include a 'request_id:' envelope line in the message body."
+            )
+        safe_name(request_id, "--request-id")
     if not from_lane:
         sys.stderr.write(
             "warning: from_lane unknown (no --from-lane flag and no 'from_lane:' "
@@ -619,7 +732,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # plainly why no heartbeat will be stamped so a typo'd lane name is caught
     # instead of quietly producing stale/orphan judgments later.
     heartbeat_lane = from_lane
-    if from_lane and lane_registered(loop_dir, from_lane) is False:
+    # D5: from_lane becomes a path segment in stamp_lane_heartbeat
+    # (lanes/<from_lane>/current.md), and it can arrive via the message body's
+    # envelope -- a traversal-shaped sender must never reach that write.
+    if from_lane and not is_safe_name(from_lane):
+        sys.stderr.write(
+            "warning: from_lane {0!r} is not a safe lane name; delivering "
+            "anyway, but the sender heartbeat will NOT be stamped.\n".format(
+                from_lane
+            )
+        )
+        heartbeat_lane = ""
+    elif from_lane and lane_registered(loop_dir, from_lane) is False:
         sys.stderr.write(
             "warning: from_lane {0!r} is not registered in agent-lanes.md; "
             "delivering anyway, but the sender heartbeat will NOT be "
@@ -628,6 +752,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         heartbeat_lane = ""
 
     inbox_dir = loop_dir / "lanes" / lane / "inbox"
+    assert_within(loop_dir / "lanes", inbox_dir)
     ensure_inbox_tree(inbox_dir)
 
     message_id = build_message_id(

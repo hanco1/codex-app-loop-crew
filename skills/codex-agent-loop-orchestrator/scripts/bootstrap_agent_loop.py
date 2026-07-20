@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -565,6 +567,18 @@ class RegistryRows(dict[str, dict[str, str]]):
         self.malformed_rows: list[tuple[int, str]] = []
 
 
+class RegistryUnreadableError(ValueError):
+    """agent-lanes.md exists but cannot be decoded as UTF-8.
+
+    A corrupt registry must NEVER read as an empty "no lanes" registry (the
+    same silent-empty trap the dashboard's duplicate guard just fixed): a
+    caller that treated it as empty would rebuild the table and clobber every
+    real row. Raised as a ValueError subclass -- not SystemExit -- because
+    ``existing_rows`` is also called in-process (the dashboard's add_lane);
+    bootstrap's CLI ``main`` converts it to a clean SystemExit.
+    """
+
+
 def recommended_tier_for(lane: str) -> str:
     """Return the advisory tier word for ``lane`` per the G16 policy.
 
@@ -639,6 +653,8 @@ def parse_thread_mapping(values: list[str]) -> dict[str, str]:
         thread_id = thread_id.strip()
         if not lane or not thread_id:
             raise SystemExit(f"Invalid --set-thread value: {value}")
+        # D5: the lane name becomes lanes_dir/<lane>; reject traversal here.
+        safe_name(lane, "--set-thread")
         mapping[lane] = thread_id
     return mapping
 
@@ -677,7 +693,7 @@ def stamp_observed_model(current_path: Path, observed: str) -> bool:
         return False
     try:
         original = current_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     lines = original.splitlines(keepends=True)
     replacement = "model_observed: " + observed
@@ -723,6 +739,8 @@ def parse_extra_lanes(values: list[str]) -> dict[str, dict[str, str]]:
         lane = parts[0] if parts else ""
         if not lane:
             raise SystemExit(f"--extra-lane must start with a lane name, got: {value}")
+        # D5: the lane name becomes lanes_dir/<lane>; reject traversal here.
+        safe_name(lane, "--extra-lane")
         role = parts[1] if len(parts) > 1 and parts[1] else f"Handle scoped {lane} work and report evidence."
         write_scope = parts[2] if len(parts) > 2 and parts[2] else f"docs/loop/lanes/{lane}/**"
         lanes[lane] = {"role": role, "write_scope": write_scope}
@@ -756,9 +774,16 @@ def existing_rows(path: Path) -> RegistryRows:
     if not path.exists():
         return rows
 
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # Never let a corrupt registry look like "no lanes" -- fail loudly.
+        raise RegistryUnreadableError(
+            "agent-lanes.md is not valid UTF-8: {0}; re-save the file as "
+            "UTF-8".format(posix_path(str(path)))
+        ) from exc
+
+    for line_number, line in enumerate(text.splitlines(), start=1):
         if line.startswith(REGISTRY_QUARANTINE_PREFIX) and line.endswith(
             REGISTRY_QUARANTINE_SUFFIX
         ):
@@ -837,6 +862,68 @@ def title_for(lane: str) -> str:
 
 def posix_path(path: str) -> str:
     return path.replace("\\", "/")
+
+
+# D5 path-traversal guard: a lane name becomes a single path segment under
+# docs/loop/lanes/. The leading character class rejects empty values and
+# dot-leading segments ('.', '..', hidden files); the body class rejects '/',
+# '\\', ':', NUL, and every other separator or metacharacter. Every
+# DEFAULT_LANES and LANE_PRESETS name matches this pattern.
+# fullmatch (not match) so a trailing newline cannot ride along; trailing
+# dots/spaces and DOS device names are rejected separately because Windows
+# aliases them onto other paths ('lane.' resolves to 'lane'; NUL/COM1 are
+# devices regardless of extension). Keep in sync with deliver_message.py.
+SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+_DOS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {"com{0}".format(i) for i in range(1, 10)}
+    | {"lpt{0}".format(i) for i in range(1, 10)}
+)
+
+
+def is_safe_name(value: str) -> bool:
+    """True when ``value`` is a safe single path segment on POSIX and Windows."""
+
+    if not SAFE_NAME_RE.fullmatch(value):
+        return False
+    if value.endswith(".") or value.endswith(" "):
+        return False
+    if value.split(".", 1)[0].lower() in _DOS_RESERVED_NAMES:
+        return False
+    return True
+
+
+def safe_name(value: str, flag: str) -> str:
+    """Validate ``value`` as a safe single path segment; exit loudly otherwise."""
+
+    if not is_safe_name(value):
+        raise SystemExit(
+            "{0} value {1!r} is not a safe name: use only letters, digits, "
+            "'.', '_' and '-', starting with a letter or digit (no path "
+            "separators, no leading/trailing dot, no DOS device names).".format(
+                flag, value
+            )
+        )
+    return value
+
+
+def assert_within(base: Path, child: Path) -> None:
+    """Belt-and-suspenders containment check: ``child`` must resolve under ``base``."""
+
+    base_resolved = str(base.resolve())
+    child_resolved = str(child.resolve())
+    try:
+        contained = os.path.commonpath([base_resolved, child_resolved]) == base_resolved
+    except ValueError:
+        # Different drives / mixed absolute-relative on Windows: not contained.
+        contained = False
+    if not contained:
+        raise SystemExit(
+            "refusing to write outside {0}: {1}".format(
+                posix_path(base_resolved), posix_path(child_resolved)
+            )
+        )
 
 
 # --- G22 write-scope overlap advisory (registration-time, advisory only) ------
@@ -1047,7 +1134,10 @@ def main() -> int:
     # here would mint exactly the duplicate the adoption ritual exists to
     # prevent.
     if thread_mapping:
-        known_lanes = set(existing_rows(registry)) | set(lane_defaults)
+        try:
+            known_lanes = set(existing_rows(registry)) | set(lane_defaults)
+        except RegistryUnreadableError as exc:
+            raise SystemExit(str(exc))
         unknown = sorted(set(thread_mapping) - known_lanes)
         if unknown:
             raise SystemExit(
@@ -1099,7 +1189,10 @@ def main() -> int:
     # on-disk rows INSIDE the lock so a racing writer's rows are merged, not
     # clobbered, and replace the file atomically so no reader sees a torn write.
     with loop_file_lock(registry.parent, "registry"):
-        rows = existing_rows(registry)
+        try:
+            rows = existing_rows(registry)
+        except RegistryUnreadableError as exc:
+            raise SystemExit(str(exc))
         # G22: which lanes are NEW this run (absent from the on-disk registry).
         # Only these get an overlap advisory below; a pre-existing overlap is not
         # re-announced on every flagless rerun.
@@ -1136,10 +1229,21 @@ def main() -> int:
             rows[lane]["thread_id"] = thread_id
             rows[lane]["status"] = "registered"
 
+        # D5: rows may include lanes loaded from an on-disk registry, and
+        # containment alone accepts an in-base alias like 'x/../victim'. Every
+        # lane name must be a plain segment BEFORE it is rewritten into the
+        # registry or used to create directories below -- a corrupt or hostile
+        # registry fails closed here with an actionable message.
+        for lane in rows:
+            safe_name(lane, "registry lane")
+
         atomic_replace(registry, render_registry(rows))
 
     for lane in sorted(rows):
         lane_dir = lanes_dir / lane
+        # D5 belt-and-suspenders: rows may come from an on-disk registry, so
+        # re-check containment even though CLI lane names were validated above.
+        assert_within(lanes_dir, lane_dir)
         lane_dir.mkdir(parents=True, exist_ok=True)
         title = title_for(lane)
         for filename, template in {
