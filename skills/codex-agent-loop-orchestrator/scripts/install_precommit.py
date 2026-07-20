@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -34,9 +36,9 @@ HOOK_TEMPLATE = """#!/bin/sh
 # Regenerate with scripts/install_precommit.py. Do not edit by hand.
 # Pass the active lane via CODEX_LANE; the guard fails closed without it.
 
-GUARD=\"{guard}\"
-LOOP_DIR=\"{loop_dir}\"
-DEFAULT_PY=\"{default_python}\"
+GUARD={guard}
+LOOP_DIR={loop_dir}
+DEFAULT_PY={default_python}
 
 if [ -n \"$CODEX_PRECOMMIT_SKIP\" ]; then
     echo \"precommit_scope_guard: skipped via CODEX_PRECOMMIT_SKIP.\" 1>&2
@@ -192,11 +194,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     hooks_dir = hooks_dir_for(repo, git_dir)
     hook_path = hooks_dir / "pre-commit"
 
+    # shlex.quote supplies its own single-quoting, so the template assigns the
+    # values bare; a path containing $, backticks, or spaces stays a literal.
     body = HOOK_TEMPLATE.format(
         marker=HOOK_MARKER,
-        guard=posix_path(str(guard_path)),
-        loop_dir=posix_path(args.loop_dir),
-        default_python=posix_path(sys.executable or ""),
+        guard=shlex.quote(posix_path(str(guard_path))),
+        loop_dir=shlex.quote(posix_path(args.loop_dir)),
+        default_python=shlex.quote(posix_path(sys.executable or "")),
     )
 
     if args.print_only:
@@ -214,8 +218,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     hooks_dir.mkdir(parents=True, exist_ok=True)
-    hook_path.write_text(body, encoding="utf-8", newline="\n")
-    make_executable(hook_path)
+    # Atomic install: write to a temp file in the hooks dir, set the exec bit
+    # on the temp file, then os.replace onto the hook path so a concurrent
+    # ``git commit`` never reads a truncated/half-written hook.
+    fd, tmp_name = tempfile.mkstemp(prefix=".pre-commit.", dir=str(hooks_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        make_executable(tmp_path)
+        os.replace(str(tmp_path), str(hook_path))
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
     print("install_precommit: wrote {0}".format(posix_path(str(hook_path))))
     print("install_precommit: guard {0}".format(posix_path(str(guard_path))))

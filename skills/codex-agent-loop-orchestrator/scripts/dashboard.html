@@ -1933,6 +1933,15 @@
   ]}
   </script>
 
+  <!-- B6: unreadable-current.md lane-card strings. Separate block, same
+       merged runtime dictionary (loadStrings reads every data-i18n-dict). -->
+  <script type="application/json" id="i18n-strings-b6" data-i18n-dict>
+  {"strings":[
+    {"key":"lane_current_unreadable_label","en":"Read error","zh":"读取错误","subtitle_en":"","subtitle_zh":""},
+    {"key":"lane_current_unreadable_body","en":"current.md unreadable — check file permissions/encoding","zh":"current.md 无法读取——请检查文件权限或编码","subtitle_en":"","subtitle_zh":""}
+  ]}
+  </script>
+
   <script type="application/json" id="i18n-strings-g30" data-i18n-dict>
   {"strings":[
     {"key":"pulse_completed","en":"All requests accepted - loop idle","zh":"所有请求均已验收，循环空闲","subtitle_en":"","subtitle_zh":""}
@@ -3052,6 +3061,16 @@
           nb.appendChild(el("span", "ln-k", t(note.labelKey)));
           nb.appendChild(el("span", "ln-v", note.text));
           card.appendChild(nb);
+        }
+
+        // B6: an unreadable current.md is a READ ERROR, not an empty lane.
+        // Say so in words (amber gate tone -- the file needs a human look)
+        // instead of rendering the same blank card an idle lane gets.
+        if (lane.current_unreadable === true) {
+          var ub = el("div", "lane-note lane-note-gate");
+          ub.appendChild(el("span", "ln-k", t("lane_current_unreadable_label")));
+          ub.appendChild(el("span", "ln-v", t("lane_current_unreadable_body")));
+          card.appendChild(ub);
         }
 
         // raw current.md, collapsed. "View raw" flows through the dictionary.

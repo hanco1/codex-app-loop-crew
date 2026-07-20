@@ -1855,7 +1855,20 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
             "error": "loop is not bootstrapped (no agent-lanes.md); run bootstrap first",
         }
 
-    existing = _existing_lane_names(registry_path)
+    # bootstrap's existing_rows raises RegistryUnreadableError (a ValueError)
+    # on a non-UTF-8 registry so a corrupt file can never read as "no lanes".
+    # Convert it to a clean JSON error instead of letting it 500 the request.
+    registry_unreadable = (
+        (getattr(bootstrap_agent_loop, "RegistryUnreadableError", None),)
+        if BOOTSTRAP_AVAILABLE and bootstrap_agent_loop is not None
+        else ()
+    )
+    registry_unreadable = tuple(e for e in registry_unreadable if e is not None)
+
+    try:
+        existing = _existing_lane_names(registry_path)
+    except registry_unreadable as exc:
+        return {"ok": False, "error": str(exc)}
     if lane.lower() in existing:
         return {"ok": False, "error": "lane {0!r} is already registered".format(lane)}
 
@@ -1867,7 +1880,10 @@ def add_lane(loop_dir: Path, lane: str, role: str) -> dict[str, Any]:
     # reader so column handling matches exactly. Fall back to a local parse if
     # bootstrap is somehow unavailable.
     if BOOTSTRAP_AVAILABLE and bootstrap_agent_loop is not None:
-        rows = bootstrap_agent_loop.existing_rows(registry_path)
+        try:
+            rows = bootstrap_agent_loop.existing_rows(registry_path)
+        except registry_unreadable as exc:
+            return {"ok": False, "error": str(exc)}
     else:
         rows = {}
         for row in _parse_md_table(registry_path):

@@ -2873,25 +2873,29 @@ def _check_g27_single_parse_and_decision_cache(tmp_path: Path) -> None:
         "\n".join(decisions) + "\n", encoding="utf-8"
     )
 
-    original_read_text = doctor.read_text
+    # Count at read_text_with_error: it is the ONE low-level read primitive
+    # every doctor file read (including the plain read_text wrapper) funnels
+    # through since the unreadable-file surfacing change, so counting here sees
+    # each physical read exactly once.
+    original_read = doctor.read_text_with_error
     original_hash = doctor.normalize_then_hash
     calls = {"run_log_reads": 0, "hashes": 0}
 
-    def counted_read_text(path: Path) -> str:
+    def counted_read(path: Path):
         if Path(path) == run_log:
             calls["run_log_reads"] += 1
-        return original_read_text(path)
+        return original_read(path)
 
     def counted_hash(paths) -> str:
         calls["hashes"] += 1
         return original_hash(paths)
 
-    doctor.read_text = counted_read_text
+    doctor.read_text_with_error = counted_read
     doctor.normalize_then_hash = counted_hash
     try:
         result = _doctor(loop)
     finally:
-        doctor.read_text = original_read_text
+        doctor.read_text_with_error = original_read
         doctor.normalize_then_hash = original_hash
 
     if result["decisions"]["stale"] != 0:

@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core state readers (completion gate, host probe, bootstrap registry, decision
   log, message bodies) report non-UTF-8 corruption with clear errors instead of
   tracebacks; lane and request-id inputs are validated against path traversal.
+- Unreadable state files are surfaced, not hidden: the doctor reports them as
+  visible issues instead of crashing, and dashboard lane cards now say when a
+  lane's `current.md` is unreadable instead of rendering it like an empty one.
+- The generated pre-commit hook shell-quotes the paths it embeds and is written
+  atomically, so repositories at unusual paths and concurrent commits are safe.
 
 ### Changed
 

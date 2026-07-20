@@ -347,8 +347,55 @@ G12_DIR_TOKEN_RE = re.compile(r"`?([A-Za-z0-9][A-Za-z0-9_.-]*)/`?")
 G12_ACCOUNT_NUMBER_RE = re.compile(r"(?<![\w-])(?:\d[ -]?){12,}\d(?![\w-])|(?<![\w-])\d{12,}(?![\w-])")
 
 
+def read_text_with_error(path: Path) -> tuple[str, str]:
+    """Read ``path`` as UTF-8, returning ``(text, error)``.
+
+    ``error`` is ``""`` on success AND for a missing file (absence is already
+    covered by REQUIRED_FILES); it names the file and the reason when the file
+    is PRESENT but unreadable (Windows sharing lock, permissions, non-UTF-8
+    bytes). ``summarize`` routes its direct core state-file reads through this
+    so an unreadable file surfaces a visible ``unreadable_file`` issue that
+    blocks ``handoff_ready`` -- mirroring the dashboard's ``read_errors`` --
+    instead of crashing the CLI with a raw traceback or silently reading as
+    empty (an unreadable tracker would otherwise hide its ``[!]`` blockers).
+    """
+    try:
+        return path.read_text(encoding="utf-8"), ""
+    except FileNotFoundError:
+        # Absence is REQUIRED_FILES' concern, not a read error. Detected via
+        # the read itself (not a separate exists() pre-check) so a stat that
+        # raises -- e.g. a parent directory without search permission -- lands
+        # in the OSError branch below instead of crashing the CLI.
+        return "", ""
+    except UnicodeDecodeError as exc:
+        return "", "{0}: not valid UTF-8 ({1})".format(path.name, exc)
+    except OSError as exc:
+        return "", "{0}: unreadable ({1})".format(path.name, exc)
+
+
+def path_exists(path: Path) -> bool:
+    """``Path.exists`` that treats an un-stat-able path as absent.
+
+    ``exists()`` itself raises (PermissionError and friends) when the parent
+    directory denies search/stat; a presence probe must degrade to False so
+    the missing-file reporting stays visible instead of the CLI crashing.
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    """Best-effort read: a missing OR unreadable file degrades to ``""``.
+
+    Callers of this plain helper are sites where absence is already handled by
+    other checks (REQUIRED_FILES, warning-only scans); the guard only ensures a
+    locked or non-UTF-8 file can never crash the read-only doctor. Core state
+    files additionally surface unreadable-present errors via
+    ``read_text_with_error`` in ``summarize``.
+    """
+    return read_text_with_error(path)[0]
 
 
 def parse_table(
@@ -783,7 +830,7 @@ def check_decision_drift(loop_dir: Path) -> dict[str, Any]:
 
     try:
         raw_text = decisions_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         warnings.append(
             {
                 "severity": "warning",
@@ -943,7 +990,7 @@ def find_git_dir(start: Path) -> Optional[Path]:
             # A ``.git`` FILE (worktree/submodule) points at the real gitdir.
             try:
                 text = dotgit.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 return dotgit
             for line in text.splitlines():
                 line = line.strip()
@@ -2209,21 +2256,35 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         now = datetime.now(timezone.utc)
 
     paths = {name: loop_dir / name for name in REQUIRED_FILES}
-    missing_files = [str(path) for path in paths.values() if not path.exists()]
+    missing_files = [str(path) for path in paths.values() if not path_exists(path)]
 
-    tracker_text = read_text(loop_dir / "tracker.md")
-    handoff_text = read_text(loop_dir / "handoff.md")
-    constraints_text = read_text(loop_dir / "constraints.md")
-    policy_text = read_text(loop_dir / "loop-policy.md")
-    budget_text = read_text(loop_dir / "loop-budget.md")
+    # A core state file that is PRESENT but unreadable (Windows sharing lock,
+    # permissions, non-UTF-8 bytes) must surface as a visible error that blocks
+    # handoff_ready -- never crash the CLI, never silently read as empty (an
+    # unreadable tracker would hide its ``[!]`` blockers; an unreadable budget
+    # would hide ``budget_exhausted: true``). Keyed by file name so a file the
+    # sweep below re-reads is reported once. Absence stays with REQUIRED_FILES.
+    read_errors: dict[str, str] = {}
+
+    def read_state(path: Path) -> str:
+        text, error = read_text_with_error(path)
+        if error:
+            read_errors.setdefault(path.name, error)
+        return text
+
+    tracker_text = read_state(loop_dir / "tracker.md")
+    handoff_text = read_state(loop_dir / "handoff.md")
+    constraints_text = read_state(loop_dir / "constraints.md")
+    policy_text = read_state(loop_dir / "loop-policy.md")
+    budget_text = read_state(loop_dir / "loop-budget.md")
     run_log_path = loop_dir / "loop-run-log.md"
-    run_log_text = read_text(run_log_path)
-    all_loop_text = "\n".join(read_text(path) for path in paths.values())
+    run_log_text = read_state(run_log_path)
+    all_loop_text = "\n".join(read_state(path) for path in paths.values())
     stale_scan_text = "\n".join(
         [
             handoff_text,
-            read_text(loop_dir / "agent-lanes.md"),
-            read_text(loop_dir / "requests.md"),
+            read_state(loop_dir / "agent-lanes.md"),
+            read_state(loop_dir / "requests.md"),
         ]
     )
 
@@ -2773,6 +2834,17 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
     # shadowed by a preface table) is a structural ERROR: it blocks readiness
     # instead of presenting an emptied queue/registry as healthy.
     issues.extend(control_table_errors)
+    # An unreadable-but-present core state file is likewise a structural ERROR
+    # (fail closed and visible), the CLI counterpart of the dashboard's
+    # ``read_errors`` surface.
+    for name in sorted(read_errors):
+        issues.append(
+            {
+                "severity": "error",
+                "code": "unreadable_file",
+                "message": read_errors[name],
+            }
+        )
     for path in missing_files:
         issues.append({"severity": "error", "code": "missing_file", "message": path})
     for lane, missing in lane_file_missing.items():
@@ -3162,6 +3234,7 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         and not lane_file_missing
         and not owner_issues
         and not control_table_errors
+        and not read_errors
     )
     auto_chain_ready = (
         handoff_ready
@@ -3187,6 +3260,10 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         readiness_reasons.append("request owner is not registered")
     if control_table_errors:
         readiness_reasons.append("a control table is missing its header or malformed")
+    if read_errors:
+        readiness_reasons.append(
+            "a loop state file is unreadable: " + ", ".join(sorted(read_errors))
+        )
     if not unchecked:
         readiness_reasons.append("no unchecked tracker item")
     if blocked:
@@ -3279,6 +3356,12 @@ def summarize(loop_dir: Path, stale_heartbeat_mins: int, now: Optional[datetime]
         "handoff_ready": handoff_ready,
         "auto_chain_ready": auto_chain_ready,
         "readiness_reasons": readiness_reasons,
+        # Unreadable-but-present core state files, mirroring the dashboard's
+        # ``read_errors`` surface (also emitted as ``unreadable_file`` issues).
+        "read_errors": [
+            {"source": name, "reason": read_errors[name]}
+            for name in sorted(read_errors)
+        ],
         "issues": issues,
         "warnings": warnings,
     }
